@@ -807,7 +807,7 @@ class Parser:
                         if self.match("as"):
                             exc_var = self.consume("NAME").value
                     handler_body = self.parse_suite()
-                    handlers.append(ASTNode("EXCEPT", "", [exc_type, handler_body]))
+                    handlers.append(ASTNode("EXCEPT", exc_var or "", [exc_type, handler_body]))
                 elif next_t.type == "else":
                     self.pos = self.pos + 1
                     else_body = self.parse_suite()
@@ -947,6 +947,20 @@ def collect_locals(node, locals_list):
             i = i + 1
         if not found:
             locals_list.append(name)
+    
+    
+    if node.type == "EXCEPT":
+        exc_var = node.value
+        if exc_var != "":
+            found = False
+            i = 0
+            while i < len(locals_list):
+                if locals_list[i] == exc_var:
+                    found = True
+                    break
+                i = i + 1
+            if not found:
+                locals_list.append(exc_var)
     
     if node.type == "DEF":
         return
@@ -1416,7 +1430,7 @@ class CodeGen:
             self.write_code("}", is_in_func)
         elif node.type == "RAISE":
             val_c = self.gen_expr(node.children[0])
-            self.write_code("fprintf(stderr, \"Error\\n\"); exit(1);", is_in_func)
+            self.write_code("turbo_raise(" + val_c + ");", is_in_func)
         elif node.type == "ASSERT":
             test_c = self.gen_expr(node.children[0])
             self.write_code("if (!turbo_is_truthy(" + test_c + ")) { fprintf(stderr, \"AssertionError\\n\"); exit(1); }", is_in_func)
@@ -1445,12 +1459,68 @@ class CodeGen:
             self.write_code("}", is_in_func)
         elif node.type == "TRY":
             body = node.children[0]
-            handlers = node.children[1]
+            handlers_node = node.children[1]
             else_body = node.children[2]
             finally_body = node.children[3]
             self.write_code("{", is_in_func)
             self.indent_level = self.indent_level + 1
+            self.write_code("int _exc_had = 0;", is_in_func)
+            self.write_code("int _exc_handled = 0;", is_in_func)
+            self.write_code("TurboObject* _exc_val = turbo_none;", is_in_func)
+            self.write_code("jmp_buf* _saved_jmp = turbo_exception_jmp;", is_in_func)
+            self.write_code("jmp_buf _try_jmp;", is_in_func)
+            self.write_code("turbo_exception_jmp = &_try_jmp;", is_in_func)
+            self.write_code("turbo_exception_value = turbo_none;", is_in_func)
+            self.write_code("if (setjmp(_try_jmp) == 0) {", is_in_func)
+            self.indent_level = self.indent_level + 1
             self.gen_block_stmts(body, is_in_func)
+            self.indent_level = self.indent_level - 1
+            self.write_code("} else {", is_in_func)
+            self.indent_level = self.indent_level + 1
+            self.write_code("_exc_had = 1;", is_in_func)
+            self.write_code("_exc_val = turbo_exception_value;", is_in_func)
+            self.indent_level = self.indent_level - 1
+            self.write_code("}", is_in_func)
+            self.write_code("turbo_exception_jmp = _saved_jmp;", is_in_func)
+            if len(handlers_node.children) > 0:
+                self.write_code("if (_exc_had) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                h_idx = 0
+                while h_idx < len(handlers_node.children):
+                    handler = handlers_node.children[h_idx]
+                    exc_type = handler.children[0]
+                    exc_var = handler.value
+                    handler_body = handler.children[1]
+                    if exc_type.type == "CONST_NONE":
+                        self.write_code("if (!_exc_handled) {", is_in_func)
+                    else:
+                        exc_type_c = self.gen_expr(exc_type)
+                        self.write_code("if (!_exc_handled && turbo_exception_matches(_exc_val, " + exc_type_c + ")) {", is_in_func)
+                    self.indent_level = self.indent_level + 1
+                    self.write_code("_exc_handled = 1;", is_in_func)
+                    if exc_var != "":
+                        self.write_code("t_" + exc_var + " = _exc_val;", is_in_func)
+                    self.gen_block_stmts(handler_body, is_in_func)
+                    self.indent_level = self.indent_level - 1
+                    self.write_code("}", is_in_func)
+                    h_idx = h_idx + 1
+                self.write_code("if (!_exc_handled) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.write_code("turbo_raise(_exc_val);", is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+            if else_body.type != "CONST_NONE":
+                self.write_code("if (!_exc_had) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.gen_block_stmts(else_body, is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+            if finally_body.type != "CONST_NONE":
+                self.gen_block_stmts(finally_body, is_in_func)
+            if len(handlers_node.children) == 0:
+                self.write_code("if (_exc_had) { turbo_raise(_exc_val); }", is_in_func)
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
         elif node.type == "DEF":

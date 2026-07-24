@@ -13,8 +13,8 @@ Features from Python not yet implemented in Turbo.
 
 ## Control Flow
 
-- [ ] `try` / `except` / `else` / `finally` — parsed but exception handling not implemented; handlers/else/finally blocks are silently dropped in codegen
-- [ ] `raise` — parsed, codegen emits `fprintf(stderr, "Error\n"); exit(1)` — hard abort, not a catchable exception
+- [x] `try` / `except` / `else` / `finally` — implemented with setjmp/longjmp; supports bare `except:`, typed `except ExcType:`, `except ExcType as e:`, `else`, and `finally`
+- [x] `raise` — raises a catchable exception via `turbo_raise()`; prints "Unhandled exception" and exits if no matching handler
 - [ ] `assert` — parsed, codegen checks truthiness and calls `exit(1)` on failure; assertion message is silently dropped
 - [ ] `with` — parsed, codegen assigns context manager to variable and wraps body in bare block; no `__enter__` / `__exit__` calls
 - [ ] `async` / `await` — parsed but codegen produces normal sync def/for/with

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <setjmp.h>
 
 typedef enum {
     TYPE_NONE,
@@ -137,6 +138,13 @@ extern TurboObject* t_enumerate;
 extern TurboObject* t_zip;
 extern TurboObject* t_map;
 extern TurboObject* t_filter;
+
+// Exception handling
+extern jmp_buf* turbo_exception_jmp;
+extern TurboObject* turbo_exception_value;
+
+void turbo_raise(TurboObject* exc);
+bool turbo_exception_matches(TurboObject* exc, TurboObject* exc_type);
 
 void turbo_init(void);
 

@@ -49,6 +49,9 @@ TurboObject* t_zip = NULL;
 TurboObject* t_map = NULL;
 TurboObject* t_filter = NULL;
 
+jmp_buf* turbo_exception_jmp = NULL;
+TurboObject* turbo_exception_value = NULL;
+
 static TurboObject* builtin_len(int argc, TurboObject** args) {
     if (argc != 1) {
         fprintf(stderr, "TypeError: len() takes exactly 1 argument\n");
@@ -650,6 +653,31 @@ static TurboObject* builtin_filter(int argc, TurboObject** args) {
         }
     }
     return res;
+}
+
+void turbo_raise(TurboObject* exc) {
+    turbo_exception_value = exc;
+    if (turbo_exception_jmp != NULL) {
+        longjmp(*turbo_exception_jmp, 1);
+    }
+    fprintf(stderr, "Unhandled exception: ");
+    TurboObject* s = turbo_str(exc);
+    fprintf(stderr, "%s\n", s->str_val.chars);
+    exit(1);
+}
+
+bool turbo_exception_matches(TurboObject* exc, TurboObject* exc_type) {
+    if (exc_type == turbo_none) return true;
+    if (exc->type != TYPE_INSTANCE) return false;
+    const char* type_name;
+    if (exc_type->type == TYPE_CLASS) {
+        type_name = exc_type->class_val.name;
+    } else if (exc_type->type == TYPE_STR) {
+        type_name = exc_type->str_val.chars;
+    } else {
+        return false;
+    }
+    return strcmp(exc->inst_val.class_obj->class_val.name, type_name) == 0;
 }
 
 void turbo_init(void) {
