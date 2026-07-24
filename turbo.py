@@ -441,13 +441,21 @@ class Parser:
             t = self.peek()
             if t.type == '(':
                 self.pos = self.pos + 1
-                args = []
                 if self.peek().type != ')':
-                    args.append(self.parse_expr())
-                    while self.try_match(','):
-                        args.append(self.parse_expr())
-                self.consume(')')
-                node = ASTNode("CALL", "", [node, ASTNode("LIST", "", args)])
+                    first_arg = self.parse_expr()
+                    if self.peek().type == "for":
+                        gen = self.parse_listcomp_generators()
+                        self.consume(')')
+                        node = ASTNode("CALL", "", [node, ASTNode("LIST", "", [ASTNode("GENCOMP", "", [first_arg, gen])])])
+                    else:
+                        args = [first_arg]
+                        while self.try_match(','):
+                            args.append(self.parse_expr())
+                        self.consume(')')
+                        node = ASTNode("CALL", "", [node, ASTNode("LIST", "", args)])
+                else:
+                    self.consume(')')
+                    node = ASTNode("CALL", "", [node, ASTNode("LIST", "", [])])
             elif t.type == '.':
                 self.pos = self.pos + 1
                 attr = self.consume("NAME").value
@@ -517,6 +525,10 @@ class Parser:
                 self.consume(')')
                 return ASTNode("TUPLE", "", [])
             first = self.parse_expr()
+            if self.peek().type == "for":
+                gen = self.parse_listcomp_generators()
+                self.consume(')')
+                return ASTNode("GENCOMP", "", [first, gen])
             if self.peek().type == ',':
                 elements = [first]
                 while self.try_match(','):
@@ -1491,6 +1503,13 @@ class CodeGen:
             c_code = "({ TurboObject* _dc = make_dict(); "
             c_code = c_code + self._gen_comp_loops(gen, "_dc", "turbo_setitem(_dc, " + key_c + ", " + val_c + ")")
             c_code = c_code + " _dc; })"
+            return c_code
+        elif node.type == "GENCOMP":
+            elem_c = self.gen_expr(node.children[0])
+            gen = node.children[1]
+            c_code = "({ TurboObject* _gc = make_list(); "
+            c_code = c_code + self._gen_comp_loops(gen, "_gc", "turbo_list_append(_gc, " + elem_c + ")")
+            c_code = c_code + " _gc; })"
             return c_code
         elif node.type == "DICT":
             keys = node.children[0].children

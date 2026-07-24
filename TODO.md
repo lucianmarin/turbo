@@ -45,7 +45,7 @@ Features from Python not yet implemented in Turbo.
 - [x] List comprehensions: `[x for x in y]`
 - [x] Dict comprehensions: `{k: v for k, v in x}`
 - [x] Set comprehensions: `{x for x in y}`
-- [ ] Generator expressions: `(x for x in y)`
+- [x] Generator expressions: `(x for x in y)`
 
 ## String Methods
 
