@@ -583,6 +583,10 @@ class Parser:
             else:
                 value = ASTNode("CONST_NONE", "", [])
             return ASTNode("YIELD", "", [value])
+        elif t.type == "await":
+            self.pos = self.pos + 1
+            value = self.parse_expr()
+            return ASTNode("AWAIT", "", [value])
         else:
             print("Parser error: unexpected token in expression " + t.type + " at line " + str(t.line))
             self.pos = self.pos + 1
@@ -607,7 +611,7 @@ class Parser:
             decorator = self.parse_expr()
             self.consume('NEWLINE')
             decorated = self.parse_stmt()
-            if decorated.type == "DEF" or decorated.type == "CLASS":
+            if decorated.type == "DEF" or decorated.type == "ASYNC_DEF" or decorated.type == "CLASS":
                 decorated.children.append(ASTNode("DECORATOR", "", [decorator]))
             return decorated
         
@@ -851,14 +855,14 @@ class Parser:
                 while p_idx < len(params):
                     params_node.children.append(ASTNode("NAME", params[p_idx], []))
                     p_idx = p_idx + 1
-                return ASTNode("DEF", name, [params_node, body])
+                return ASTNode("ASYNC_DEF", name, [params_node, body])
             elif next_t.type == "for":
                 self.pos = self.pos + 1
                 var_name = self.consume("NAME").value
                 self.consume("in")
                 iterable = self.parse_expr()
                 body = self.parse_suite()
-                return ASTNode("FOR", var_name, [iterable, body])
+                return ASTNode("ASYNC_FOR", var_name, [iterable, body])
             elif next_t.type == "with":
                 self.pos = self.pos + 1
                 expr = self.parse_expr()
@@ -869,7 +873,7 @@ class Parser:
                 alias_node = ASTNode("CONST_NONE", "", [])
                 if alias is not None:
                     alias_node = ASTNode("NAME", alias, [])
-                return ASTNode("WITH", "", [expr, alias_node, body])
+                return ASTNode("ASYNC_WITH", "", [expr, alias_node, body])
             else:
                 print("Parser error: expected def/for/with after async at line " + str(t.line))
                 self.consume('NEWLINE')
@@ -936,7 +940,7 @@ def collect_locals(node, locals_list):
                 i = i + 1
             if not found:
                 locals_list.append(name)
-    elif node.type == "FOR":
+    elif node.type == "FOR" or node.type == "ASYNC_FOR":
         name = node.value
         found = False
         i = 0
@@ -962,7 +966,7 @@ def collect_locals(node, locals_list):
             if not found:
                 locals_list.append(exc_var)
 
-    if node.type == "WITH":
+    if node.type == "WITH" or node.type == "ASYNC_WITH":
         alias_node = node.children[1]
         if alias_node.type == "NAME":
             name = alias_node.value
@@ -976,7 +980,7 @@ def collect_locals(node, locals_list):
             if not found:
                 locals_list.append(name)
     
-    if node.type == "DEF":
+    if node.type == "DEF" or node.type == "ASYNC_DEF":
         return
 
     idx = 0
@@ -1232,6 +1236,8 @@ class CodeGen:
             return "turbo_none /* lambda */"
         elif node.type == "YIELD":
             return "turbo_none /* yield */"
+        elif node.type == "AWAIT":
+            return self.gen_expr(node.children[0])
         else:
             print("CodeGen error: unknown expression " + node.type)
             return "turbo_none"
@@ -1299,7 +1305,7 @@ class CodeGen:
         m_idx = 0
         while m_idx < len(suite.children):
             m_node = suite.children[m_idx]
-            if m_node.type == "DEF":
+            if m_node.type == "DEF" or m_node.type == "ASYNC_DEF":
                 self.gen_func_def(m_node, class_name)
                 method_name = m_node.value
                 self.write_main("turbo_class_add_method(t_" + class_name + ', "' + method_name + '", t_impl_' + class_name + '_' + method_name + ');')
@@ -1423,6 +1429,8 @@ class CodeGen:
             self.write_code("}", is_in_func)
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
+        elif node.type == "ASYNC_FOR":
+            self.gen_stmt(ASTNode("FOR", node.value, node.children), is_in_func)
         elif node.type == "IF":
             cond_c = self.gen_expr(node.children[0])
             self.write_code("if (turbo_is_truthy(" + cond_c + ")) {", is_in_func)
@@ -1509,6 +1517,8 @@ class CodeGen:
             self.write_code("}", is_in_func)
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
+        elif node.type == "ASYNC_WITH":
+            self.gen_stmt(ASTNode("WITH", "", node.children), is_in_func)
         elif node.type == "TRY":
             body = node.children[0]
             handlers_node = node.children[1]
@@ -1575,7 +1585,7 @@ class CodeGen:
                 self.write_code("if (_exc_had) { turbo_raise(_exc_val); }", is_in_func)
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
-        elif node.type == "DEF":
+        elif node.type == "DEF" or node.type == "ASYNC_DEF":
             self.gen_func_def(node, "")
         elif node.type == "CLASS":
             self.gen_class_def(node)

@@ -21,7 +21,7 @@ Features from Python not yet implemented in Turbo.
   - [x] wraps body in try/finally via setjmp/longjmp
   - [x] calls `__exit__(exc_type, exc_val, None)` with proper args
   - [x] re-raises exception if `__exit__` returns false
-- [ ] `async` / `await` — parsed but codegen produces normal sync def/for/with
+- [x] `async` / `await` — parsed and codegen produces sync C code; `async def/for/with` are handled; `await` evaluates the expression synchronously
 - [ ] `match` / `case` — parsed as stub, pattern matching not implemented
 - [ ] `for` / `else`, `while` / `else` — else clauses on loops
 - [ ] `del` — parsed, codegen sets variable to `turbo_none` or subscript to None; does not actually delete
