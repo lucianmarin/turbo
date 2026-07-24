@@ -1453,6 +1453,12 @@ class CodeGen:
         if class_name == "":
             self.write_header("TurboObject* t_" + func_name + " = NULL;\n")
             self.write_main("t_" + func_name + " = make_func(t_impl_" + func_name + ', "' + func_name + '");')
+            d_idx = 2
+            while d_idx < len(node.children):
+                if node.children[d_idx].type == "DECORATOR":
+                    decorator_c = self.gen_expr(node.children[d_idx].children[0])
+                    self.write_main("t_" + func_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + func_name + "});")
+                d_idx = d_idx + 1
 
     def gen_class_def(self, node):
         class_name = node.value
@@ -1468,6 +1474,13 @@ class CodeGen:
                 method_name = m_node.value
                 self.write_main("turbo_class_add_method(t_" + class_name + ', "' + method_name + '", t_impl_' + class_name + '_' + method_name + ');')
             m_idx = m_idx + 1
+        
+        d_idx = 1
+        while d_idx < len(node.children):
+            if node.children[d_idx].type == "DECORATOR":
+                decorator_c = self.gen_expr(node.children[d_idx].children[0])
+                self.write_main("t_" + class_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + class_name + "});")
+            d_idx = d_idx + 1
 
     def gen_block_stmts(self, block_node, is_in_func):
         stmts = block_node.children

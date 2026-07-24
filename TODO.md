@@ -28,7 +28,7 @@ Features from Python not yet implemented in Turbo.
 - [x] `global` / `nonlocal` — names excluded from local variable declarations; `global` resolves to module-level globals; `nonlocal` prevents local shadowing (full closure support not yet implemented)
 - [x] `yield` / `yield from` — implemented via eager list collection: generator functions collect yielded values into a list and return it at the end; `yield from` iterates the sub-iterator and appends each value
 - [x] `lambda` — codegen generates a proper C function and returns `make_func(...)`
-- [ ] `@decorator` — parsed, decorator AST attached to def/class, but never applied in codegen
+- [x] `@decorator` — parsed and applied in codegen via `turbo_call`; supports stacking and class decorators
 - [x] Ternary conditional: `x if cond else y`
 - [x] Walrus operator: `:=`
 
