@@ -121,6 +121,9 @@ static const char* get_type_name(TurboObject* obj) {
         case TYPE_CLASS: return "type";
         case TYPE_INSTANCE: return "instance";
         case TYPE_FILE: return "file";
+        case TYPE_STATICMETHOD: return "staticmethod";
+        case TYPE_CLASSMETHOD: return "classmethod";
+        case TYPE_PROPERTY: return "property";
         default: return "unknown";
     }
 }
@@ -1163,6 +1166,31 @@ TurboObject* make_func(TurboCFunction func, const char* name) {
     return obj;
 }
 
+TurboObject* make_staticmethod(TurboCFunction func, const char* name) {
+    TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
+    obj->type = TYPE_STATICMETHOD;
+    obj->staticmethod_val.func_ptr = func;
+    obj->staticmethod_val.name = strdup(name);
+    return obj;
+}
+
+TurboObject* make_classmethod(TurboCFunction func, const char* name) {
+    TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
+    obj->type = TYPE_CLASSMETHOD;
+    obj->classmethod_val.func_ptr = func;
+    obj->classmethod_val.name = strdup(name);
+    return obj;
+}
+
+TurboObject* make_property(TurboCFunction getter, TurboCFunction setter, const char* name) {
+    TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
+    obj->type = TYPE_PROPERTY;
+    obj->property_val.getter = getter;
+    obj->property_val.setter = setter;
+    obj->property_val.name = strdup(name);
+    return obj;
+}
+
 TurboObject* make_class(const char* name) {
     TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
     obj->type = TYPE_CLASS;
@@ -1171,6 +1199,10 @@ TurboObject* make_class(const char* name) {
     obj->class_val.method_capacity = 8;
     obj->class_val.method_names = (char**)malloc(sizeof(char*) * obj->class_val.method_capacity);
     obj->class_val.method_funcs = (TurboCFunction*)malloc(sizeof(TurboCFunction) * obj->class_val.method_capacity);
+    obj->class_val.attr_count = 0;
+    obj->class_val.attr_capacity = 8;
+    obj->class_val.attr_names = (char**)malloc(sizeof(char*) * obj->class_val.attr_capacity);
+    obj->class_val.attr_values = (TurboObject**)malloc(sizeof(TurboObject*) * obj->class_val.attr_capacity);
     return obj;
 }
 
@@ -1220,6 +1252,32 @@ static TurboObject* make_int_from_str(char* digits, int len, int sign) {
     obj->int_val.length = len;
     obj->int_val.sign = sign;
     return obj;
+}
+
+static TurboObject* try_op_overload(TurboObject* a, TurboObject* b, const char* method) {
+    if (a->type == TYPE_INSTANCE) {
+        TurboObject* cls = a->inst_val.class_obj;
+        for (int i = 0; i < cls->class_val.method_count; i++) {
+            if (strcmp(cls->class_val.method_names[i], method) == 0) {
+                TurboObject** args = (TurboObject**)malloc(sizeof(TurboObject*) * 2);
+                args[0] = a;
+                args[1] = b;
+                TurboObject* res = cls->class_val.method_funcs[i](2, args);
+                free(args);
+                return res;
+            }
+        }
+        TurboObject* cls_attr = turbo_class_get_attr(cls, method);
+        if (cls_attr != NULL && cls_attr->type == TYPE_STATICMETHOD) {
+            TurboObject** args = (TurboObject**)malloc(sizeof(TurboObject*) * 2);
+            args[0] = a;
+            args[1] = b;
+            TurboObject* res = cls_attr->staticmethod_val.func_ptr(2, args);
+            free(args);
+            return res;
+        }
+    }
+    return NULL;
 }
 
 TurboObject* turbo_add(TurboObject* a, TurboObject* b) {
@@ -1291,6 +1349,10 @@ TurboObject* turbo_add(TurboObject* a, TurboObject* b) {
         }
         return res;
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__add__");
+        if (r != NULL) return r;
+    }
     fprintf(stderr, "TypeError: unsupported operand type(s) for +\n");
     exit(1);
 }
@@ -1337,6 +1399,10 @@ TurboObject* turbo_sub(TurboObject* a, TurboObject* b) {
     if ((a->type == TYPE_INT || a->type == TYPE_FLOAT) && b->type == TYPE_COMPLEX) {
         return make_complex(to_double(a) - b->complex_val.real, -b->complex_val.imag);
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__sub__");
+        if (r != NULL) return r;
+    }
     fprintf(stderr, "TypeError: unsupported operand type(s) for -\n");
     exit(1);
 }
@@ -1381,6 +1447,10 @@ TurboObject* turbo_mul(TurboObject* a, TurboObject* b) {
         free(new_chars);
         return res;
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__mul__");
+        if (r != NULL) return r;
+    }
     fprintf(stderr, "TypeError: unsupported operand type(s) for *\n");
     exit(1);
 }
@@ -1404,6 +1474,10 @@ TurboObject* turbo_div(TurboObject* a, TurboObject* b) {
         }
         return make_float(to_double(a) / db);
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__truediv__");
+        if (r != NULL) return r;
+    }
     fprintf(stderr, "TypeError: unsupported operand type(s) for /\n");
     exit(1);
 }
@@ -1419,6 +1493,10 @@ TurboObject* turbo_mod(TurboObject* a, TurboObject* b) {
         int sign = a->int_val.sign;
         if (rlen == 1 && r[0] == '0') sign = 0;
         return make_int_from_str(r, rlen, sign);
+    }
+    {
+        TurboObject* r = try_op_overload(a, b, "__mod__");
+        if (r != NULL) return r;
     }
     fprintf(stderr, "TypeError: unsupported operand type(s) for %%\n");
     exit(1);
@@ -1479,6 +1557,10 @@ TurboObject* turbo_pow(TurboObject* a, TurboObject* b) {
         (b->type == TYPE_FLOAT || b->type == TYPE_INT)) {
         return make_float(pow(to_double(a), to_double(b)));
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__pow__");
+        if (r != NULL) return r;
+    }
     fprintf(stderr, "TypeError: unsupported operand type(s) for **\n");
     exit(1);
 }
@@ -1505,6 +1587,10 @@ TurboObject* turbo_floordiv(TurboObject* a, TurboObject* b) {
         }
         return make_float(floor(da / db));
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__floordiv__");
+        if (r != NULL) return r;
+    }
     fprintf(stderr, "TypeError: unsupported operand type(s) for //\n");
     exit(1);
 }
@@ -1512,6 +1598,10 @@ TurboObject* turbo_floordiv(TurboObject* a, TurboObject* b) {
 TurboObject* turbo_bitand(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_int_from_ll(int_to_ll(a) & int_to_ll(b));
+    }
+    {
+        TurboObject* r = try_op_overload(a, b, "__and__");
+        if (r != NULL) return r;
     }
     fprintf(stderr, "TypeError: unsupported operand type(s) for &\n");
     exit(1);
@@ -1521,6 +1611,10 @@ TurboObject* turbo_bitor(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_int_from_ll(int_to_ll(a) | int_to_ll(b));
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__or__");
+        if (r != NULL) return r;
+    }
     fprintf(stderr, "TypeError: unsupported operand type(s) for |\n");
     exit(1);
 }
@@ -1528,6 +1622,10 @@ TurboObject* turbo_bitor(TurboObject* a, TurboObject* b) {
 TurboObject* turbo_bitxor(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_int_from_ll(int_to_ll(a) ^ int_to_ll(b));
+    }
+    {
+        TurboObject* r = try_op_overload(a, b, "__xor__");
+        if (r != NULL) return r;
     }
     fprintf(stderr, "TypeError: unsupported operand type(s) for ^\n");
     exit(1);
@@ -1537,6 +1635,10 @@ TurboObject* turbo_lshift(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_int_from_ll(int_to_ll(a) << int_to_ll(b));
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__lshift__");
+        if (r != NULL) return r;
+    }
     fprintf(stderr, "TypeError: unsupported operand type(s) for <<\n");
     exit(1);
 }
@@ -1544,6 +1646,10 @@ TurboObject* turbo_lshift(TurboObject* a, TurboObject* b) {
 TurboObject* turbo_rshift(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_int_from_ll(int_to_ll(a) >> int_to_ll(b));
+    }
+    {
+        TurboObject* r = try_op_overload(a, b, "__rshift__");
+        if (r != NULL) return r;
     }
     fprintf(stderr, "TypeError: unsupported operand type(s) for >>\n");
     exit(1);
@@ -1716,6 +1822,10 @@ TurboObject* turbo_eq(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_FLOAT) {
         return make_bool(to_double(a) == b->float_val);
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__eq__");
+        if (r != NULL) return r;
+    }
     return make_bool(is_equal(a, b));
 }
 
@@ -1726,10 +1836,18 @@ TurboObject* turbo_ne(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_FLOAT) {
         return make_bool(to_double(a) != b->float_val);
     }
+    {
+        TurboObject* r = try_op_overload(a, b, "__ne__");
+        if (r != NULL) return r;
+    }
     return make_bool(!is_equal(a, b));
 }
 
 TurboObject* turbo_lt(TurboObject* a, TurboObject* b) {
+    {
+        TurboObject* r = try_op_overload(a, b, "__lt__");
+        if (r != NULL) return r;
+    }
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_bool(int_cmp(a, b) < 0);
     }
@@ -1750,6 +1868,10 @@ TurboObject* turbo_lt(TurboObject* a, TurboObject* b) {
 }
 
 TurboObject* turbo_gt(TurboObject* a, TurboObject* b) {
+    {
+        TurboObject* r = try_op_overload(a, b, "__gt__");
+        if (r != NULL) return r;
+    }
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_bool(int_cmp(a, b) > 0);
     }
@@ -1770,6 +1892,10 @@ TurboObject* turbo_gt(TurboObject* a, TurboObject* b) {
 }
 
 TurboObject* turbo_lte(TurboObject* a, TurboObject* b) {
+    {
+        TurboObject* r = try_op_overload(a, b, "__le__");
+        if (r != NULL) return r;
+    }
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_bool(int_cmp(a, b) <= 0);
     }
@@ -1790,6 +1916,10 @@ TurboObject* turbo_lte(TurboObject* a, TurboObject* b) {
 }
 
 TurboObject* turbo_gte(TurboObject* a, TurboObject* b) {
+    {
+        TurboObject* r = try_op_overload(a, b, "__ge__");
+        if (r != NULL) return r;
+    }
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
         return make_bool(int_cmp(a, b) >= 0);
     }
@@ -2076,7 +2206,45 @@ TurboObject* turbo_getattr(TurboObject* obj, const char* name) {
                 return make_func(cls->class_val.method_funcs[i], name);
             }
         }
+        TurboObject* cls_attr = turbo_class_get_attr(cls, name);
+        if (cls_attr != NULL) {
+            if (cls_attr->type == TYPE_PROPERTY) {
+                TurboObject* prop_args[1] = {obj};
+                return cls_attr->property_val.getter(1, prop_args);
+            }
+            if (cls_attr->type == TYPE_STATICMETHOD) {
+                return make_func(cls_attr->staticmethod_val.func_ptr, name);
+            }
+            if (cls_attr->type == TYPE_CLASSMETHOD) {
+                TurboObject* bound = make_func(cls_attr->classmethod_val.func_ptr, name);
+                return bound;
+            }
+            return cls_attr;
+        }
         fprintf(stderr, "AttributeError: '%s' object has no attribute '%s'\n", cls->class_val.name, name);
+        exit(1);
+    }
+    if (obj->type == TYPE_CLASS) {
+        for (int i = 0; i < obj->class_val.method_count; i++) {
+            if (strcmp(obj->class_val.method_names[i], name) == 0) {
+                return make_func(obj->class_val.method_funcs[i], name);
+            }
+        }
+        TurboObject* cls_attr = turbo_class_get_attr(obj, name);
+        if (cls_attr != NULL) {
+            if (cls_attr->type == TYPE_STATICMETHOD) {
+                return make_func(cls_attr->staticmethod_val.func_ptr, name);
+            }
+            if (cls_attr->type == TYPE_CLASSMETHOD) {
+                return make_func(cls_attr->classmethod_val.func_ptr, name);
+            }
+            if (cls_attr->type == TYPE_PROPERTY) {
+                fprintf(stderr, "AttributeError: property '%s' cannot be accessed on class\n", name);
+                exit(1);
+            }
+            return cls_attr;
+        }
+        fprintf(stderr, "AttributeError: class '%s' has no attribute '%s'\n", obj->class_val.name, name);
         exit(1);
     }
     if (obj->type == TYPE_MODULE) {
@@ -2103,6 +2271,13 @@ TurboObject* turbo_getattr(TurboObject* obj, const char* name) {
 
 void turbo_setattr(TurboObject* obj, const char* name, TurboObject* val) {
     if (obj->type == TYPE_INSTANCE) {
+        TurboObject* cls = obj->inst_val.class_obj;
+        TurboObject* cls_attr = turbo_class_get_attr(cls, name);
+        if (cls_attr != NULL && cls_attr->type == TYPE_PROPERTY && cls_attr->property_val.setter != NULL) {
+            TurboObject* set_args[2] = {obj, val};
+            cls_attr->property_val.setter(2, set_args);
+            return;
+        }
         for (int i = 0; i < obj->inst_val.length; i++) {
             if (strcmp(obj->inst_val.keys[i], name) == 0) {
                 obj->inst_val.values[i] = val;
@@ -2117,6 +2292,10 @@ void turbo_setattr(TurboObject* obj, const char* name, TurboObject* val) {
         obj->inst_val.keys[obj->inst_val.length] = strdup(name);
         obj->inst_val.values[obj->inst_val.length] = val;
         obj->inst_val.length++;
+        return;
+    }
+    if (obj->type == TYPE_CLASS) {
+        turbo_class_set_attr(obj, name, val);
         return;
     }
     if (obj->type == TYPE_MODULE) {
@@ -2350,6 +2529,28 @@ TurboObject* turbo_str(TurboObject* val) {
             }
             return make_str("<super>");
         }
+        case TYPE_INSTANCE: {
+            TurboObject* cls = val->inst_val.class_obj;
+            TurboObject* cls_attr = turbo_class_get_attr(cls, "__str__");
+            if (cls_attr != NULL && cls_attr->type == TYPE_STATICMETHOD) {
+                TurboObject* args[1] = {val};
+                TurboObject* res = cls_attr->staticmethod_val.func_ptr(1, args);
+                if (res->type == TYPE_STR) return res;
+            }
+            for (int i = 0; i < cls->class_val.method_count; i++) {
+                if (strcmp(cls->class_val.method_names[i], "__str__") == 0) {
+                    TurboObject* m_args[1] = {val};
+                    TurboObject* res = cls->class_val.method_funcs[i](1, m_args);
+                    if (res->type == TYPE_STR) return res;
+                    break;
+                }
+            }
+            char* s = (char*)malloc(strlen(cls->class_val.name) + 16);
+            sprintf(s, "<%s object>", cls->class_val.name);
+            TurboObject* res = make_str(s);
+            free(s);
+            return res;
+        }
         default:
             return make_str("<object>");
     }
@@ -2366,6 +2567,23 @@ TurboObject* turbo_repr(TurboObject* val) {
         TurboObject* res = make_str_len(buf, len + 2);
         free(buf);
         return res;
+    }
+    if (val->type == TYPE_INSTANCE) {
+        TurboObject* cls = val->inst_val.class_obj;
+        TurboObject* cls_attr = turbo_class_get_attr(cls, "__repr__");
+        if (cls_attr != NULL && cls_attr->type == TYPE_STATICMETHOD) {
+            TurboObject* args[1] = {val};
+            TurboObject* res = cls_attr->staticmethod_val.func_ptr(1, args);
+            if (res->type == TYPE_STR) return res;
+        }
+        for (int i = 0; i < cls->class_val.method_count; i++) {
+            if (strcmp(cls->class_val.method_names[i], "__repr__") == 0) {
+                TurboObject* m_args[1] = {val};
+                TurboObject* res = cls->class_val.method_funcs[i](1, m_args);
+                if (res->type == TYPE_STR) return res;
+                break;
+            }
+        }
     }
     return turbo_str(val);
 }
@@ -2625,9 +2843,45 @@ void turbo_class_add_method(TurboObject* class_obj, const char* name, TurboCFunc
     class_obj->class_val.method_count++;
 }
 
+void turbo_class_set_attr(TurboObject* class_obj, const char* name, TurboObject* val) {
+    if (class_obj->type != TYPE_CLASS) {
+        fprintf(stderr, "TypeError: expected class object\n");
+        exit(1);
+    }
+    for (int i = 0; i < class_obj->class_val.attr_count; i++) {
+        if (strcmp(class_obj->class_val.attr_names[i], name) == 0) {
+            class_obj->class_val.attr_values[i] = val;
+            return;
+        }
+    }
+    if (class_obj->class_val.attr_count >= class_obj->class_val.attr_capacity) {
+        class_obj->class_val.attr_capacity *= 2;
+        class_obj->class_val.attr_names = (char**)realloc(class_obj->class_val.attr_names, sizeof(char*) * class_obj->class_val.attr_capacity);
+        class_obj->class_val.attr_values = (TurboObject**)realloc(class_obj->class_val.attr_values, sizeof(TurboObject*) * class_obj->class_val.attr_capacity);
+    }
+    class_obj->class_val.attr_names[class_obj->class_val.attr_count] = strdup(name);
+    class_obj->class_val.attr_values[class_obj->class_val.attr_count] = val;
+    class_obj->class_val.attr_count++;
+}
+
+TurboObject* turbo_class_get_attr(TurboObject* class_obj, const char* name) {
+    for (int i = 0; i < class_obj->class_val.attr_count; i++) {
+        if (strcmp(class_obj->class_val.attr_names[i], name) == 0) {
+            return class_obj->class_val.attr_values[i];
+        }
+    }
+    return NULL;
+}
+
 TurboObject* turbo_call(TurboObject* callable, int argc, TurboObject** args) {
     if (callable->type == TYPE_FUNC) {
         return callable->func_val.func_ptr(argc, args);
+    }
+    if (callable->type == TYPE_STATICMETHOD) {
+        return callable->staticmethod_val.func_ptr(argc, args);
+    }
+    if (callable->type == TYPE_CLASSMETHOD) {
+        return callable->classmethod_val.func_ptr(argc, args);
     }
     if (callable->type == TYPE_CLASS) {
         TurboObject* inst = make_instance(callable);
@@ -3128,6 +3382,27 @@ TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int ar
                 return res;
             }
         }
+        TurboObject* cls_attr = turbo_class_get_attr(cls, method_name);
+        if (cls_attr != NULL) {
+            if (cls_attr->type == TYPE_STATICMETHOD) {
+                return cls_attr->staticmethod_val.func_ptr(argc, args);
+            }
+            if (cls_attr->type == TYPE_CLASSMETHOD) {
+                int call_argc = argc + 1;
+                TurboObject** call_args = (TurboObject**)malloc(sizeof(TurboObject*) * call_argc);
+                call_args[0] = cls;
+                for (int j = 0; j < argc; j++) {
+                    call_args[j + 1] = args[j];
+                }
+                TurboObject* res = cls_attr->classmethod_val.func_ptr(call_argc, call_args);
+                free(call_args);
+                return res;
+            }
+            if (cls_attr->type == TYPE_PROPERTY) {
+                TurboObject* prop_args[1] = {obj};
+                return cls_attr->property_val.getter(1, prop_args);
+            }
+        }
         fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n", cls->class_val.name, method_name);
         exit(1);
     }
@@ -3454,6 +3729,36 @@ TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int ar
             turbo_file_close(obj);
             return turbo_none;
         }
+    }
+    if (obj->type == TYPE_CLASS) {
+        for (int i = 0; i < obj->class_val.method_count; i++) {
+            if (strcmp(obj->class_val.method_names[i], method_name) == 0) {
+                return obj->class_val.method_funcs[i](argc, args);
+            }
+        }
+        TurboObject* cls_attr = turbo_class_get_attr(obj, method_name);
+        if (cls_attr != NULL) {
+            if (cls_attr->type == TYPE_STATICMETHOD) {
+                return cls_attr->staticmethod_val.func_ptr(argc, args);
+            }
+            if (cls_attr->type == TYPE_CLASSMETHOD) {
+                int call_argc = argc + 1;
+                TurboObject** call_args = (TurboObject**)malloc(sizeof(TurboObject*) * call_argc);
+                call_args[0] = obj;
+                for (int j = 0; j < argc; j++) {
+                    call_args[j + 1] = args[j];
+                }
+                TurboObject* res = cls_attr->classmethod_val.func_ptr(call_argc, call_args);
+                free(call_args);
+                return res;
+            }
+            if (cls_attr->type == TYPE_PROPERTY) {
+                TurboObject* prop_args[1] = {obj};
+                return cls_attr->property_val.getter(1, prop_args);
+            }
+        }
+        fprintf(stderr, "AttributeError: class '%s' has no method '%s'\n", obj->class_val.name, method_name);
+        exit(1);
     }
     if (obj->type == TYPE_MODULE) {
         TurboObject* func = turbo_module_get(obj, method_name);

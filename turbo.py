@@ -1183,6 +1183,18 @@ class Parser:
                 value = self.parse_expr()
                 self.consume('NEWLINE')
                 return ASTNode("ASSIGN", "", [expr, value])
+            elif next_t.type == ':':
+                # Annotation: x: type  or  x: type = value
+                self.pos = self.pos + 1
+                type_expr = self.parse_expr()
+                default_node = ASTNode("CONST_NONE", "", [])
+                if self.peek().type == '=':
+                    self.pos = self.pos + 1
+                    default_node = self.parse_expr()
+                self.consume('NEWLINE')
+                if expr.type == "NAME":
+                    return ASTNode("ANN_ASSIGN", expr.value, [type_expr, default_node])
+                return ASTNode("EXPR", "", [expr])
             elif next_t.type == '=':
                 self.pos = self.pos + 1
                 value = self.parse_expr()
@@ -1208,6 +1220,19 @@ class Parser:
         return ASTNode("BLOCK", "", stmts)
 
 def collect_locals(node, locals_list):
+    if node.type == "ANN_ASSIGN":
+        name = node.value
+        found = False
+        i = 0
+        while i < len(locals_list):
+            if locals_list[i] == name:
+                found = True
+                break
+            i = i + 1
+        if not found:
+            locals_list.append(name)
+        return
+
     if node.type == "ASSIGN" or node.type == "AUGASSIGN":
         target = node.children[0]
         if target.type == "NAME":
@@ -1846,22 +1871,122 @@ class CodeGen:
             self.write_main("t_" + class_name + ' = make_class("' + class_name + '");')
         
         suite = node.children[0]
+
+        # Check for @dataclass
+        is_dataclass = False
+        dc_idx = 1
+        while dc_idx < len(node.children):
+            if node.children[dc_idx].type == "DECORATOR":
+                dcc = node.children[dc_idx].children[0]
+                if dcc.type == "NAME" and dcc.value == "dataclass":
+                    is_dataclass = True
+            dc_idx = dc_idx + 1
+
+        # Handle @dataclass: generate __init__ with field params
+        if is_dataclass:
+            init_fields = []
+            dc_m_idx = 0
+            while dc_m_idx < len(suite.children):
+                s = suite.children[dc_m_idx]
+                if s.type == "ANN_ASSIGN":
+                    fname = s.value
+                    fdefault = s.children[0] if s.children[1].type == "CONST_NONE" else s.children[1]
+                    init_fields.append((fname, fdefault))
+                elif s.type == "ASSIGN":
+                    target = s.children[0]
+                    if target.type == "NAME":
+                        fname = target.value
+                        fdefault = s.children[1]
+                        init_fields.append((fname, fdefault))
+                dc_m_idx = dc_m_idx + 1
+            init_impl = "t_impl_" + full_name + "__init__"
+            self.write_header("TurboObject* " + init_impl + "(int argc, TurboObject** args);\n")
+            self.funcs = self.funcs + "TurboObject* " + init_impl + "(int argc, TurboObject** args) {\n"
+            self.funcs = self.funcs + "    TurboObject* t_self = args[0];\n"
+            init_i = 0
+            while init_i < len(init_fields):
+                fname = init_fields[init_i][0]
+                fdefault = init_fields[init_i][1]
+                self.funcs = self.funcs + "    TurboObject* t_" + fname + " = (argc > " + str(init_i + 1) + ") ? args[" + str(init_i + 1) + "] : "
+                if fdefault.type == "CONST_NONE":
+                    self.funcs = self.funcs + "turbo_none"
+                else:
+                    self.funcs = self.funcs + self.gen_expr(fdefault)
+                self.funcs = self.funcs + ";\n"
+                init_i = init_i + 1
+            init_i = 0
+            while init_i < len(init_fields):
+                fname = init_fields[init_i][0]
+                self.funcs = self.funcs + '    turbo_setattr(t_self, "' + fname + '", t_' + fname + ');\n'
+                init_i = init_i + 1
+            self.funcs = self.funcs + "    return turbo_none;\n"
+            self.funcs = self.funcs + "}\n\n"
+            if mod_prefix == "":
+                self.write_main("turbo_class_add_method(t_" + class_name + ', "__init__", ' + init_impl + ');')
+
+        # Generate methods and class-level assignments
         m_idx = 0
         while m_idx < len(suite.children):
             m_node = suite.children[m_idx]
             if m_node.type == "DEF" or m_node.type == "ASYNC_DEF":
-                self.gen_func_def(m_node, full_name, "")
                 method_name = m_node.value
-                if mod_prefix == "":
-                    self.write_main("turbo_class_add_method(t_" + class_name + ', "' + method_name + '", t_impl_' + class_name + '_' + method_name + ');')
+                # Check method decorators for special handling
+                is_static = False
+                is_class = False
+                is_property = False
+                md_idx = 2
+                while md_idx < len(m_node.children):
+                    if m_node.children[md_idx].type == "DECORATOR":
+                        dec_c = m_node.children[md_idx].children[0]
+                        if dec_c.type == "NAME":
+                            if dec_c.value == "staticmethod":
+                                is_static = True
+                            elif dec_c.value == "classmethod":
+                                is_class = True
+                            elif dec_c.value == "property":
+                                is_property = True
+                    md_idx = md_idx + 1
+                self.gen_func_def(m_node, full_name, "")
+                if is_static:
+                    if mod_prefix == "":
+                        self.write_main("turbo_class_set_attr(t_" + class_name + ', "' + method_name + '", make_staticmethod(t_impl_' + class_name + '_' + method_name + ', "' + method_name + '"));')
+                elif is_class:
+                    if mod_prefix == "":
+                        self.write_main("turbo_class_set_attr(t_" + class_name + ', "' + method_name + '", make_classmethod(t_impl_' + class_name + '_' + method_name + ', "' + method_name + '"));')
+                elif is_property:
+                    if mod_prefix == "":
+                        self.write_main("turbo_class_set_attr(t_" + class_name + ', "' + method_name + '", make_property(t_impl_' + class_name + '_' + method_name + ', NULL, "' + method_name + '"));')
+                else:
+                    if mod_prefix == "":
+                        self.write_main("turbo_class_add_method(t_" + class_name + ', "' + method_name + '", t_impl_' + class_name + '_' + method_name + ');')
+            elif m_node.type == "ASSIGN":
+                target = m_node.children[0]
+                if target.type == "NAME":
+                    attr_name = target.value
+                    val_c = self.gen_expr(m_node.children[1])
+                    if mod_prefix == "":
+                        self.write_main('turbo_class_set_attr(t_' + class_name + ', "' + attr_name + '", ' + val_c + ');')
+            elif m_node.type == "ANN_ASSIGN":
+                attr_name = m_node.value
+                if len(m_node.children) > 1:
+                    val_c = self.gen_expr(m_node.children[1])
+                    if mod_prefix == "":
+                        self.write_main('turbo_class_set_attr(t_' + class_name + ', "' + attr_name + '", ' + val_c + ');')
             m_idx = m_idx + 1
-        
+
+        # Handle class-level decorators (not dataclass)
         d_idx = 1
         while d_idx < len(node.children):
             if node.children[d_idx].type == "DECORATOR":
-                decorator_c = self.gen_expr(node.children[d_idx].children[0])
-                if mod_prefix == "":
-                    self.write_main("t_" + class_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + class_name + "});")
+                dec_c = node.children[d_idx].children[0]
+                is_special = False
+                if dec_c.type == "NAME":
+                    if dec_c.value == "dataclass":
+                        is_special = True
+                if not is_special:
+                    decorator_c = self.gen_expr(dec_c)
+                    if mod_prefix == "":
+                        self.write_main("t_" + class_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + class_name + "});")
             d_idx = d_idx + 1
 
     def _gen_comp_loops(self, gen_node, container, append_code):
@@ -2095,6 +2220,12 @@ class CodeGen:
                 self.write_code("break;", is_in_func)
         elif node.type == "CONTINUE":
             self.write_code("continue;", is_in_func)
+        elif node.type == "ANN_ASSIGN":
+            target_name = node.value
+            default_node = node.children[1]
+            if default_node.type != "CONST_NONE":
+                val_c = self.gen_expr(default_node)
+                self.write_code("t_" + target_name + " = " + val_c + ";", is_in_func)
         elif node.type == "EXPR":
             expr_c = self.gen_expr(node.children[0])
             self.write_code("(void)(" + expr_c + ");", is_in_func)

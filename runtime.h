@@ -22,7 +22,10 @@ typedef enum {
     TYPE_TUPLE,
     TYPE_SET,
     TYPE_MODULE,
-    TYPE_SUPER
+    TYPE_SUPER,
+    TYPE_STATICMETHOD,
+    TYPE_CLASSMETHOD,
+    TYPE_PROPERTY
 } TurboType;
 
 typedef struct TurboObject TurboObject;
@@ -82,6 +85,10 @@ struct TurboObject {
             TurboCFunction* method_funcs;
             int method_count;
             int method_capacity;
+            char** attr_names;
+            TurboObject** attr_values;
+            int attr_count;
+            int attr_capacity;
         } class_val;
         struct {
             TurboObject* class_obj;
@@ -99,6 +106,19 @@ struct TurboObject {
         struct {
             TurboObject* obj;
         } super_val;
+        struct {
+            TurboCFunction func_ptr;
+            char* name;
+        } staticmethod_val;
+        struct {
+            TurboCFunction func_ptr;
+            char* name;
+        } classmethod_val;
+        struct {
+            TurboCFunction getter;
+            TurboCFunction setter;
+            char* name;
+        } property_val;
     };
 };
 
@@ -174,6 +194,9 @@ TurboObject* make_tuple_from_list(TurboObject* list);
 TurboObject* make_set(void);
 TurboObject* make_dict(void);
 TurboObject* make_func(TurboCFunction func, const char* name);
+TurboObject* make_staticmethod(TurboCFunction func, const char* name);
+TurboObject* make_classmethod(TurboCFunction func, const char* name);
+TurboObject* make_property(TurboCFunction getter, TurboCFunction setter, const char* name);
 TurboObject* make_class(const char* name);
 TurboObject* make_instance(TurboObject* class_obj);
 TurboObject* make_file(FILE* handle);
@@ -269,6 +292,8 @@ TurboObject* turbo_dict_copy(TurboObject* self);
 TurboObject* turbo_dict_setdefault(TurboObject* self, TurboObject* key, TurboObject* default_val);
 
 void turbo_class_add_method(TurboObject* class_obj, const char* name, TurboCFunction func);
+void turbo_class_set_attr(TurboObject* class_obj, const char* name, TurboObject* val);
+TurboObject* turbo_class_get_attr(TurboObject* class_obj, const char* name);
 
 TurboObject* turbo_call(TurboObject* callable, int argc, TurboObject** args);
 TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int argc, TurboObject** args);

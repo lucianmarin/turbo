@@ -110,13 +110,13 @@ Features from Python not yet implemented in Turbo.
 
 ## Object-Oriented Programming
 
-- [ ] `@staticmethod` — static methods
-- [ ] `@classmethod` — class methods
-- [ ] `@property` — computed attributes
-- [ ] `@dataclass` — auto-generated boilerplate
+- [x] `@staticmethod` — static methods
+- [x] `@classmethod` — class methods
+- [x] `@property` — computed attributes
+- [x] `@dataclass` — auto-generated boilerplate
 - [ ] `super()` — parent class method resolution (runtime stub only)
-- [ ] `__str__` / `__repr__` — string representation protocol
-- [ ] Operator overloading: `__add__`, `__eq__`, `__lt__`, etc.
+- [x] `__str__` / `__repr__` — string representation protocol
+- [x] Operator overloading: `__add__`, `__eq__`, `__lt__`, etc.
 - [ ] `__slots__` — memory-efficient attribute declaration
 - [ ] `__new__` / metaclasses — custom instance creation
 - [ ] Abstract base classes
