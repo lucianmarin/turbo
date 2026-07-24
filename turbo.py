@@ -578,7 +578,11 @@ class Parser:
         elif t.type == "yield":
             self.pos = self.pos + 1
             value = None
-            if self.peek().type != 'NEWLINE' and self.peek().type != ')' and self.peek().type != ',':
+            if self.peek().type == "from":
+                self.pos = self.pos + 1
+                value = self.parse_expr()
+                return ASTNode("YIELD_FROM", "", [value])
+            elif self.peek().type != 'NEWLINE' and self.peek().type != ')' and self.peek().type != ',':
                 value = self.parse_expr()
             else:
                 value = ASTNode("CONST_NONE", "", [])
@@ -1055,6 +1059,18 @@ def scan_global_nonlocal_names(body_node):
         idx = idx + 1
     return names
 
+def has_yield(node):
+    if node.type == "YIELD" or node.type == "YIELD_FROM":
+        return True
+    if node.type == "DEF" or node.type == "ASYNC_DEF" or node.type == "CLASS":
+        return False
+    i = 0
+    while i < len(node.children):
+        if has_yield(node.children[i]):
+            return True
+        i = i + 1
+    return False
+
 def escape_c_string(s):
     res = ""
     i = 0
@@ -1084,6 +1100,7 @@ class CodeGen:
         self.local_vars = []
         self.else_loop_stack = []
         self.else_loop_counter = 0
+        self.is_generator = False
 
     def write_header(self, s):
         self.header = self.header + s
@@ -1296,7 +1313,11 @@ class CodeGen:
         elif node.type == "LAMBDA":
             return "turbo_none /* lambda */"
         elif node.type == "YIELD":
-            return "turbo_none /* yield */"
+            val_c = self.gen_expr(node.children[0])
+            return "({ TurboObject* __yv = " + val_c + "; turbo_list_append(__yield_values, __yv); turbo_none; })"
+        elif node.type == "YIELD_FROM":
+            iter_c = self.gen_expr(node.children[0])
+            return "({ TurboObject* __sub = " + iter_c + "; if (__sub->type == TYPE_LIST) { for (int __i = 0; __i < __sub->list_val.length; __i++) { turbo_list_append(__yield_values, __sub->list_val.items[__i]); } } else if (__sub->type == TYPE_TUPLE) { for (int __i = 0; __i < __sub->tuple_val.length; __i++) { turbo_list_append(__yield_values, __sub->tuple_val.items[__i]); } } else if (__sub->type == TYPE_STR) { for (int __i = 0; __i < __sub->str_val.length; __i++) { char __tmp[2] = {__sub->str_val.chars[__i], '\\0'}; turbo_list_append(__yield_values, make_str(__tmp)); } } turbo_none; })"
         elif node.type == "AWAIT":
             return self.gen_expr(node.children[0])
         else:
@@ -1340,6 +1361,10 @@ class CodeGen:
                 l_idx = l_idx + 1
             self.local_vars = new_locals
         
+        generator_func = has_yield(body_node)
+        old_generator = self.is_generator
+        self.is_generator = generator_func
+
         self.write_header("TurboObject* " + impl_name + "(int argc, TurboObject** args);\n")
         
         self.funcs = self.funcs + "TurboObject* " + impl_name + "(int argc, TurboObject** args) {\n"
@@ -1363,12 +1388,20 @@ class CodeGen:
             if not is_param:
                 self.funcs = self.funcs + "    TurboObject* t_" + l_name + " = turbo_none;\n"
             l_idx = l_idx + 1
+        
+        if generator_func:
+            self.funcs = self.funcs + "    TurboObject* __yield_values = make_list();\n"
             
         self.indent_level = 1
         self.gen_block_stmts(body_node, True)
         
-        self.funcs = self.funcs + "    return turbo_none;\n"
+        if generator_func:
+            self.funcs = self.funcs + "    return __yield_values;\n"
+        else:
+            self.funcs = self.funcs + "    return turbo_none;\n"
         self.funcs = self.funcs + "}\n\n"
+        
+        self.is_generator = old_generator
         
         self.local_vars = old_locals
         
@@ -1412,7 +1445,7 @@ class CodeGen:
             self.write_code("continue;", is_in_func)
         elif node.type == "EXPR":
             expr_c = self.gen_expr(node.children[0])
-            self.write_code(expr_c + ";", is_in_func)
+            self.write_code("(void)(" + expr_c + ");", is_in_func)
         elif node.type == "ASSIGN":
             target = node.children[0]
             val_node = node.children[1]
@@ -1466,8 +1499,13 @@ class CodeGen:
                 elif op == '<<=':
                     self.write_code("t_" + target.value + " = turbo_lshift(t_" + target.value + ", " + val_c + ");", is_in_func)
         elif node.type == "RETURN":
-            val_c = self.gen_expr(node.children[0])
-            self.write_code("return " + val_c + ";", is_in_func)
+            if self.is_generator and node.children[0].type != "CONST_NONE":
+                self.gen_expr(node.children[0])
+            if self.is_generator:
+                self.write_code("return __yield_values;", is_in_func)
+            else:
+                val_c = self.gen_expr(node.children[0])
+                self.write_code("return " + val_c + ";", is_in_func)
         elif node.type == "WHILE":
             cond_c = self.gen_expr(node.children[0])
             if len(node.children) > 2:

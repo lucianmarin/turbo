@@ -26,7 +26,7 @@ Features from Python not yet implemented in Turbo.
 - [x] `for` / `else`, `while` / `else` — else clauses on loops
 - [x] `del` — removes list elements and dict keys via `turbo_delitem`; variables set to `turbo_none`
 - [x] `global` / `nonlocal` — names excluded from local variable declarations; `global` resolves to module-level globals; `nonlocal` prevents local shadowing (full closure support not yet implemented)
-- [ ] `yield` / `yield from` — parsed but codegen is a stub (returns `turbo_none`)
+- [x] `yield` / `yield from` — implemented via eager list collection: generator functions collect yielded values into a list and return it at the end; `yield from` iterates the sub-iterator and appends each value
 - [ ] `lambda` — parsed but codegen is a stub (returns `turbo_none`)
 - [ ] `@decorator` — parsed, decorator AST attached to def/class, but never applied in codegen
 - [x] Ternary conditional: `x if cond else y`
