@@ -1548,7 +1548,7 @@ class CodeGen:
             if target.type == "SUBSCRIPT":
                 obj_c = self.gen_expr(target.children[0])
                 idx_c = self.gen_expr(target.children[1])
-                self.write_code("turbo_setitem(" + obj_c + ", " + idx_c + ", turbo_none);", is_in_func)
+                self.write_code("turbo_delitem(" + obj_c + ", " + idx_c + ");", is_in_func)
             elif target.type == "NAME":
                 self.write_code("t_" + target.value + " = turbo_none;", is_in_func)
             else:

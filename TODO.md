@@ -24,7 +24,7 @@ Features from Python not yet implemented in Turbo.
 - [x] `async` / `await` — parsed and codegen produces sync C code; `async def/for/with` are handled; `await` evaluates the expression synchronously
 - [x] `match` / `case` — pattern matching implemented via if/elif chain; supports literal, capture, and wildcard (`_`) patterns
 - [x] `for` / `else`, `while` / `else` — else clauses on loops
-- [ ] `del` — parsed, codegen sets variable to `turbo_none` or subscript to None; does not actually delete
+- [x] `del` — removes list elements and dict keys via `turbo_delitem`; variables set to `turbo_none`
 - [ ] `global` / `nonlocal` — parsed, codegen emits C comments only; no effect on scoping
 - [ ] `yield` / `yield from` — parsed but codegen is a stub (returns `turbo_none`)
 - [ ] `lambda` — parsed but codegen is a stub (returns `turbo_none`)

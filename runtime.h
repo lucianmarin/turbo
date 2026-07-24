@@ -199,6 +199,7 @@ bool turbo_is_truthy(TurboObject* val);
 TurboObject* turbo_len(TurboObject* val);
 TurboObject* turbo_getitem(TurboObject* obj, TurboObject* key);
 void turbo_setitem(TurboObject* obj, TurboObject* key, TurboObject* val);
+void turbo_delitem(TurboObject* obj, TurboObject* key);
 TurboObject* turbo_slice(TurboObject* obj, TurboObject* start, TurboObject* end);
 TurboObject* turbo_getattr(TurboObject* obj, const char* name);
 void turbo_setattr(TurboObject* obj, const char* name, TurboObject* val);

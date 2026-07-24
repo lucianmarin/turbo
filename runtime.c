@@ -1770,6 +1770,42 @@ void turbo_setitem(TurboObject* obj, TurboObject* key, TurboObject* val) {
     exit(1);
 }
 
+void turbo_delitem(TurboObject* obj, TurboObject* key) {
+    if (obj->type == TYPE_LIST) {
+        if (key->type != TYPE_INT) {
+            fprintf(stderr, "TypeError: list indices must be integers\n");
+            exit(1);
+        }
+        long long idx = int_to_ll(key);
+        if (idx < 0) idx += obj->list_val.length;
+        if (idx < 0 || idx >= obj->list_val.length) {
+            fprintf(stderr, "IndexError: list index out of range\n");
+            exit(1);
+        }
+        for (long long i = idx; i < obj->list_val.length - 1; i++) {
+            obj->list_val.items[i] = obj->list_val.items[i + 1];
+        }
+        obj->list_val.length--;
+        return;
+    }
+    if (obj->type == TYPE_DICT) {
+        for (int i = 0; i < obj->dict_val.length; i++) {
+            if (is_equal(obj->dict_val.keys[i], key)) {
+                for (int j = i; j < obj->dict_val.length - 1; j++) {
+                    obj->dict_val.keys[j] = obj->dict_val.keys[j + 1];
+                    obj->dict_val.values[j] = obj->dict_val.values[j + 1];
+                }
+                obj->dict_val.length--;
+                return;
+            }
+        }
+        fprintf(stderr, "KeyError: key not found in dict\n");
+        exit(1);
+    }
+    fprintf(stderr, "TypeError: object does not support item deletion\n");
+    exit(1);
+}
+
 TurboObject* turbo_slice(TurboObject* obj, TurboObject* start, TurboObject* end) {
     long long len = 0;
     bool is_bytes = false;
