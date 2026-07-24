@@ -698,6 +698,9 @@ class Parser:
             self.pos = self.pos + 1
             cond = self.parse_expr()
             body = self.parse_suite()
+            if self.match("else"):
+                else_body = self.parse_suite()
+                return ASTNode("WHILE", "", [cond, body, else_body])
             return ASTNode("WHILE", "", [cond, body])
 
         elif t.type == "for":
@@ -706,6 +709,9 @@ class Parser:
             self.consume("in")
             iterable = self.parse_expr()
             body = self.parse_suite()
+            if self.match("else"):
+                else_body = self.parse_suite()
+                return ASTNode("FOR", var_name, [iterable, body, else_body])
             return ASTNode("FOR", var_name, [iterable, body])
 
         elif t.type == "return":
@@ -874,6 +880,9 @@ class Parser:
                 self.consume("in")
                 iterable = self.parse_expr()
                 body = self.parse_suite()
+                if self.match("else"):
+                    else_body = self.parse_suite()
+                    return ASTNode("ASYNC_FOR", var_name, [iterable, body, else_body])
                 return ASTNode("ASYNC_FOR", var_name, [iterable, body])
             elif next_t.type == "with":
                 self.pos = self.pos + 1
@@ -1056,6 +1065,8 @@ class CodeGen:
         self.main_body = ""
         self.indent_level = 0
         self.local_vars = []
+        self.else_loop_stack = []
+        self.else_loop_counter = 0
 
     def write_header(self, s):
         self.header = self.header + s
@@ -1357,7 +1368,10 @@ class CodeGen:
         elif node.type == "IMPORT":
             self.write_code("/* import " + node.value + " */;", is_in_func)
         elif node.type == "BREAK":
-            self.write_code("break;", is_in_func)
+            if len(self.else_loop_stack) > 0:
+                self.write_code(self.else_loop_stack[-1] + " = 1; break;", is_in_func)
+            else:
+                self.write_code("break;", is_in_func)
         elif node.type == "CONTINUE":
             self.write_code("continue;", is_in_func)
         elif node.type == "EXPR":
@@ -1420,16 +1434,44 @@ class CodeGen:
             self.write_code("return " + val_c + ";", is_in_func)
         elif node.type == "WHILE":
             cond_c = self.gen_expr(node.children[0])
-            self.write_code("while (turbo_is_truthy(" + cond_c + ")) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.gen_block_stmts(node.children[1], is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
+            if len(node.children) > 2:
+                flag_name = "_turbo_brk_" + str(self.else_loop_counter)
+                self.else_loop_counter = self.else_loop_counter + 1
+                self.else_loop_stack.append(flag_name)
+                self.write_code("{", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.write_code("int " + flag_name + " = 0;", is_in_func)
+                self.write_code("while (turbo_is_truthy(" + cond_c + ")) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.gen_block_stmts(node.children[1], is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+                self.write_code("if (!" + flag_name + ") {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.gen_block_stmts(node.children[2], is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+                self.else_loop_stack.pop()
+            else:
+                self.write_code("while (turbo_is_truthy(" + cond_c + ")) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.gen_block_stmts(node.children[1], is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
         elif node.type == "FOR":
             var_name = node.value
             iter_c = self.gen_expr(node.children[0])
+            do_else = len(node.children) > 2
+            if do_else:
+                flag_name = "_turbo_brk_" + str(self.else_loop_counter)
+                self.else_loop_counter = self.else_loop_counter + 1
+                self.else_loop_stack.append(flag_name)
             self.write_code("{", is_in_func)
             self.indent_level = self.indent_level + 1
+            if do_else:
+                self.write_code("int " + flag_name + " = 0;", is_in_func)
             self.write_code("TurboObject* _iter = " + iter_c + ";", is_in_func)
             self.write_code("if (_iter->type == TYPE_LIST) {", is_in_func)
             self.indent_level = self.indent_level + 1
@@ -1460,8 +1502,16 @@ class CodeGen:
             self.write_code("}", is_in_func)
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
+            if do_else:
+                self.write_code("if (!" + flag_name + ") {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.gen_block_stmts(node.children[2], is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
+            if do_else:
+                self.else_loop_stack.pop()
         elif node.type == "ASYNC_FOR":
             self.gen_stmt(ASTNode("FOR", node.value, node.children), is_in_func)
         elif node.type == "IF":

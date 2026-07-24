@@ -417,6 +417,7 @@ TurboObject* t_impl_Lexer_collect_locals(int argc, TurboObject** args) {
     TurboObject* t_found = turbo_none;
     TurboObject* t_i = turbo_none;
     TurboObject* t_exc_var = turbo_none;
+    TurboObject* t_alias_node = turbo_none;
     TurboObject* t_idx = turbo_none;
     if (turbo_is_truthy(({ TurboObject* _lh = turbo_eq(turbo_getattr(t_node, "type"), make_str("ASSIGN")); turbo_is_truthy(_lh) ? _lh : turbo_eq(turbo_getattr(t_node, "type"), make_str("AUGASSIGN")); }))) {
         t_target = turbo_getitem(turbo_getattr(t_node, "children"), make_int("0"));
@@ -436,7 +437,7 @@ TurboObject* t_impl_Lexer_collect_locals(int argc, TurboObject** args) {
             }
         }
     } else {
-        if (turbo_is_truthy(turbo_eq(turbo_getattr(t_node, "type"), make_str("FOR")))) {
+        if (turbo_is_truthy(({ TurboObject* _lh = turbo_eq(turbo_getattr(t_node, "type"), make_str("FOR")); turbo_is_truthy(_lh) ? _lh : turbo_eq(turbo_getattr(t_node, "type"), make_str("ASYNC_FOR")); }))) {
             t_name = turbo_getattr(t_node, "value");
             t_found = turbo_false;
             t_i = make_int("0");
@@ -469,7 +470,40 @@ TurboObject* t_impl_Lexer_collect_locals(int argc, TurboObject** args) {
             }
         }
     }
-    if (turbo_is_truthy(turbo_eq(turbo_getattr(t_node, "type"), make_str("DEF")))) {
+    if (turbo_is_truthy(({ TurboObject* _lh = turbo_eq(turbo_getattr(t_node, "type"), make_str("WITH")); turbo_is_truthy(_lh) ? _lh : turbo_eq(turbo_getattr(t_node, "type"), make_str("ASYNC_WITH")); }))) {
+        t_alias_node = turbo_getitem(turbo_getattr(t_node, "children"), make_int("1"));
+        if (turbo_is_truthy(turbo_eq(turbo_getattr(t_alias_node, "type"), make_str("NAME")))) {
+            t_name = turbo_getattr(t_alias_node, "value");
+            t_found = turbo_false;
+            t_i = make_int("0");
+            while (turbo_is_truthy(turbo_lt(t_i, turbo_call(t_len, 1, (TurboObject*[]){t_locals_list})))) {
+                if (turbo_is_truthy(turbo_eq(turbo_getitem(t_locals_list, t_i), t_name))) {
+                    t_found = turbo_true;
+                    break;
+                }
+                t_i = turbo_add(t_i, make_int("1"));
+            }
+            if (turbo_is_truthy(turbo_not(t_found))) {
+                turbo_call_method(t_locals_list, "append", 1, (TurboObject*[]){t_name});
+            }
+        }
+    }
+    if (turbo_is_truthy(turbo_eq(turbo_getattr(t_node, "type"), make_str("PATTERN_CAP")))) {
+        t_name = turbo_getattr(t_node, "value");
+        t_found = turbo_false;
+        t_i = make_int("0");
+        while (turbo_is_truthy(turbo_lt(t_i, turbo_call(t_len, 1, (TurboObject*[]){t_locals_list})))) {
+            if (turbo_is_truthy(turbo_eq(turbo_getitem(t_locals_list, t_i), t_name))) {
+                t_found = turbo_true;
+                break;
+            }
+            t_i = turbo_add(t_i, make_int("1"));
+        }
+        if (turbo_is_truthy(turbo_not(t_found))) {
+            turbo_call_method(t_locals_list, "append", 1, (TurboObject*[]){t_name});
+        }
+    }
+    if (turbo_is_truthy(({ TurboObject* _lh = turbo_eq(turbo_getattr(t_node, "type"), make_str("DEF")); turbo_is_truthy(_lh) ? _lh : turbo_eq(turbo_getattr(t_node, "type"), make_str("ASYNC_DEF")); }))) {
         return turbo_none;
     }
     t_idx = make_int("0");
