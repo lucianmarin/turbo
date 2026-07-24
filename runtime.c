@@ -95,9 +95,12 @@ static TurboObject* builtin_chr(int argc, TurboObject** args) {
 }
 
 static TurboObject* builtin_open(int argc, TurboObject** args) {
-    if (argc != 2) {
-        fprintf(stderr, "TypeError: open() takes exactly 2 arguments\n");
+    if (argc < 1 || argc > 2) {
+        fprintf(stderr, "TypeError: open() takes 1 or 2 arguments\n");
         exit(1);
+    }
+    if (argc == 1) {
+        return turbo_open(args[0], make_str("r"));
     }
     return turbo_open(args[0], args[1]);
 }
@@ -3080,6 +3083,26 @@ TurboObject* turbo_str_count(TurboObject* self, TurboObject* sub) {
     return make_int_from_ll(count);
 }
 
+static TurboObject* format_arg_with_spec(TurboObject* arg, const char* spec, int spec_len) {
+    if (spec == NULL || spec_len == 0) {
+        return turbo_str(arg);
+    }
+    if (spec_len > 1 && spec[0] == '.' && spec[spec_len - 1] == 'f') {
+        int prec = 0;
+        int p = 1;
+        while (p < spec_len - 1 && spec[p] >= '0' && spec[p] <= '9') {
+            prec = prec * 10 + (spec[p] - '0');
+            p++;
+        }
+        if (p == spec_len - 1 && arg->type == TYPE_FLOAT) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%.*f", prec, arg->float_val);
+            return make_str(buf);
+        }
+    }
+    return turbo_str(arg);
+}
+
 TurboObject* turbo_str_format(TurboObject* self, int argc, TurboObject** args) {
     const char* fmt = self->str_val.chars;
     int fmt_len = self->str_val.length;
@@ -3101,12 +3124,22 @@ TurboObject* turbo_str_format(TurboObject* self, int argc, TurboObject** args) {
                         i++;
                     }
                 }
+                const char* spec = NULL;
+                int spec_len = 0;
+                if (i < fmt_len && fmt[i] == ':') {
+                    i++;
+                    spec = fmt + i;
+                    while (i < fmt_len && fmt[i] != '}') {
+                        i++;
+                    }
+                    spec_len = (fmt + i) - spec;
+                }
                 if (i < fmt_len) i++;
                 if (idx >= argc) {
                     fprintf(stderr, "IndexError: tuple index out of range\n");
                     exit(1);
                 }
-                TurboObject* arg_str = turbo_str(args[idx]);
+                TurboObject* arg_str = format_arg_with_spec(args[idx], spec, spec_len);
                 total_len += arg_str->str_val.length;
                 arg_idx = idx + 1 > arg_idx ? idx + 1 : arg_idx;
             }
@@ -3140,8 +3173,18 @@ TurboObject* turbo_str_format(TurboObject* self, int argc, TurboObject** args) {
                         i++;
                     }
                 }
+                const char* spec = NULL;
+                int spec_len = 0;
+                if (i < fmt_len && fmt[i] == ':') {
+                    i++;
+                    spec = fmt + i;
+                    while (i < fmt_len && fmt[i] != '}') {
+                        i++;
+                    }
+                    spec_len = (fmt + i) - spec;
+                }
                 if (i < fmt_len) i++;
-                TurboObject* arg_str = turbo_str(args[idx]);
+                TurboObject* arg_str = format_arg_with_spec(args[idx], spec, spec_len);
                 memcpy(result + pos, arg_str->str_val.chars, arg_str->str_val.length);
                 pos += arg_str->str_val.length;
                 arg_idx = idx + 1 > arg_idx ? idx + 1 : arg_idx;
@@ -3724,6 +3767,21 @@ TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int ar
         if (strcmp(method_name, "close") == 0) {
             if (argc != 0) {
                 fprintf(stderr, "TypeError: close() takes no arguments\n");
+                exit(1);
+            }
+            turbo_file_close(obj);
+            return turbo_none;
+        }
+        if (strcmp(method_name, "__enter__") == 0) {
+            if (argc != 0) {
+                fprintf(stderr, "TypeError: __enter__() takes no arguments\n");
+                exit(1);
+            }
+            return obj;
+        }
+        if (strcmp(method_name, "__exit__") == 0) {
+            if (argc != 3) {
+                fprintf(stderr, "TypeError: __exit__() takes exactly 3 arguments\n");
                 exit(1);
             }
             turbo_file_close(obj);

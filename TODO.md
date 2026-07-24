@@ -135,3 +135,9 @@ Features from Python not yet implemented in Turbo.
 - [ ] Step parameter in slicing: `seq[start:stop:step]`
 - [ ] Garbage collector or reference counting (currently malloc-only)
 - [x] Package system / `__init__.py`
+
+## Extras
+
+- [x] File context manager protocol — `open()` file objects support `__enter__`/`__exit__`
+- [x] `open()` default mode — accepts 1 arg, defaults to `"r"`
+- [x] `str.format()` format specifiers — supports `:.Nf` for float precision
