@@ -16,14 +16,16 @@ TurboObject* t_impl_Greeter___init__(int argc, TurboObject** args);
 TurboObject* t_impl_Greeter_greet(int argc, TurboObject** args);
 TurboObject* t_impl_test_classes(int argc, TurboObject** args);
 TurboObject* t_test_classes = NULL;
+TurboObject* t_impl_test_bigint(int argc, TurboObject** args);
+TurboObject* t_test_bigint = NULL;
 TurboObject* t_impl_main(int argc, TurboObject** args);
 TurboObject* t_main = NULL;
 
 TurboObject* t_impl_test_arithmetic(int argc, TurboObject** args) {
     TurboObject* t_x = turbo_none;
     TurboObject* t_y = turbo_none;
-    t_x = make_int(10);
-    t_y = make_int(3);
+    t_x = make_int("10");
+    t_y = make_int("3");
     turbo_call(t_print, 1, (TurboObject*[]){make_str("Arithmetic:")});
     turbo_call(t_print, 2, (TurboObject*[]){make_str("x + y ="), turbo_add(t_x, t_y)});
     turbo_call(t_print, 2, (TurboObject*[]){make_str("x - y ="), turbo_sub(t_x, t_y)});
@@ -37,8 +39,8 @@ TurboObject* t_impl_test_comparisons(int argc, TurboObject** args) {
     TurboObject* t_x = turbo_none;
     TurboObject* t_y = turbo_none;
     turbo_call(t_print, 1, (TurboObject*[]){make_str("Comparisons:")});
-    t_x = make_int(5);
-    t_y = make_int(10);
+    t_x = make_int("5");
+    t_y = make_int("10");
     turbo_call(t_print, 2, (TurboObject*[]){make_str("x < y:"), turbo_lt(t_x, t_y)});
     turbo_call(t_print, 2, (TurboObject*[]){make_str("x > y:"), turbo_gt(t_x, t_y)});
     turbo_call(t_print, 2, (TurboObject*[]){make_str("x == y:"), turbo_eq(t_x, t_y)});
@@ -49,14 +51,14 @@ TurboObject* t_impl_test_comparisons(int argc, TurboObject** args) {
 TurboObject* t_impl_test_lists(int argc, TurboObject** args) {
     TurboObject* t_lst = turbo_none;
     turbo_call(t_print, 1, (TurboObject*[]){make_str("Lists:")});
-    t_lst = ({ TurboObject* _lst = make_list(); turbo_list_append(_lst, make_int(1)); turbo_list_append(_lst, make_int(2));  _lst; });
-    turbo_call_method(t_lst, "append", 1, (TurboObject*[]){make_int(3)});
-    turbo_call_method(t_lst, "append", 1, (TurboObject*[]){make_int(4)});
+    t_lst = ({ TurboObject* _lst = make_list(); turbo_list_append(_lst, make_int("1")); turbo_list_append(_lst, make_int("2"));  _lst; });
+    turbo_call_method(t_lst, "append", 1, (TurboObject*[]){make_int("3")});
+    turbo_call_method(t_lst, "append", 1, (TurboObject*[]){make_int("4")});
     turbo_call(t_print, 2, (TurboObject*[]){make_str("lst:"), t_lst});
     turbo_call(t_print, 2, (TurboObject*[]){make_str("len(lst):"), turbo_call(t_len, 1, (TurboObject*[]){t_lst})});
-    turbo_call(t_print, 2, (TurboObject*[]){make_str("lst[0]:"), turbo_getitem(t_lst, make_int(0))});
-    turbo_call(t_print, 2, (TurboObject*[]){make_str("lst[-1]:"), turbo_getitem(t_lst, turbo_sub(make_int(0), make_int(1)))});
-    turbo_call(t_print, 2, (TurboObject*[]){make_str("lst[1:3]:"), turbo_slice(t_lst, make_int(1), make_int(3))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("lst[0]:"), turbo_getitem(t_lst, make_int("0"))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("lst[-1]:"), turbo_getitem(t_lst, turbo_sub(make_int("0"), make_int("1")))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("lst[1:3]:"), turbo_slice(t_lst, make_int("1"), make_int("3"))});
     return turbo_none;
 }
 
@@ -67,8 +69,8 @@ TurboObject* t_impl_test_strings(int argc, TurboObject** args) {
     t_s = turbo_add(make_str("hello"), make_str(" world"));
     turbo_call(t_print, 2, (TurboObject*[]){make_str("s:"), t_s});
     turbo_call(t_print, 2, (TurboObject*[]){make_str("len(s):"), turbo_call(t_len, 1, (TurboObject*[]){t_s})});
-    turbo_call(t_print, 2, (TurboObject*[]){make_str("s[0]:"), turbo_getitem(t_s, make_int(0))});
-    turbo_call(t_print, 2, (TurboObject*[]){make_str("s[6:11]:"), turbo_slice(t_s, make_int(6), make_int(11))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("s[0]:"), turbo_getitem(t_s, make_int("0"))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("s[6:11]:"), turbo_slice(t_s, make_int("6"), make_int("11"))});
     t_parts = turbo_call_method(t_s, "split", 0, NULL);
     turbo_call(t_print, 2, (TurboObject*[]){make_str("split parts:"), t_parts});
     return turbo_none;
@@ -79,16 +81,21 @@ TurboObject* t_impl_test_loops(int argc, TurboObject** args) {
     TurboObject* t_j = turbo_none;
     TurboObject* t_item = turbo_none;
     turbo_call(t_print, 1, (TurboObject*[]){make_str("Loops:")});
-    t_i = make_int(0);
-    while (turbo_is_truthy(turbo_lt(t_i, make_int(3)))) {
+    t_i = make_int("0");
+    while (turbo_is_truthy(turbo_lt(t_i, make_int("3")))) {
         turbo_call(t_print, 2, (TurboObject*[]){make_str("while loop count:"), t_i});
-        t_i = turbo_add(t_i, make_int(1));
+        t_i = turbo_add(t_i, make_int("1"));
     }
     {
-        TurboObject* _iter = turbo_call(t_range, 1, (TurboObject*[]){make_int(3)});
+        TurboObject* _iter = turbo_call(t_range, 1, (TurboObject*[]){make_int("3")});
         if (_iter->type == TYPE_LIST) {
             for (int _i = 0; _i < _iter->list_val.length; _i++) {
                 t_j = _iter->list_val.items[_i];
+                turbo_call(t_print, 2, (TurboObject*[]){make_str("for j in range(3):"), t_j});
+            }
+        } else if (_iter->type == TYPE_TUPLE) {
+            for (int _i = 0; _i < _iter->tuple_val.length; _i++) {
+                t_j = _iter->tuple_val.items[_i];
                 turbo_call(t_print, 2, (TurboObject*[]){make_str("for j in range(3):"), t_j});
             }
         } else if (_iter->type == TYPE_STR) {
@@ -104,6 +111,11 @@ TurboObject* t_impl_test_loops(int argc, TurboObject** args) {
         if (_iter->type == TYPE_LIST) {
             for (int _i = 0; _i < _iter->list_val.length; _i++) {
                 t_item = _iter->list_val.items[_i];
+                turbo_call(t_print, 2, (TurboObject*[]){make_str("for item in list:"), t_item});
+            }
+        } else if (_iter->type == TYPE_TUPLE) {
+            for (int _i = 0; _i < _iter->tuple_val.length; _i++) {
+                t_item = _iter->tuple_val.items[_i];
                 turbo_call(t_print, 2, (TurboObject*[]){make_str("for item in list:"), t_item});
             }
         } else if (_iter->type == TYPE_STR) {
@@ -140,6 +152,38 @@ TurboObject* t_impl_test_classes(int argc, TurboObject** args) {
     return turbo_none;
 }
 
+TurboObject* t_impl_test_bigint(int argc, TurboObject** args) {
+    TurboObject* t_a = turbo_none;
+    TurboObject* t_b = turbo_none;
+    TurboObject* t_c = turbo_none;
+    TurboObject* t_d = turbo_none;
+    TurboObject* t_e = turbo_none;
+    turbo_call(t_print, 1, (TurboObject*[]){make_str("BigInts:")});
+    t_a = make_int("123456789012345678901234567890");
+    t_b = make_int("987654321098765432109876543210");
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("a + b ="), turbo_add(t_a, t_b)});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("b - a ="), turbo_sub(t_b, t_a)});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("a * b ="), turbo_mul(t_a, t_b)});
+    t_c = turbo_pow(make_int("2"), make_int("100"));
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("2 ** 100 ="), t_c});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("c - 1 ="), turbo_sub(t_c, make_int("1"))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("-c ="), turbo_sub(make_int("0"), t_c)});
+    t_d = make_int("1000000000000000000000000000000");
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("d // 3 ="), turbo_floordiv(t_d, make_int("3"))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("d % 3 ="), turbo_mod(t_d, make_int("3"))});
+    t_e = turbo_sub(make_int("0"), make_int("123456789012345678901234567890"));
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("e ="), t_e});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("abs(e) ="), turbo_call(t_abs, 1, (TurboObject*[]){t_e})});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("e + 10 ="), turbo_add(t_e, make_int("10"))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("a > b:"), turbo_gt(t_a, t_b)});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("a < b:"), turbo_lt(t_a, t_b)});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("a == a:"), turbo_eq(t_a, t_a)});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("a != b:"), turbo_ne(t_a, t_b)});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("e < 0:"), turbo_lt(t_e, make_int("0"))});
+    turbo_call(t_print, 2, (TurboObject*[]){make_str("e > 0:"), turbo_gt(t_e, make_int("0"))});
+    return turbo_none;
+}
+
 TurboObject* t_impl_main(int argc, TurboObject** args) {
     turbo_call(t_test_arithmetic, 0, NULL);
     turbo_call(t_test_comparisons, 0, NULL);
@@ -147,6 +191,7 @@ TurboObject* t_impl_main(int argc, TurboObject** args) {
     turbo_call(t_test_strings, 0, NULL);
     turbo_call(t_test_loops, 0, NULL);
     turbo_call(t_test_classes, 0, NULL);
+    turbo_call(t_test_bigint, 0, NULL);
     return turbo_none;
 }
 
@@ -161,6 +206,7 @@ void turbo_main(void) {
     turbo_class_add_method(t_Greeter, "__init__", t_impl_Greeter___init__);
     turbo_class_add_method(t_Greeter, "greet", t_impl_Greeter_greet);
     t_test_classes = make_func(t_impl_test_classes, "test_classes");
+    t_test_bigint = make_func(t_impl_test_bigint, "test_bigint");
     t_main = make_func(t_impl_main, "main");
     turbo_call(t_main, 0, NULL);
 }

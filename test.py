@@ -70,6 +70,31 @@ def test_classes():
     g.greet("Turbo")
     print("g.prefix attribute access:", g.prefix)
 
+def test_bigint():
+    print("BigInts:")
+    a = 123456789012345678901234567890
+    b = 987654321098765432109876543210
+    print("a + b =", a + b)
+    print("b - a =", b - a)
+    print("a * b =", a * b)
+    c = 2 ** 100
+    print("2 ** 100 =", c)
+    print("c - 1 =", c - 1)
+    print("-c =", -c)
+    d = 1000000000000000000000000000000
+    print("d // 3 =", d // 3)
+    print("d % 3 =", d % 3)
+    e = -123456789012345678901234567890
+    print("e =", e)
+    print("abs(e) =", abs(e))
+    print("e + 10 =", e + 10)
+    print("a > b:", a > b)
+    print("a < b:", a < b)
+    print("a == a:", a == a)
+    print("a != b:", a != b)
+    print("e < 0:", e < 0)
+    print("e > 0:", e > 0)
+
 def main():
     test_arithmetic()
     test_comparisons()
@@ -77,5 +102,6 @@ def main():
     test_strings()
     test_loops()
     test_classes()
+    test_bigint()
 
 main()
