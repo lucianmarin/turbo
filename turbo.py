@@ -102,7 +102,7 @@ class Lexer:
                     continue
             if p + 1 < len(line):
                 two_chars = line[p] + line[p+1]
-                if two_chars == '==' or two_chars == '!=' or two_chars == '<=' or two_chars == '>=' or two_chars == '+=' or two_chars == '-=' or two_chars == '*=' or two_chars == '/=' or two_chars == '%=' or two_chars == '**' or two_chars == '//' or two_chars == '<<' or two_chars == '>>' or two_chars == '&=' or two_chars == '|=' or two_chars == '^=' or two_chars == ':=' or two_chars == '->':
+                if two_chars == '==' or two_chars == '!=' or two_chars == '<=' or two_chars == '>=' or two_chars == '+=' or two_chars == '-=' or two_chars == '*=' or two_chars == '/=' or two_chars == '%=' or two_chars == '**' or two_chars == '//' or two_chars == '<<' or two_chars == '>>' or two_chars == '&=' or two_chars == '|=' or two_chars == '^=' or two_chars == ':=' or two_chars == '->' or two_chars == '@=':
                     self.tokens.append(Token(two_chars, two_chars, line_num))
                     p = p + 2
                     continue
@@ -941,7 +941,7 @@ class Parser:
                 value = self.parse_expr()
                 self.consume('NEWLINE')
                 return ASTNode("ASSIGN", "", [expr, value])
-            elif next_t.type == '+=' or next_t.type == '-=' or next_t.type == '*=' or next_t.type == '/=' or next_t.type == '%=' or next_t.type == '**=' or next_t.type == '//=' or next_t.type == '&=' or next_t.type == '|=' or next_t.type == '^=' or next_t.type == '>>=' or next_t.type == '<<=':
+            elif next_t.type == '+=' or next_t.type == '-=' or next_t.type == '*=' or next_t.type == '/=' or next_t.type == '%=' or next_t.type == '**=' or next_t.type == '//=' or next_t.type == '&=' or next_t.type == '|=' or next_t.type == '^=' or next_t.type == '>>=' or next_t.type == '<<=' or next_t.type == '@=':
                 op = next_t.type
                 self.pos = self.pos + 1
                 value = self.parse_expr()
@@ -1556,6 +1556,8 @@ class CodeGen:
                     self.write_code("t_" + target.value + " = turbo_rshift(t_" + target.value + ", " + val_c + ");", is_in_func)
                 elif op == '<<=':
                     self.write_code("t_" + target.value + " = turbo_lshift(t_" + target.value + ", " + val_c + ");", is_in_func)
+                elif op == '@=':
+                    self.write_code("t_" + target.value + " = turbo_matmul(t_" + target.value + ", " + val_c + ");", is_in_func)
         elif node.type == "RETURN":
             if self.is_generator and node.children[0].type != "CONST_NONE":
                 self.gen_expr(node.children[0])

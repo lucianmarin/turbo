@@ -37,8 +37,8 @@ Features from Python not yet implemented in Turbo.
 - [x] `**` — exponentiation
 - [x] `//` — floor division
 - [x] Bitwise: `&`, `|`, `^`, `~`, `<<`, `>>`
-- [ ] `@` — matrix multiplication (runtime stub: prints NotImplementedError and exits)
-- [x] Augmented assignments: `*=`, `/=`, `%=`, `//=`, `**=`, `&=`, `|=`, `^=`, `>>=`, `<<=`
+- [x] `@` — matrix multiplication on lists of lists with dimension validation
+- [x] Augmented assignments: `*=`, `/=`, `%=`, `//=`, `**=`, `&=`, `|=`, `^=`, `>>=`, `<<=`, `@=`
 
 ## Comprehensions
 

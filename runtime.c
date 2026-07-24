@@ -1444,10 +1444,66 @@ TurboObject* turbo_rshift(TurboObject* a, TurboObject* b) {
 }
 
 TurboObject* turbo_matmul(TurboObject* a, TurboObject* b) {
-    (void)a;
-    (void)b;
-    fprintf(stderr, "NotImplementedError: matrix multiplication (@) not implemented\n");
-    exit(1);
+    if (a->type != TYPE_LIST || b->type != TYPE_LIST) {
+        fprintf(stderr, "TypeError: matrix multiplication (@) requires both arguments to be lists\n");
+        exit(1);
+    }
+    if (a->list_val.length == 0 || b->list_val.length == 0) {
+        fprintf(stderr, "ValueError: cannot multiply empty matrices\n");
+        exit(1);
+    }
+    TurboObject* first_row = a->list_val.items[0];
+    if (first_row->type != TYPE_LIST) {
+        fprintf(stderr, "TypeError: matrix multiplication (@) requires list of lists\n");
+        exit(1);
+    }
+    int m = a->list_val.length;
+    int n = first_row->list_val.length;
+    for (int i = 1; i < m; i++) {
+        if (a->list_val.items[i]->type != TYPE_LIST ||
+            a->list_val.items[i]->list_val.length != n) {
+            fprintf(stderr, "ValueError: matrix A has inconsistent row lengths\n");
+            exit(1);
+        }
+    }
+    for (int i = 0; i < b->list_val.length; i++) {
+        if (b->list_val.items[i]->type != TYPE_LIST) {
+            fprintf(stderr, "TypeError: matrix multiplication (@) requires list of lists\n");
+            exit(1);
+        }
+    }
+    int p = b->list_val.items[0]->list_val.length;
+    for (int i = 1; i < b->list_val.length; i++) {
+        if (b->list_val.items[i]->list_val.length != p) {
+            fprintf(stderr, "ValueError: matrix B has inconsistent row lengths\n");
+            exit(1);
+        }
+    }
+    if (n != b->list_val.length) {
+        fprintf(stderr, "ValueError: incompatible dimensions for matrix multiplication: A(%d,%d) and B(%d,%d)\n", m, n, b->list_val.length, p);
+        exit(1);
+    }
+    TurboObject* result = make_list();
+    for (int i = 0; i < m; i++) {
+        TurboObject* row = make_list();
+        for (int j = 0; j < p; j++) {
+            TurboObject* sum = NULL;
+            for (int k = 0; k < n; k++) {
+                TurboObject* a_ik = turbo_getitem(turbo_getitem(a, make_int_from_ll(i)), make_int_from_ll(k));
+                TurboObject* b_kj = turbo_getitem(turbo_getitem(b, make_int_from_ll(k)), make_int_from_ll(j));
+                TurboObject* prod = turbo_mul(a_ik, b_kj);
+                if (k == 0) {
+                    sum = prod;
+                } else {
+                    TurboObject* new_sum = turbo_add(sum, prod);
+                    sum = new_sum;
+                }
+            }
+            turbo_list_append(row, sum);
+        }
+        turbo_list_append(result, row);
+    }
+    return result;
 }
 
 TurboObject* turbo_bitnot(TurboObject* a) {
