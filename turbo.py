@@ -602,6 +602,18 @@ class Parser:
         self.consume('DEDENT')
         return ASTNode("BLOCK", "", stmts)
 
+    def parse_pattern(self):
+        t = self.peek()
+        if t.type == "NAME" and t.value == "_":
+            self.pos = self.pos + 1
+            return ASTNode("PATTERN_WC", "", [])
+        elif t.type == "NAME":
+            self.pos = self.pos + 1
+            return ASTNode("PATTERN_CAP", t.value, [])
+        else:
+            expr = self.parse_expr()
+            return ASTNode("PATTERN_LIT", "", [expr])
+
     def parse_stmt(self):
         t = self.peek()
         
@@ -885,14 +897,23 @@ class Parser:
             self.consume(':')
             self.consume('NEWLINE')
             self.consume('INDENT')
+            cases = []
             while self.peek().type == "case":
                 self.pos = self.pos + 1
-                # Skip case pattern
-                while self.peek().type != ':':
-                    self.pos = self.pos + 1
-                self.parse_suite()
+                pattern = self.parse_pattern()
+                self.consume(':')
+                self.consume('NEWLINE')
+                self.consume('INDENT')
+                body_stmts = []
+                while self.peek().type != 'DEDENT' and self.peek().type != 'EOF':
+                    body_stmts.append(self.parse_stmt())
+                self.consume('DEDENT')
+                body = ASTNode("BLOCK", "", body_stmts)
+                cases.append(ASTNode("CASE", "", [pattern, body]))
             self.consume('DEDENT')
-            return ASTNode("EXPR", "", [subject])
+            result = ASTNode("MATCH", "", [subject])
+            result.children.extend(cases)
+            return result
 
         else:
             expr = self.parse_expr()
@@ -980,6 +1001,18 @@ def collect_locals(node, locals_list):
             if not found:
                 locals_list.append(name)
     
+    if node.type == "PATTERN_CAP":
+        name = node.value
+        found = False
+        i = 0
+        while i < len(locals_list):
+            if locals_list[i] == name:
+                found = True
+                break
+            i = i + 1
+        if not found:
+            locals_list.append(name)
+
     if node.type == "DEF" or node.type == "ASYNC_DEF":
         return
 
@@ -1583,6 +1616,44 @@ class CodeGen:
                 self.gen_block_stmts(finally_body, is_in_func)
             if len(handlers_node.children) == 0:
                 self.write_code("if (_exc_had) { turbo_raise(_exc_val); }", is_in_func)
+            self.indent_level = self.indent_level - 1
+            self.write_code("}", is_in_func)
+        elif node.type == "MATCH":
+            subject_expr = self.gen_expr(node.children[0])
+            self.write_code("{", is_in_func)
+            self.indent_level = self.indent_level + 1
+            self.write_code("TurboObject *__match_subject = " + subject_expr + ";", is_in_func)
+            n = len(node.children)
+            i = 1
+            while i < n:
+                case_node = node.children[i]
+                pattern_node = case_node.children[0]
+                body_node = case_node.children[1]
+                is_first = (i == 1)
+                if pattern_node.type == "PATTERN_LIT":
+                    lit_expr = self.gen_expr(pattern_node.children[0])
+                    cond = "turbo_is_truthy(turbo_eq(__match_subject, " + lit_expr + "))"
+                    if is_first:
+                        self.write_code("if (" + cond + ") {", is_in_func)
+                    else:
+                        self.write_code("} else if (" + cond + ") {", is_in_func)
+                elif pattern_node.type == "PATTERN_CAP":
+                    if is_first:
+                        self.write_code("if (1) {", is_in_func)
+                    else:
+                        self.write_code("} else {", is_in_func)
+                elif pattern_node.type == "PATTERN_WC":
+                    if is_first:
+                        self.write_code("if (1) {", is_in_func)
+                    else:
+                        self.write_code("} else {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                if pattern_node.type == "PATTERN_CAP":
+                    self.write_code("t_" + pattern_node.value + " = __match_subject;", is_in_func)
+                self.gen_block_stmts(body_node, is_in_func)
+                self.indent_level = self.indent_level - 1
+                i = i + 1
+            self.write_code("}", is_in_func)
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
         elif node.type == "DEF" or node.type == "ASYNC_DEF":

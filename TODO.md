@@ -22,7 +22,7 @@ Features from Python not yet implemented in Turbo.
   - [x] calls `__exit__(exc_type, exc_val, None)` with proper args
   - [x] re-raises exception if `__exit__` returns false
 - [x] `async` / `await` — parsed and codegen produces sync C code; `async def/for/with` are handled; `await` evaluates the expression synchronously
-- [ ] `match` / `case` — parsed as stub, pattern matching not implemented
+- [x] `match` / `case` — pattern matching implemented via if/elif chain; supports literal, capture, and wildcard (`_`) patterns
 - [ ] `for` / `else`, `while` / `else` — else clauses on loops
 - [ ] `del` — parsed, codegen sets variable to `turbo_none` or subscript to None; does not actually delete
 - [ ] `global` / `nonlocal` — parsed, codegen emits C comments only; no effect on scoping
