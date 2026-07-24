@@ -77,7 +77,7 @@ Features from Python not yet implemented in Turbo.
 - [x] `.items()` — view of key-value pairs
 - [x] `.get(key, default)` — safe lookup with fallback
 - [x] `.pop(key)` — remove and return
-- [ ] `.popitem()` — remove and return arbitrary pair
+- [x] `.popitem()` — remove and return arbitrary pair
 - [x] `.update(other)` — merge another dict
 - [x] `.clear()` / `.copy()` — clear / shallow copy
 - [x] `.setdefault(key, default)` — insert if missing

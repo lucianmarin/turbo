@@ -2933,6 +2933,21 @@ TurboObject* turbo_dict_pop(TurboObject* self, TurboObject* key) {
     exit(1);
 }
 
+TurboObject* turbo_dict_popitem(TurboObject* self) {
+    if (self->dict_val.length == 0) {
+        fprintf(stderr, "KeyError: popitem(): dictionary is empty\n");
+        exit(1);
+    }
+    int last = self->dict_val.length - 1;
+    TurboObject* key = self->dict_val.keys[last];
+    TurboObject* value = self->dict_val.values[last];
+    self->dict_val.length--;
+    TurboObject* pair = make_tuple();
+    turbo_tuple_append(pair, key);
+    turbo_tuple_append(pair, value);
+    return pair;
+}
+
 void turbo_dict_update(TurboObject* self, TurboObject* other) {
     if (other->type != TYPE_DICT) {
         fprintf(stderr, "TypeError: update() argument must be dict\n");
@@ -3204,6 +3219,13 @@ TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int ar
                 exit(1);
             }
             return turbo_dict_pop(obj, args[0]);
+        }
+        if (strcmp(method_name, "popitem") == 0) {
+            if (argc != 0) {
+                fprintf(stderr, "TypeError: popitem() takes no arguments\n");
+                exit(1);
+            }
+            return turbo_dict_popitem(obj);
         }
         if (strcmp(method_name, "update") == 0) {
             if (argc != 1) {

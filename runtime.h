@@ -256,6 +256,7 @@ TurboObject* turbo_dict_values(TurboObject* self);
 TurboObject* turbo_dict_items(TurboObject* self);
 TurboObject* turbo_dict_get(TurboObject* self, TurboObject* key, TurboObject* default_val);
 TurboObject* turbo_dict_pop(TurboObject* self, TurboObject* key);
+TurboObject* turbo_dict_popitem(TurboObject* self);
 void turbo_dict_update(TurboObject* self, TurboObject* other);
 void turbo_dict_clear(TurboObject* self);
 TurboObject* turbo_dict_copy(TurboObject* self);
