@@ -39,6 +39,8 @@ struct TurboObject {
             char* digits;
             int length;
             int sign;
+            bool is_small;
+            long long small_val;
         } int_val;
         bool bool_val;
         double float_val;
@@ -169,6 +171,13 @@ extern TurboObject* t_zip;
 extern TurboObject* t_map;
 extern TurboObject* t_filter;
 
+// Cached small integer constants
+extern TurboObject* _cached_int_0;
+extern TurboObject* _cached_int_1;
+extern TurboObject* _cached_int_2;
+extern TurboObject* _cached_int_3;
+extern TurboObject* _cached_str_empty;
+
 // Exception handling
 extern jmp_buf* turbo_exception_jmp;
 extern TurboObject* turbo_exception_value;
@@ -180,6 +189,7 @@ void turbo_init(void);
 
 TurboObject* make_int(const char* str);
 TurboObject* make_int_from_ll(long long val);
+double to_double(TurboObject* obj);
 long long int_to_ll(TurboObject* obj);
 TurboObject* make_float(double val);
 TurboObject* make_complex(double real, double imag);

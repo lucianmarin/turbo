@@ -1475,6 +1475,7 @@ class CodeGen:
         self.processed_modules = []
         self.input_dir = "."
         self.builtins_list = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "tuple", "set", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter"]
+        self.pending_native_vars = None  # (native_vars, native_int_vars) after a native for-loop
 
     def write_header(self, s):
         self.header = self.header + s
@@ -1499,8 +1500,38 @@ class CodeGen:
         else:
             self.write_main(s)
 
+    def _gen_range_bound(self, node):
+        if node.type == "CONST_INT":
+            return str(int(node.value)) + "LL"
+        if node.type == "BINOP":
+            op = node.value
+            if op in ("+", "-", "*", "/"):
+                left = self._gen_range_bound(node.children[0])
+                right = self._gen_range_bound(node.children[1])
+                if left and right:
+                    return "(" + left + " " + op + " " + right + ")"
+        if node.type == "NAME":
+            return "int_to_ll(t_" + node.value + ")"
+        return "int_to_ll(" + self.gen_expr(node) + ")"
+
+    def _get_cached_int(self, val):
+        cache = {"0": "_cached_int_0", "1": "_cached_int_1", "2": "_cached_int_2", "3": "_cached_int_3"}
+        if val in cache:
+            return cache[val]
+        return None
+
     def gen_expr(self, node):
         if node.type == "CONST_INT":
+            cached = self._get_cached_int(node.value)
+            if cached:
+                return cached
+            # Check for small ints that can use make_int_from_ll
+            try:
+                ival = int(node.value)
+                if abs(ival) <= 1000000:
+                    return "make_int_from_ll(" + str(ival) + "LL)"
+            except:
+                pass
             return 'make_int("' + node.value + '")'
         elif node.type == "CONST_FLOAT":
             return "make_float(" + node.value + ")"
@@ -1514,6 +1545,8 @@ class CodeGen:
         elif node.type == "CONST_BYTES":
             return 'make_bytes_from_str("' + escape_c_string(node.value) + '")'
         elif node.type == "CONST_STR":
+            if node.value == "":
+                return "_cached_str_empty"
             return 'make_str("' + escape_c_string(node.value) + '")'
         elif node.type == "CONST_NONE":
             return "turbo_none"
@@ -2194,12 +2227,322 @@ class CodeGen:
         self.funcs = self.funcs + "    return mod;\n"
         self.funcs = self.funcs + "}\n\n"
 
+    # Native type constants
+    NATIVE_FLOAT = "float"
+    NATIVE_INT = "int"
+
+    def _infer_native_type(self, node, var_types, loop_var):
+        if node.type == "CONST_FLOAT":
+            return CodeGen.NATIVE_FLOAT
+        if node.type == "CONST_INT":
+            return CodeGen.NATIVE_INT
+        if node.type == "NAME":
+            if node.value == loop_var:
+                return CodeGen.NATIVE_INT
+            return var_types.get(node.value, None)
+        if node.type == "UNARY" and node.value == "-":
+            return self._infer_native_type(node.children[0], var_types, loop_var)
+        if node.type == "BINOP":
+            lt = self._infer_native_type(node.children[0], var_types, loop_var)
+            rt = self._infer_native_type(node.children[1], var_types, loop_var)
+            if lt == None or rt == None:
+                return None
+            if lt == CodeGen.NATIVE_FLOAT or rt == CodeGen.NATIVE_FLOAT:
+                if node.value in ('+', '-', '*', '/'):
+                    return CodeGen.NATIVE_FLOAT
+                return None
+            if lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT:
+                if node.value in ('+', '-', '*', '//', '%'):
+                    return CodeGen.NATIVE_INT
+                if node.value == '/':
+                    return CodeGen.NATIVE_FLOAT
+                return None
+            return None
+        return None
+
+    def _gen_native_expr(self, node, var_types, loop_var):
+        if node.type == "CONST_INT":
+            return (node.value + "LL", CodeGen.NATIVE_INT)
+        if node.type == "CONST_FLOAT":
+            return (node.value, CodeGen.NATIVE_FLOAT)
+        if node.type == "NAME":
+            if node.value == loop_var:
+                return ("_r_i", CodeGen.NATIVE_INT)
+            t = var_types.get(node.value, None)
+            if t == CodeGen.NATIVE_FLOAT:
+                return ("_d_" + node.value, CodeGen.NATIVE_FLOAT)
+            if t == CodeGen.NATIVE_INT:
+                return ("_i_" + node.value, CodeGen.NATIVE_INT)
+            pass
+        if node.type == "UNARY" and node.value == "-":
+            tmp0 = self._gen_native_expr(node.children[0], var_types, loop_var)
+            inner = tmp0[0]
+            t = tmp0[1]
+            return ("(-(" + inner + "))", t)
+        if node.type == "BINOP":
+            tmp0 = self._gen_native_expr(node.children[0], var_types, loop_var)
+            left = tmp0[0]
+            lt = tmp0[1]
+            tmp1 = self._gen_native_expr(node.children[1], var_types, loop_var)
+            right = tmp1[0]
+            rt = tmp1[1]
+            op = node.value
+            same_int = lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT
+            if lt == CodeGen.NATIVE_FLOAT or rt == CodeGen.NATIVE_FLOAT:
+                if lt == CodeGen.NATIVE_INT:
+                    left = "(double)(" + left + ")"
+                if rt == CodeGen.NATIVE_INT:
+                    right = "(double)(" + right + ")"
+                return ("((" + left + ") " + op + " (" + right + "))", CodeGen.NATIVE_FLOAT)
+            if same_int and op == '/':
+                return ("((double)(" + left + ") / (double)(" + right + "))", CodeGen.NATIVE_FLOAT)
+            if same_int and op in ('+', '-', '*', '//', '%'):
+                return ("((" + left + ") " + op + " (" + right + "))", CodeGen.NATIVE_INT)
+            return None
+        return None
+
+    def _collect_names(self, node, names):
+        if node.type == "NAME":
+            names.add(node.value)
+        if hasattr(node, 'children') and node.children:
+            for c in node.children:
+                if isinstance(c, ASTNode):
+                    self._collect_names(c, names)
+
+    def _infer_type_heuristic(self, node, var_types, loop_var):
+        if node.type == "NAME":
+            if node.value == loop_var:
+                return CodeGen.NATIVE_INT
+            if node.value in var_types:
+                return var_types[node.value]
+            return None
+        if node.type == "CONST_FLOAT":
+            return CodeGen.NATIVE_FLOAT
+        if node.type == "CONST_INT":
+            return CodeGen.NATIVE_INT
+        if node.type == "UNARY" and node.value == "-":
+            return self._infer_type_heuristic(node.children[0], var_types, loop_var)
+        if node.type == "BINOP":
+            lt = self._infer_type_heuristic(node.children[0], var_types, loop_var)
+            rt = self._infer_type_heuristic(node.children[1], var_types, loop_var)
+            op = node.value
+            if op == '/':
+                return CodeGen.NATIVE_FLOAT
+            if lt == CodeGen.NATIVE_FLOAT or rt == CodeGen.NATIVE_FLOAT:
+                if op in ('+', '-', '*'):
+                    return CodeGen.NATIVE_FLOAT
+                return None
+            if lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT:
+                if op in ('+', '-', '*', '//', '%'):
+                    return CodeGen.NATIVE_INT
+                return None
+            if lt != None:
+                return lt
+            if rt != None:
+                return rt
+            return None
+        return None
+
+    def _type_from_body_use(self, var_name, body_node, loop_var):
+        var_types_dummy = {loop_var: CodeGen.NATIVE_INT}
+        for stmt in body_node.children:
+            if stmt.type == "ASSIGN":
+                target = stmt.children[0]
+                val = stmt.children[1]
+                if target.type == "NAME" and target.value == var_name:
+                    t = self._infer_type_heuristic(val, var_types_dummy, loop_var)
+                    if t != None:
+                        return t
+            elif stmt.type == "AUGASSIGN":
+                val = stmt.children[1]
+                t = self._infer_type_heuristic(val, var_types_dummy, loop_var)
+                if t != None:
+                    return t
+        return None
+
+    def _collect_op_usage(self, body_node):
+        ops = {}
+        stmt_idx = 0
+        while stmt_idx < len(body_node.children):
+            stmt = body_node.children[stmt_idx]
+            nodes = [stmt]
+            while len(nodes) > 0:
+                node = nodes[0]
+                nodes = nodes[1:]
+                if node.type == "BINOP":
+                    op = node.value
+                    c_idx = 0
+                    while c_idx < len(node.children):
+                        c = node.children[c_idx]
+                        if c.type == "NAME":
+                            existing = ops.get(c.value, None)
+                            if existing == None:
+                                existing = []
+                            ops[c.value] = existing + [op]
+                        if isinstance(c, ASTNode):
+                            nodes.append(c)
+                        c_idx = c_idx + 1
+                elif node.type == "UNARY":
+                    c_idx = 0
+                    while c_idx < len(node.children):
+                        c = node.children[c_idx]
+                        if isinstance(c, ASTNode):
+                            nodes.append(c)
+                        c_idx = c_idx + 1
+            stmt_idx = stmt_idx + 1
+        return ops
+
+    def _scan_body_vars(self, body_node, var_types, loop_var):
+        lhs_map = {}
+        lhs_keys_list = []
+        stmt_types = []
+        s_idx = 0
+        while s_idx < len(body_node.children):
+            stmt = body_node.children[s_idx]
+            stmt_types.append(stmt.type)
+            if stmt.type == "ASSIGN" or stmt.type == "AUGASSIGN":
+                target = stmt.children[0]
+                if target.type == "NAME":
+                    lhs_map[target.value] = stmt
+                    lhs_keys_list.append(target.value)
+            s_idx = s_idx + 1
+        # Check if all stmt types are ASSIGN or AUGASSIGN
+        t_idx = 0
+        while t_idx < len(stmt_types):
+            if stmt_types[t_idx] != "ASSIGN" and stmt_types[t_idx] != "AUGASSIGN":
+                return False
+            t_idx = t_idx + 1
+        op_usage = self._collect_op_usage(body_node)
+        # Fixed-point iteration
+        changed = True
+        while changed:
+            changed = False
+            k_idx = 0
+            while k_idx < len(lhs_keys_list):
+                v = lhs_keys_list[k_idx]
+                if v in var_types:
+                    k_idx = k_idx + 1
+                    continue
+                stmt = lhs_map[v]
+                val = stmt.children[1]
+                typ = self._infer_type_heuristic(val, var_types, loop_var)
+                if typ != None:
+                    var_types[v] = typ
+                    changed = True
+                k_idx = k_idx + 1
+        # Assign types for remaining vars using usage heuristics
+        k_idx = 0
+        while k_idx < len(lhs_keys_list):
+            v = lhs_keys_list[k_idx]
+            if v in var_types:
+                k_idx = k_idx + 1
+                continue
+            uses = op_usage.get(v, [])
+            has_div = False
+            u_idx = 0
+            while u_idx < len(uses):
+                if uses[u_idx] == "/":
+                    has_div = True
+                u_idx = u_idx + 1
+            if has_div:
+                var_types[v] = CodeGen.NATIVE_FLOAT
+                changed = True
+            else:
+                has_arith = False
+                u_idx = 0
+                while u_idx < len(uses):
+                    if uses[u_idx] == "+" or uses[u_idx] == "-" or uses[u_idx] == "*":
+                        has_arith = True
+                    u_idx = u_idx + 1
+                if has_arith:
+                    var_types[v] = CodeGen.NATIVE_FLOAT
+                    changed = True
+                else:
+                    typ = self._type_from_body_use(v, body_node, loop_var)
+                    if typ != None:
+                        var_types[v] = typ
+                        changed = True
+                    else:
+                        return False
+            k_idx = k_idx + 1
+        # Refine types
+        changed = True
+        while changed:
+            changed = False
+            k_idx = 0
+            while k_idx < len(lhs_keys_list):
+                v = lhs_keys_list[k_idx]
+                if not (v in var_types):
+                    k_idx = k_idx + 1
+                    continue
+                stmt = lhs_map[v]
+                val = stmt.children[1]
+                t = self._infer_type_heuristic(val, var_types, loop_var)
+                if t != None and t != var_types[v]:
+                    var_types[v] = t
+                    changed = True
+                k_idx = k_idx + 1
+        # Verify all vars have types
+        k_idx = 0
+        while k_idx < len(lhs_keys_list):
+            v = lhs_keys_list[k_idx]
+            if not (v in var_types):
+                return False
+            k_idx = k_idx + 1
+        return lhs_keys_list
+
+    def _gen_native_stmt(self, stmt, var_types, loop_var):
+        if stmt.type == "ASSIGN":
+            target = stmt.children[0]
+            if target.type == "NAME":
+                tmp0 = self._gen_native_expr(stmt.children[1], var_types, loop_var)
+                val_c = tmp0[0]
+                t = var_types.get(target.value, None)
+                if t == CodeGen.NATIVE_FLOAT:
+                    return "_d_" + target.value + " = " + val_c + ";"
+                if t == CodeGen.NATIVE_INT:
+                    return "_i_" + target.value + " = " + val_c + ";"
+        if stmt.type == "AUGASSIGN":
+            target = stmt.children[0]
+            if target.type == "NAME":
+                tmp0 = self._gen_native_expr(stmt.children[1], var_types, loop_var)
+                val_c = tmp0[0]
+                vt = tmp0[1]
+                t = var_types.get(target.value, None)
+                op = stmt.value
+                c_op = op[0]  # += -> +
+                if t == CodeGen.NATIVE_FLOAT:
+                    if vt == CodeGen.NATIVE_INT:
+                        val_c = "(double)(" + val_c + ")"
+                    return "_d_" + target.value + " = _d_" + target.value + " " + c_op + " " + val_c + ";"
+                if t == CodeGen.NATIVE_INT:
+                    return "_i_" + target.value + " = _i_" + target.value + " " + c_op + " " + val_c + ";"
+        return None
+
     def gen_block_stmts(self, block_node, is_in_func):
         stmts = block_node.children
         s_idx = 0
         while s_idx < len(stmts):
             self.gen_stmt(stmts[s_idx], is_in_func)
             s_idx = s_idx + 1
+        self._flush_pending_native(is_in_func)
+
+    def _flush_pending_native(self, is_in_func):
+        if self.pending_native_vars != None:
+            pnv = self.pending_native_vars
+            native_vars = pnv[0]
+            native_int_vars = pnv[1]
+            var_types = pnv[2]
+            loop_var = pnv[3]
+            self.pending_native_vars = None
+            for v in native_vars:
+                self.write_code("t_" + v + " = make_float(_d_" + v + ");", is_in_func)
+            for v in native_int_vars:
+                self.write_code("t_" + v + " = make_int_from_ll(_i_" + v + ");", is_in_func)
+            self.indent_level = self.indent_level - 1
+            self.write_code("}", is_in_func)
+
+
 
     def gen_stmt(self, node, is_in_func):
         if node.type == "PASS":
@@ -2227,6 +2570,7 @@ class CodeGen:
                 val_c = self.gen_expr(default_node)
                 self.write_code("t_" + target_name + " = " + val_c + ";", is_in_func)
         elif node.type == "EXPR":
+            self._flush_pending_native(is_in_func)
             expr_c = self.gen_expr(node.children[0])
             self.write_code("(void)(" + expr_c + ");", is_in_func)
         elif node.type == "ASSIGN":
@@ -2253,6 +2597,17 @@ class CodeGen:
                     idx_c = self.gen_expr(target.children[1])
                     self.write_code('turbo_setitem(' + obj_c + ', ' + idx_c + ', ' + val_c + ');', is_in_func)
         elif node.type == "AUGASSIGN":
+            if self.pending_native_vars != None:
+                pnv = self.pending_native_vars
+                native_vars = pnv[0]
+                native_int_vars = pnv[1]
+                var_types = pnv[2]
+                loop_var = pnv[3]
+                ns = self._gen_native_stmt(node, var_types, loop_var)
+                if ns != None:
+                    self.write_code(ns, is_in_func)
+                    return
+            self._flush_pending_native(is_in_func)
             target = node.children[0]
             val_c = self.gen_expr(node.children[1])
             op = node.value
@@ -2284,6 +2639,7 @@ class CodeGen:
                 elif op == '@=':
                     self.write_code("t_" + target.value + " = turbo_matmul(t_" + target.value + ", " + val_c + ");", is_in_func)
         elif node.type == "RETURN":
+            self._flush_pending_native(is_in_func)
             if self.is_generator and node.children[0].type != "CONST_NONE":
                 self.gen_expr(node.children[0])
             if self.is_generator:
@@ -2292,6 +2648,7 @@ class CodeGen:
                 val_c = self.gen_expr(node.children[0])
                 self.write_code("return " + val_c + ";", is_in_func)
         elif node.type == "WHILE":
+            self._flush_pending_native(is_in_func)
             cond_c = self.gen_expr(node.children[0])
             if len(node.children) > 2:
                 flag_name = "_turbo_brk_" + str(self.else_loop_counter)
@@ -2321,59 +2678,134 @@ class CodeGen:
                 self.write_code("}", is_in_func)
         elif node.type == "FOR":
             var_name = node.value
-            iter_c = self.gen_expr(node.children[0])
+            iter_node = node.children[0]
             do_else = len(node.children) > 2
-            if do_else:
-                flag_name = "_turbo_brk_" + str(self.else_loop_counter)
-                self.else_loop_counter = self.else_loop_counter + 1
-                self.else_loop_stack.append(flag_name)
-            self.write_code("{", is_in_func)
-            self.indent_level = self.indent_level + 1
-            if do_else:
-                self.write_code("int " + flag_name + " = 0;", is_in_func)
-            self.write_code("TurboObject* _iter = " + iter_c + ";", is_in_func)
-            self.write_code("if (_iter->type == TYPE_LIST) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("for (int _i = 0; _i < _iter->list_val.length; _i++) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("t_" + var_name + " = _iter->list_val.items[_i];", is_in_func)
-            self.gen_block_stmts(node.children[1], is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("} else if (_iter->type == TYPE_TUPLE) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("for (int _i = 0; _i < _iter->tuple_val.length; _i++) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("t_" + var_name + " = _iter->tuple_val.items[_i];", is_in_func)
-            self.gen_block_stmts(node.children[1], is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("} else if (_iter->type == TYPE_STR) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("for (int _i = 0; _i < _iter->str_val.length; _i++) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("char _tmp[2] = {_iter->str_val.chars[_i], '\\0'};", is_in_func)
-            self.write_code("t_" + var_name + " = make_str(_tmp);", is_in_func)
-            self.gen_block_stmts(node.children[1], is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            if do_else:
-                self.write_code("if (!" + flag_name + ") {", is_in_func)
+            # Detect for VAR in range(ARGS) for native loop
+            is_range_loop = False
+            range_start = "0"
+            range_stop = ""
+            if iter_node.type == "CALL" and iter_node.children[0].type == "NAME" and iter_node.children[0].value == "range":
+                rargs = iter_node.children[1].children
+                if len(rargs) >= 1 and len(rargs) <= 2 and not do_else:
+                    if len(rargs) == 1:
+                        is_range_loop = True
+                        range_stop = self._gen_range_bound(rargs[0])
+                    elif len(rargs) == 2:
+                        is_range_loop = True
+                        range_start = self._gen_range_bound(rargs[0])
+                        range_stop = self._gen_range_bound(rargs[1])
+            if is_range_loop:
+                body_node = node.children[1]
+                var_types = {}
+                var_types[var_name] = CodeGen.NATIVE_INT
+                can_native = self._scan_body_vars(body_node, var_types, var_name)
+                lhs_keys_list = self._scan_body_vars(body_node, var_types, var_name)
+                if lhs_keys_list != False:
+                    native_vars = []
+                    native_int_vars = []
+                    # Collect var_types keys: lhs_keys_list + loop_var
+                    all_keys = [var_name]
+                    a_idx = 0
+                    while a_idx < len(lhs_keys_list):
+                        k = lhs_keys_list[a_idx]
+                        if k != var_name:
+                            all_keys.append(k)
+                        a_idx = a_idx + 1
+                    vk_idx = 0
+                    while vk_idx < len(all_keys):
+                        k = all_keys[vk_idx]
+                        v = var_types[k]
+                        if k != var_name and v == CodeGen.NATIVE_FLOAT:
+                            native_vars.append(k)
+                        if k != var_name and v == CodeGen.NATIVE_INT:
+                            native_int_vars.append(k)
+                        vk_idx = vk_idx + 1
+                    self.write_code("{", is_in_func)
+                    self.indent_level = self.indent_level + 1
+                    for v in native_vars:
+                        self.write_code("double _d_" + v + " = to_double(t_" + v + ");", is_in_func)
+                    for v in native_int_vars:
+                        self.write_code("long long _i_" + v + " = int_to_ll(t_" + v + ");", is_in_func)
+                    self.write_code("long long _r_start = " + range_start + ";", is_in_func)
+                    self.write_code("long long _r_stop = " + range_stop + ";", is_in_func)
+                    self.write_code("for (long long _r_i = _r_start; _r_i < _r_stop; _r_i++) {", is_in_func)
+                    self.indent_level = self.indent_level + 1
+                    s_idx = 0
+                    while s_idx < len(body_node.children):
+                        stmt_c = self._gen_native_stmt(body_node.children[s_idx], var_types, var_name)
+                        self.write_code(stmt_c, is_in_func)
+                        s_idx = s_idx + 1
+                    self.indent_level = self.indent_level - 1
+                    self.write_code("}", is_in_func)
+                    # Defer boxing so following statements can use native vars
+                    self.pending_native_vars = (native_vars, native_int_vars, var_types, var_name)
+                else:
+                    self.write_code("{", is_in_func)
+                    self.indent_level = self.indent_level + 1
+                    self.write_code("long long _r_start = " + range_start + ";", is_in_func)
+                    self.write_code("long long _r_stop = " + range_stop + ";", is_in_func)
+                    self.write_code("for (long long _r_i = _r_start; _r_i < _r_stop; _r_i++) {", is_in_func)
+                    self.indent_level = self.indent_level + 1
+                    self.write_code("t_" + var_name + " = make_int_from_ll(_r_i);", is_in_func)
+                    self.gen_block_stmts(body_node, is_in_func)
+                    self.indent_level = self.indent_level - 1
+                    self.write_code("}", is_in_func)
+                    self.indent_level = self.indent_level - 1
+                    self.write_code("}", is_in_func)
+            else:
+                iter_c = self.gen_expr(iter_node)
+                if do_else:
+                    flag_name = "_turbo_brk_" + str(self.else_loop_counter)
+                    self.else_loop_counter = self.else_loop_counter + 1
+                    self.else_loop_stack.append(flag_name)
+                self.write_code("{", is_in_func)
                 self.indent_level = self.indent_level + 1
-                self.gen_block_stmts(node.children[2], is_in_func)
+                if do_else:
+                    self.write_code("int " + flag_name + " = 0;", is_in_func)
+                self.write_code("TurboObject* _iter = " + iter_c + ";", is_in_func)
+                self.write_code("if (_iter->type == TYPE_LIST) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.write_code("for (int _i = 0; _i < _iter->list_val.length; _i++) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.write_code("t_" + var_name + " = _iter->list_val.items[_i];", is_in_func)
+                self.gen_block_stmts(node.children[1], is_in_func)
                 self.indent_level = self.indent_level - 1
                 self.write_code("}", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            if do_else:
-                self.else_loop_stack.pop()
+                self.indent_level = self.indent_level - 1
+                self.write_code("} else if (_iter->type == TYPE_TUPLE) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.write_code("for (int _i = 0; _i < _iter->tuple_val.length; _i++) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.write_code("t_" + var_name + " = _iter->tuple_val.items[_i];", is_in_func)
+                self.gen_block_stmts(node.children[1], is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("} else if (_iter->type == TYPE_STR) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.write_code("for (int _i = 0; _i < _iter->str_val.length; _i++) {", is_in_func)
+                self.indent_level = self.indent_level + 1
+                self.write_code("char _tmp[2] = {_iter->str_val.chars[_i], '\\0'};", is_in_func)
+                self.write_code("t_" + var_name + " = make_str(_tmp);", is_in_func)
+                self.gen_block_stmts(node.children[1], is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+                if do_else:
+                    self.write_code("if (!" + flag_name + ") {", is_in_func)
+                    self.indent_level = self.indent_level + 1
+                    self.gen_block_stmts(node.children[2], is_in_func)
+                    self.indent_level = self.indent_level - 1
+                    self.write_code("}", is_in_func)
+                self.indent_level = self.indent_level - 1
+                self.write_code("}", is_in_func)
+                if do_else:
+                    self.else_loop_stack.pop()
         elif node.type == "ASYNC_FOR":
             self.gen_stmt(ASTNode("FOR", node.value, node.children), is_in_func)
         elif node.type == "IF":
+            self._flush_pending_native(is_in_func)
             cond_c = self.gen_expr(node.children[0])
             self.write_code("if (turbo_is_truthy(" + cond_c + ")) {", is_in_func)
             self.indent_level = self.indent_level + 1
@@ -2393,9 +2825,11 @@ class CodeGen:
                     self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
         elif node.type == "RAISE":
+            self._flush_pending_native(is_in_func)
             val_c = self.gen_expr(node.children[0])
             self.write_code("turbo_raise(" + val_c + ");", is_in_func)
         elif node.type == "ASSERT":
+            self._flush_pending_native(is_in_func)
             test_c = self.gen_expr(node.children[0])
             if node.children[1].type == "CONST_NONE":
                 self.write_code("if (!turbo_is_truthy(" + test_c + ")) { fprintf(stderr, \"AssertionError\\n\"); exit(1); }", is_in_func)
@@ -2403,6 +2837,7 @@ class CodeGen:
                 msg_c = self.gen_expr(node.children[1])
                 self.write_code("if (!turbo_is_truthy(" + test_c + ")) { TurboObject* _amsg = turbo_str(" + msg_c + "); fprintf(stderr, \"AssertionError: %s\\n\", _amsg->str_val.chars); exit(1); }", is_in_func)
         elif node.type == "DEL":
+            self._flush_pending_native(is_in_func)
             target = node.children[0]
             if target.type == "SUBSCRIPT":
                 obj_c = self.gen_expr(target.children[0])
@@ -2419,6 +2854,7 @@ class CodeGen:
             if is_in_func:
                 self.write_code("/* nonlocal: names resolved to enclosing function scope */", is_in_func)
         elif node.type == "WITH":
+            self._flush_pending_native(is_in_func)
             expr_c = self.gen_expr(node.children[0])
             alias_node = node.children[1]
             body = node.children[2]
@@ -2466,6 +2902,7 @@ class CodeGen:
         elif node.type == "ASYNC_WITH":
             self.gen_stmt(ASTNode("WITH", "", node.children), is_in_func)
         elif node.type == "TRY":
+            self._flush_pending_native(is_in_func)
             body = node.children[0]
             handlers_node = node.children[1]
             else_body = node.children[2]
@@ -2532,6 +2969,7 @@ class CodeGen:
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
         elif node.type == "MATCH":
+            self._flush_pending_native(is_in_func)
             subject_expr = self.gen_expr(node.children[0])
             self.write_code("{", is_in_func)
             self.indent_level = self.indent_level + 1

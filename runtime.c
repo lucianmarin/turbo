@@ -4,9 +4,47 @@
 #include <ctype.h>
 #include <math.h>
 
+#define TMP_POOL_SIZE 131072
+
+static TurboObject _tmp_pool[TMP_POOL_SIZE];
+static int _tmp_pool_idx = 0;
+
+static TurboObject* tmp_alloc(void) {
+    if (_tmp_pool_idx >= TMP_POOL_SIZE) {
+        return (TurboObject*)malloc(sizeof(TurboObject));
+    }
+    TurboObject* obj = &_tmp_pool[_tmp_pool_idx];
+    _tmp_pool_idx++;
+    return obj;
+}
+
+static TurboObject* tmp_int_from_ll(long long val) {
+    TurboObject* obj = tmp_alloc();
+    obj->type = TYPE_INT;
+    obj->int_val.is_small = 1;
+    obj->int_val.small_val = val;
+    obj->int_val.sign = val < 0;
+    obj->int_val.digits = NULL;
+    obj->int_val.length = 0;
+    return obj;
+}
+
+static TurboObject* tmp_float(double val) {
+    TurboObject* obj = tmp_alloc();
+    obj->type = TYPE_FLOAT;
+    obj->float_val = val;
+    return obj;
+}
+
 TurboObject* turbo_none = NULL;
 TurboObject* turbo_true = NULL;
 TurboObject* turbo_false = NULL;
+
+TurboObject* _cached_int_0 = NULL;
+TurboObject* _cached_int_1 = NULL;
+TurboObject* _cached_int_2 = NULL;
+TurboObject* _cached_int_3 = NULL;
+TurboObject* _cached_str_empty = NULL;
 
 TurboObject* t_print = NULL;
 TurboObject* t_len = NULL;
@@ -261,7 +299,7 @@ static TurboObject* builtin_abs(int argc, TurboObject** args) {
     }
     if (args[0]->type == TYPE_FLOAT) {
         double v = args[0]->float_val;
-        return make_float(v < 0 ? -v : v);
+        return tmp_float(v < 0 ? -v : v);
     }
     fprintf(stderr, "TypeError: bad operand type for abs()\n");
     exit(1);
@@ -845,6 +883,12 @@ void turbo_init(void) {
     t_zip = make_func(builtin_zip, "zip");
     t_map = make_func(builtin_map, "map");
     t_filter = make_func(builtin_filter, "filter");
+
+    _cached_int_0 = make_int("0");
+    _cached_int_1 = make_int("1");
+    _cached_int_2 = make_int("2");
+    _cached_int_3 = make_int("3");
+    _cached_str_empty = make_str("");
 }
 
 // --- Bignum string arithmetic helpers ---
@@ -1033,6 +1077,10 @@ static char* str_mod(const char* a, int a_len, const char* b, int b_len, int* ou
     return res;
 }
 
+static inline bool ll_fits(long long val) {
+    return (val >= 0 || val == (-9223372036854775807LL - 1)) ? true : false;
+}
+
 TurboObject* make_int(const char* str) {
     TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
     obj->type = TYPE_INT;
@@ -1047,14 +1095,43 @@ TurboObject* make_int(const char* str) {
     obj->int_val.digits = digits;
     obj->int_val.length = len;
     obj->int_val.sign = sign;
+    obj->int_val.is_small = 0;
+    obj->int_val.small_val = 0;
+    // Check if fits in long long
+    if (len <= 18) {
+        long long llval = 0;
+        for (int i = 0; i < len; i++) {
+            llval = llval * 10 + (digits[i] - '0');
+        }
+        if (sign) llval = -llval;
+        if ((sign == 0 && llval >= 0) || (sign == 1 && llval <= 0)) {
+            obj->int_val.is_small = 1;
+            obj->int_val.small_val = llval;
+        }
+    }
     return obj;
 }
 
 TurboObject* make_int_from_ll(long long val) {
+    TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
+    obj->type = TYPE_INT;
+    obj->int_val.is_small = 1;
+    obj->int_val.small_val = val;
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", val);
-    return make_int(buf);
+    int len = strlen(buf);
+    int sign = 0;
+    int start = 0;
+    if (buf[0] == '-') { sign = 1; start = 1; }
+    obj->int_val.sign = sign;
+    obj->int_val.digits = (char*)malloc(len - start + 1);
+    memcpy(obj->int_val.digits, buf + start, len - start + 1);
+    obj->int_val.length = len - start;
+    strip_leading_zeros(obj->int_val.digits, &obj->int_val.length);
+    return obj;
 }
+
+
 
 TurboObject* make_float(double val) {
     TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
@@ -1093,6 +1170,7 @@ TurboObject* make_str_len(const char* val, int len) {
 TurboObject* make_bool(bool val) {
     return val ? turbo_true : turbo_false;
 }
+
 
 TurboObject* make_bytes(const unsigned char* data, int length) {
     TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
@@ -1231,7 +1309,7 @@ static void add_to_list(TurboObject* list, TurboObject* item) {
     turbo_list_append(list, item);
 }
 
-static double to_double(TurboObject* obj) {
+double to_double(TurboObject* obj) {
     if (obj->type == TYPE_INT) return (double)int_to_ll(obj);
     if (obj->type == TYPE_FLOAT) return obj->float_val;
     return 0.0;
@@ -1239,6 +1317,9 @@ static double to_double(TurboObject* obj) {
 
 // Convert bignum to long long (for indexing, etc.)
 long long int_to_ll(TurboObject* obj) {
+    if (obj->int_val.is_small) {
+        return obj->int_val.small_val;
+    }
     long long val = 0;
     for (int i = 0; i < obj->int_val.length; i++) {
         val = val * 10 + (obj->int_val.digits[i] - '0');
@@ -1254,6 +1335,19 @@ static TurboObject* make_int_from_str(char* digits, int len, int sign) {
     obj->int_val.digits = digits;
     obj->int_val.length = len;
     obj->int_val.sign = sign;
+    obj->int_val.is_small = 0;
+    obj->int_val.small_val = 0;
+    if (len <= 18) {
+        long long llval = 0;
+        for (int i = 0; i < len; i++) {
+            llval = llval * 10 + (digits[i] - '0');
+        }
+        if (sign) llval = -llval;
+        if ((sign == 0 && llval >= 0) || (sign == 1 && llval <= 0)) {
+            obj->int_val.is_small = 1;
+            obj->int_val.small_val = llval;
+        }
+    }
     return obj;
 }
 
@@ -1285,6 +1379,12 @@ static TurboObject* try_op_overload(TurboObject* a, TurboObject* b, const char* 
 
 TurboObject* turbo_add(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
+        if (a->int_val.is_small && b->int_val.is_small) {
+            long long res;
+            if (!__builtin_add_overflow(a->int_val.small_val, b->int_val.small_val, &res)) {
+                return tmp_int_from_ll(res);
+            }
+        }
         int sa = a->int_val.sign, sb = b->int_val.sign;
         int cmp = abs_cmp(a->int_val.digits, a->int_val.length, b->int_val.digits, b->int_val.length);
         if (sa == sb) {
@@ -1308,7 +1408,7 @@ TurboObject* turbo_add(TurboObject* a, TurboObject* b) {
     if ((a->type == TYPE_FLOAT || a->type == TYPE_INT) &&
         (b->type == TYPE_FLOAT || b->type == TYPE_INT)) {
         if (a->type == TYPE_FLOAT || b->type == TYPE_FLOAT) {
-            return make_float(to_double(a) + to_double(b));
+            return tmp_float(to_double(a) + to_double(b));
         }
     }
     if (a->type == TYPE_COMPLEX && b->type == TYPE_COMPLEX) {
@@ -1362,6 +1462,12 @@ TurboObject* turbo_add(TurboObject* a, TurboObject* b) {
 
 TurboObject* turbo_sub(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
+        if (a->int_val.is_small && b->int_val.is_small) {
+            long long res;
+            if (!__builtin_sub_overflow(a->int_val.small_val, b->int_val.small_val, &res)) {
+                return tmp_int_from_ll(res);
+            }
+        }
         int sa = a->int_val.sign, sb = b->int_val.sign;
         int cmp = abs_cmp(a->int_val.digits, a->int_val.length, b->int_val.digits, b->int_val.length);
         if (sa != sb) {
@@ -1387,7 +1493,7 @@ TurboObject* turbo_sub(TurboObject* a, TurboObject* b) {
     if ((a->type == TYPE_FLOAT || a->type == TYPE_INT) &&
         (b->type == TYPE_FLOAT || b->type == TYPE_INT)) {
         if (a->type == TYPE_FLOAT || b->type == TYPE_FLOAT) {
-            return make_float(to_double(a) - to_double(b));
+            return tmp_float(to_double(a) - to_double(b));
         }
     }
     if (a->type == TYPE_COMPLEX && b->type == TYPE_COMPLEX) {
@@ -1412,6 +1518,12 @@ TurboObject* turbo_sub(TurboObject* a, TurboObject* b) {
 
 TurboObject* turbo_mul(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
+        if (a->int_val.is_small && b->int_val.is_small) {
+            long long res;
+            if (!__builtin_mul_overflow(a->int_val.small_val, b->int_val.small_val, &res)) {
+                return tmp_int_from_ll(res);
+            }
+        }
         int rlen;
         char* r = str_mul(a->int_val.digits, a->int_val.length, b->int_val.digits, b->int_val.length, &rlen);
         int sign = (a->int_val.sign != b->int_val.sign) ? 1 : 0;
@@ -1421,7 +1533,7 @@ TurboObject* turbo_mul(TurboObject* a, TurboObject* b) {
     if ((a->type == TYPE_FLOAT || a->type == TYPE_INT) &&
         (b->type == TYPE_FLOAT || b->type == TYPE_INT)) {
         if (a->type == TYPE_FLOAT || b->type == TYPE_FLOAT) {
-            return make_float(to_double(a) * to_double(b));
+            return tmp_float(to_double(a) * to_double(b));
         }
     }
     if (a->type == TYPE_COMPLEX && b->type == TYPE_COMPLEX) {
@@ -1466,7 +1578,7 @@ TurboObject* turbo_div(TurboObject* a, TurboObject* b) {
             fprintf(stderr, "ZeroDivisionError: division by zero\n");
             exit(1);
         }
-        return make_float(da / db);
+        return tmp_float(da / db);
     }
     if ((a->type == TYPE_FLOAT || a->type == TYPE_INT) &&
         (b->type == TYPE_FLOAT || b->type == TYPE_INT)) {
@@ -1475,7 +1587,7 @@ TurboObject* turbo_div(TurboObject* a, TurboObject* b) {
             fprintf(stderr, "ZeroDivisionError: division by zero\n");
             exit(1);
         }
-        return make_float(to_double(a) / db);
+        return tmp_float(to_double(a) / db);
     }
     {
         TurboObject* r = try_op_overload(a, b, "__truediv__");
@@ -1487,6 +1599,15 @@ TurboObject* turbo_div(TurboObject* a, TurboObject* b) {
 
 TurboObject* turbo_mod(TurboObject* a, TurboObject* b) {
     if (a->type == TYPE_INT && b->type == TYPE_INT) {
+        if (a->int_val.is_small && b->int_val.is_small) {
+            if (b->int_val.small_val == 0) {
+                fprintf(stderr, "ZeroDivisionError: integer modulo by zero\n");
+                exit(1);
+            }
+            long long res = llabs(a->int_val.small_val) % llabs(b->int_val.small_val);
+            if (a->int_val.small_val < 0) res = -res;
+            return tmp_int_from_ll(res);
+        }
         if (b->int_val.length == 1 && b->int_val.digits[0] == '0') {
             fprintf(stderr, "ZeroDivisionError: integer division or modulo by zero\n");
             exit(1);
@@ -1542,7 +1663,7 @@ TurboObject* turbo_pow(TurboObject* a, TurboObject* b) {
         if (b->int_val.sign) {
             // Negative exponent: return float
             double da = to_double(a), db = to_double(b);
-            return make_float(pow(da, db));
+            return tmp_float(pow(da, db));
         }
         int rlen;
         char* r = str_pow(a->int_val.digits, a->int_val.length, b->int_val.digits, b->int_val.length, &rlen);
@@ -1558,7 +1679,7 @@ TurboObject* turbo_pow(TurboObject* a, TurboObject* b) {
     }
     if ((a->type == TYPE_FLOAT || a->type == TYPE_INT) &&
         (b->type == TYPE_FLOAT || b->type == TYPE_INT)) {
-        return make_float(pow(to_double(a), to_double(b)));
+        return tmp_float(pow(to_double(a), to_double(b)));
     }
     {
         TurboObject* r = try_op_overload(a, b, "__pow__");
@@ -1588,7 +1709,7 @@ TurboObject* turbo_floordiv(TurboObject* a, TurboObject* b) {
             fprintf(stderr, "ZeroDivisionError: float floor division by zero\n");
             exit(1);
         }
-        return make_float(floor(da / db));
+        return tmp_float(floor(da / db));
     }
     {
         TurboObject* r = try_op_overload(a, b, "__floordiv__");
@@ -1734,7 +1855,9 @@ static bool is_equal(TurboObject* a, TurboObject* b) {
     if (a->type != b->type) return false;
     switch (a->type) {
         case TYPE_NONE: return true;
-        case TYPE_INT: return a->int_val.sign == b->int_val.sign && abs_cmp(a->int_val.digits, a->int_val.length, b->int_val.digits, b->int_val.length) == 0;
+        case TYPE_INT:
+            if (a->int_val.is_small && b->int_val.is_small) return a->int_val.small_val == b->int_val.small_val;
+            return a->int_val.sign == b->int_val.sign && abs_cmp(a->int_val.digits, a->int_val.length, b->int_val.digits, b->int_val.length) == 0;
         case TYPE_BOOL: return a->bool_val == b->bool_val;
         case TYPE_FLOAT: return a->float_val == b->float_val;
         case TYPE_COMPLEX:
@@ -1813,6 +1936,11 @@ TurboObject* turbo_import_module(const char* name) {
 
 // Compare two bignums: returns >0 if a > b, 0 if ==, <0 if a < b
 static int int_cmp(TurboObject* a, TurboObject* b) {
+    if (a->int_val.is_small && b->int_val.is_small) {
+        if (a->int_val.small_val < b->int_val.small_val) return -1;
+        if (a->int_val.small_val > b->int_val.small_val) return 1;
+        return 0;
+    }
     if (a->int_val.sign != b->int_val.sign) return b->int_val.sign - a->int_val.sign;
     int cmp = abs_cmp(a->int_val.digits, a->int_val.length, b->int_val.digits, b->int_val.length);
     return a->int_val.sign ? -cmp : cmp;
@@ -2403,6 +2531,10 @@ TurboObject* turbo_str(TurboObject* val) {
         case TYPE_BOOL:
             return make_str(val->bool_val ? "True" : "False");
         case TYPE_INT: {
+            if (val->int_val.is_small) {
+                snprintf(buf, sizeof(buf), "%lld", val->int_val.small_val);
+                return make_str(buf);
+            }
             const char* sign_str = val->int_val.sign ? "-" : "";
             char* res = (char*)malloc(val->int_val.length + 2);
             sprintf(res, "%s%s", sign_str, val->int_val.digits);
@@ -2624,10 +2756,10 @@ TurboObject* turbo_int(TurboObject* val) {
 
 TurboObject* turbo_float(TurboObject* val) {
     if (val->type == TYPE_FLOAT) return val;
-    if (val->type == TYPE_INT) return make_float((double)int_to_ll(val));
-    if (val->type == TYPE_BOOL) return make_float(val->bool_val ? 1.0 : 0.0);
+    if (val->type == TYPE_INT) return tmp_float((double)int_to_ll(val));
+    if (val->type == TYPE_BOOL) return tmp_float(val->bool_val ? 1.0 : 0.0);
     if (val->type == TYPE_STR) {
-        return make_float(atof(val->str_val.chars));
+        return tmp_float(atof(val->str_val.chars));
     }
     fprintf(stderr, "ValueError: invalid literal for float()\n");
     exit(1);
