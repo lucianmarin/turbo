@@ -2323,8 +2323,8 @@ TurboObject* turbo_open(TurboObject* path, TurboObject* mode) {
     }
     FILE* f = fopen(path->str_val.chars, mode->str_val.chars);
     if (f == NULL) {
-        fprintf(stderr, "FileNotFoundError: [Errno 2] No such file or directory: '%s'\n", path->str_val.chars);
-        exit(1);
+        turbo_raise(make_str("FileNotFoundError"));
+        return turbo_none;
     }
     return make_file(f);
 }

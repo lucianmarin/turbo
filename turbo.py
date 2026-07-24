@@ -177,10 +177,14 @@ class Lexer:
                         p = p + 1
                         if p < len(line):
                             ec = line[p]
-                            if ec == 'n': val = val + "\n"
-                            elif ec == 't': val = val + "\t"
-                            elif ec == 'r': val = val + "\r"
-                            else: val = val + ec
+                            if ec == 'n':
+                                val = val + "\n"
+                            elif ec == 't':
+                                val = val + "\t"
+                            elif ec == 'r':
+                                val = val + "\r"
+                            else:
+                                val = val + ec
                         p = p + 1
                     elif line[p] == quote and p + 2 < len(line) and line[p] == line[p+1] and line[p] == line[p+2]:
                         p = p + 3
@@ -300,7 +304,7 @@ class Parser:
         self.pos = self.pos + 1
         return t
 
-    def match(self, token_type):
+    def try_match(self, token_type):
         t = self.peek()
         if t.type == token_type:
             self.pos = self.pos + 1
@@ -309,28 +313,28 @@ class Parser:
 
     def parse_expr(self):
         node = self.parse_and()
-        while self.match("or"):
+        while self.try_match("or"):
             right = self.parse_and()
             node = ASTNode("OR", "", [node, right])
-        if self.match("if"):
+        if self.try_match("if"):
             cond = self.parse_and()
             self.consume("else")
             else_val = self.parse_expr()
             node = ASTNode("TERNARY", "", [cond, node, else_val])
-        if self.match(':='):
+        if self.try_match(':='):
             value = self.parse_expr()
             node = ASTNode("ASSIGN", "", [node, value])
         return node
 
     def parse_and(self):
         node = self.parse_not()
-        while self.match("and"):
+        while self.try_match("and"):
             right = self.parse_not()
             node = ASTNode("AND", "", [node, right])
         return node
 
     def parse_not(self):
-        if self.match("not"):
+        if self.try_match("not"):
             expr = self.parse_not()
             return ASTNode("NOT", "", [expr])
         return self.parse_comparison()
@@ -426,7 +430,7 @@ class Parser:
 
     def parse_power(self):
         node = self.parse_primary()
-        if self.match('**'):
+        if self.try_match('**'):
             right = self.parse_power()
             node = ASTNode("BINOP", '**', [node, right])
         return node
@@ -440,7 +444,7 @@ class Parser:
                 args = []
                 if self.peek().type != ')':
                     args.append(self.parse_expr())
-                    while self.match(','):
+                    while self.try_match(','):
                         args.append(self.parse_expr())
                 self.consume(')')
                 node = ASTNode("CALL", "", [node, ASTNode("LIST", "", args)])
@@ -453,7 +457,7 @@ class Parser:
                 is_slice = False
                 start = None
                 end = None
-                if self.match(':'):
+                if self.try_match(':'):
                     is_slice = True
                     start = ASTNode("CONST_NONE", "", [])
                     if self.peek().type != ']':
@@ -462,7 +466,7 @@ class Parser:
                         end = ASTNode("CONST_NONE", "", [])
                 else:
                     first = self.parse_expr()
-                    if self.match(':'):
+                    if self.try_match(':'):
                         is_slice = True
                         start = first
                         if self.peek().type != ']':
@@ -515,7 +519,7 @@ class Parser:
             first = self.parse_expr()
             if self.peek().type == ',':
                 elements = [first]
-                while self.match(','):
+                while self.try_match(','):
                     if self.peek().type == ')':
                         break
                     elements.append(self.parse_expr())
@@ -532,7 +536,7 @@ class Parser:
                     self.consume(']')
                     return ASTNode("LISTCOMP", "", [first_expr, gen])
                 elements = [first_expr]
-                while self.match(','):
+                while self.try_match(','):
                     elements.append(self.parse_expr())
             else:
                 elements = []
@@ -554,7 +558,7 @@ class Parser:
                     return ASTNode("DICTCOMP", "", [first, value, gen])
                 keys = [first]
                 values = [value]
-                while self.match(','):
+                while self.try_match(','):
                     key = self.parse_expr()
                     self.consume(':')
                     val = self.parse_expr()
@@ -569,7 +573,7 @@ class Parser:
                     self.consume('}')
                     return ASTNode("SETCOMP", "", [first, gen])
                 elements = [first]
-                while self.match(','):
+                while self.try_match(','):
                     if self.peek().type == '}':
                         break
                     elements.append(self.parse_expr())
@@ -580,7 +584,7 @@ class Parser:
             params = []
             if self.peek().type != ':':
                 params.append(self.consume("NAME").value)
-                while self.match(','):
+                while self.try_match(','):
                     params.append(self.consume("NAME").value)
             self.consume(':')
             body = self.parse_expr()
@@ -680,7 +684,7 @@ class Parser:
                     self.pos = self.pos + 1
                     self.parse_expr()
                 params.append(p_name)
-                while self.match(','):
+                while self.try_match(','):
                     p_name = self.consume("NAME").value
                     if self.peek().type == ':':
                         self.pos = self.pos + 1
@@ -703,7 +707,7 @@ class Parser:
             self.pos = self.pos + 1
             name = self.consume("NAME").value
             # Optional inheritance
-            if self.match('('):
+            if self.try_match('('):
                 base_name = self.consume("NAME").value
                 self.consume(')')
             body = self.parse_suite()
@@ -739,7 +743,7 @@ class Parser:
             self.pos = self.pos + 1
             cond = self.parse_expr()
             body = self.parse_suite()
-            if self.match("else"):
+            if self.try_match("else"):
                 else_body = self.parse_suite()
                 return ASTNode("WHILE", "", [cond, body, else_body])
             return ASTNode("WHILE", "", [cond, body])
@@ -750,7 +754,7 @@ class Parser:
             self.consume("in")
             iterable = self.parse_expr()
             body = self.parse_suite()
-            if self.match("else"):
+            if self.try_match("else"):
                 else_body = self.parse_suite()
                 return ASTNode("FOR", var_name, [iterable, body, else_body])
             return ASTNode("FOR", var_name, [iterable, body])
@@ -787,17 +791,17 @@ class Parser:
                 self.pos = self.pos + 1
                 mod_parts = mod_parts + '.' + self.consume("NAME").value
             alias = ASTNode("CONST_NONE", "", [])
-            if self.match("as"):
+            if self.try_match("as"):
                 alias = ASTNode("NAME", self.consume("NAME").value, [])
             if self.peek().type == ',':
                 modules = [ASTNode("IMPORT", mod_parts, [alias])]
-                while self.match(','):
+                while self.try_match(','):
                     mod_parts = self.consume("NAME").value
                     while self.peek().type == '.':
                         self.pos = self.pos + 1
                         mod_parts = mod_parts + '.' + self.consume("NAME").value
                     alias = ASTNode("CONST_NONE", "", [])
-                    if self.match("as"):
+                    if self.try_match("as"):
                         alias = ASTNode("NAME", self.consume("NAME").value, [])
                     modules.append(ASTNode("IMPORT", mod_parts, [alias]))
                 self.consume('NEWLINE')
@@ -816,13 +820,13 @@ class Parser:
             while True:
                 name = self.consume("NAME").value
                 alias = ASTNode("CONST_NONE", "", [])
-                if self.match("as"):
+                if self.try_match("as"):
                     alias = ASTNode("NAME", self.consume("NAME").value, [])
                 if alias.type == "CONST_NONE":
                     imported.append(ASTNode("NAME", name, []))
                 else:
                     imported.append(ASTNode("IMPORT_AS", "", [ASTNode("NAME", name, []), alias]))
-                if not self.match(','):
+                if not self.try_match(','):
                     break
             self.consume('NEWLINE')
             return ASTNode("FROM_IMPORT", mod_parts, imported)
@@ -857,7 +861,7 @@ class Parser:
             self.pos = self.pos + 1
             names = []
             names.append(self.consume("NAME").value)
-            while self.match(','):
+            while self.try_match(','):
                 names.append(self.consume("NAME").value)
             self.consume('NEWLINE')
             names_node = ASTNode("LIST", "", [])
@@ -871,7 +875,7 @@ class Parser:
             self.pos = self.pos + 1
             names = []
             names.append(self.consume("NAME").value)
-            while self.match(','):
+            while self.try_match(','):
                 names.append(self.consume("NAME").value)
             self.consume('NEWLINE')
             names_node = ASTNode("LIST", "", [])
@@ -885,11 +889,11 @@ class Parser:
             self.pos = self.pos + 1
             expr = self.parse_expr()
             alias = None
-            if self.match("as"):
+            if self.try_match("as"):
                 alias = self.consume("NAME").value
             body = self.parse_suite()
             alias_node = ASTNode("CONST_NONE", "", [])
-            if alias is not None:
+            if alias != None:
                 alias_node = ASTNode("NAME", alias, [])
             return ASTNode("WITH", "", [expr, alias_node, body])
 
@@ -908,7 +912,7 @@ class Parser:
                     exc_var = None
                     if self.peek().type != ':':
                         exc_type = self.parse_expr()
-                        if self.match("as"):
+                        if self.try_match("as"):
                             exc_var = self.consume("NAME").value
                     handler_body = self.parse_suite()
                     handlers.append(ASTNode("EXCEPT", exc_var or "", [exc_type, handler_body]))
@@ -939,7 +943,7 @@ class Parser:
                         self.pos = self.pos + 1
                         self.parse_expr()
                     params.append(p_name)
-                    while self.match(','):
+                    while self.try_match(','):
                         p_name = self.consume("NAME").value
                         if self.peek().type == ':':
                             self.pos = self.pos + 1
@@ -962,7 +966,7 @@ class Parser:
                 self.consume("in")
                 iterable = self.parse_expr()
                 body = self.parse_suite()
-                if self.match("else"):
+                if self.try_match("else"):
                     else_body = self.parse_suite()
                     return ASTNode("ASYNC_FOR", var_name, [iterable, body, else_body])
                 return ASTNode("ASYNC_FOR", var_name, [iterable, body])
@@ -970,11 +974,11 @@ class Parser:
                 self.pos = self.pos + 1
                 expr = self.parse_expr()
                 alias = None
-                if self.match("as"):
+                if self.try_match("as"):
                     alias = self.consume("NAME").value
                 body = self.parse_suite()
                 alias_node = ASTNode("CONST_NONE", "", [])
-                if alias is not None:
+                if alias != None:
                     alias_node = ASTNode("NAME", alias, [])
                 return ASTNode("ASYNC_WITH", "", [expr, alias_node, body])
             else:
@@ -1033,7 +1037,7 @@ class Parser:
         stmts = []
         while self.peek().type != 'EOF':
             # Skip stray newlines at the module level
-            if self.match('NEWLINE'):
+            if self.try_match('NEWLINE'):
                 continue
             stmts.append(self.parse_stmt())
         return ASTNode("BLOCK", "", stmts)
@@ -1278,7 +1282,7 @@ class CodeGen:
         self.else_loop_counter = 0
         self.is_generator = False
         self.lambda_counter = 0
-        self.processed_modules = set()
+        self.processed_modules = []
         self.input_dir = "."
         self.builtins_list = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter"]
 
@@ -1570,7 +1574,7 @@ class CodeGen:
             print("CodeGen error: unknown expression " + node.type)
             return "turbo_none"
 
-    def gen_func_def(self, node, class_name, mod_prefix=""):
+    def gen_func_def(self, node, class_name, mod_prefix):
         func_name = node.value
         if class_name != "":
             impl_name = "t_impl_" + class_name + "_" + func_name
@@ -1662,7 +1666,7 @@ class CodeGen:
                         self.write_main("t_" + func_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + func_name + "});")
                     d_idx = d_idx + 1
 
-    def gen_class_def(self, node, mod_prefix=""):
+    def gen_class_def(self, node, mod_prefix):
         class_name = node.value
         full_name = mod_prefix + class_name
         self.write_header("TurboObject* t_" + full_name + " = NULL;\n")
@@ -1674,7 +1678,7 @@ class CodeGen:
         while m_idx < len(suite.children):
             m_node = suite.children[m_idx]
             if m_node.type == "DEF" or m_node.type == "ASYNC_DEF":
-                self.gen_func_def(m_node, full_name)
+                self.gen_func_def(m_node, full_name, "")
                 method_name = m_node.value
                 if mod_prefix == "":
                     self.write_main("turbo_class_add_method(t_" + class_name + ', "' + method_name + '", t_impl_' + class_name + '_' + method_name + ');')
@@ -1711,9 +1715,12 @@ class CodeGen:
             sv = "TurboObject* _lc_tmp = _lci->list_val.items[_lci_i]; "
             svt = "TurboObject* _lc_tmp = _lci->tuple_val.items[_lci_i]; "
             svs = ""
-            for i, t in enumerate(targets):
+            i = 0
+            while i < len(targets):
+                t = targets[i]
                 sv += "TurboObject* t_" + t + " = turbo_getitem(_lc_tmp, make_int_from_ll(" + str(i) + ")); "
                 svt += "TurboObject* t_" + t + " = turbo_getitem(_lc_tmp, make_int_from_ll(" + str(i) + ")); "
+                i = i + 1
         code = "{ TurboObject* _lci = " + iter_c + "; "
         code = code + "if (_lci->type == TYPE_LIST) { for (int _lci_i = 0; _lci_i < _lci->list_val.length; _lci_i++) { " + sv + if_c + "{ " + inner + " } } } "
         code = code + "else if (_lci->type == TYPE_TUPLE) { for (int _lci_i = 0; _lci_i < _lci->tuple_val.length; _lci_i++) { " + svt + if_c + "{ " + inner + " } } } "
@@ -1726,11 +1733,11 @@ class CodeGen:
         if is_stdlib_module(module_name.split('.')[0]):
             return None
         mod_file = find_module_file(module_name, self.input_dir)
-        if mod_file is None:
+        if mod_file == None:
             init_file = find_package_init(module_name, self.input_dir)
             if init_file != None:
                 mod_file = init_file
-        if mod_file is None:
+        if mod_file == None:
             return None
         f_in = open(mod_file, "r")
         text = f_in.read()
@@ -1753,10 +1760,10 @@ class CodeGen:
             self.write_code("t_" + local_name + " = t_init_module_" + module_name.replace('.', '_') + "();", is_in_func)
             return
         module_ast = self._load_module(module_name)
-        if module_ast is None:
+        if module_ast == None:
             self.write_code("/* import " + module_name + " (not found) */;", is_in_func)
             return
-        self.processed_modules.add(module_name)
+        self.processed_modules.append(module_name)
         prefix = module_name.replace('.', '_') + '_'
         init_func_name = "t_init_module_" + module_name.replace('.', '_')
         mod_var_name = "t_module_" + module_name.replace('.', '_')
@@ -1786,10 +1793,10 @@ class CodeGen:
             return
         if not (module_name in self.processed_modules):
             module_ast = self._load_module(module_name)
-            if module_ast is None:
+            if module_ast == None:
                 self.write_code("/* from " + module_name + " import ... (not found) */;", is_in_func)
                 return
-            self.processed_modules.add(module_name)
+            self.processed_modules.append(module_name)
             prefix = module_name.replace('.', '_') + '_'
             mod_globals = []
             collect_globals(module_ast, mod_globals)
@@ -2260,9 +2267,9 @@ class CodeGen:
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
         elif node.type == "DEF" or node.type == "ASYNC_DEF":
-            self.gen_func_def(node, "")
+            self.gen_func_def(node, "", "")
         elif node.type == "CLASS":
-            self.gen_class_def(node)
+            self.gen_class_def(node, "")
 
 def main():
     if len(sys_argv) < 4:
