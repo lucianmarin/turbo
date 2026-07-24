@@ -1586,6 +1586,8 @@ class CodeGen:
         self.input_dir = "."
         self.builtins_list = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "tuple", "set", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter"]
         self.pending_native_vars = None  # (native_vars, native_int_vars) after a native for-loop
+        self._var_types = {}  # function-level inferred variable types
+        self._native_temp_counter = 0
 
     def write_header(self, s):
         self.header = self.header + s
@@ -2008,6 +2010,9 @@ class CodeGen:
             self.funcs = self.funcs + "    t_" + nf.value + " = make_func(t_impl_" + nested_mod_prefix + nf.value + ', "' + nf.value + '");\n'
         body_node.children = remaining_stmts
 
+        self._var_types = {}
+        self._infer_func_types(body_node, self._var_types)
+
         self.gen_block_stmts(body_node, True)
         
         if generator_func:
@@ -2413,14 +2418,20 @@ class CodeGen:
             pass
         if node.type == "UNARY" and node.value == "-":
             tmp0 = self._gen_native_expr(node.children[0], var_types, loop_var)
+            if tmp0 == None:
+                return None
             inner = tmp0[0]
             t = tmp0[1]
             return ("(-(" + inner + "))", t)
         if node.type == "BINOP":
             tmp0 = self._gen_native_expr(node.children[0], var_types, loop_var)
+            if tmp0 == None:
+                return None
             left = tmp0[0]
             lt = tmp0[1]
             tmp1 = self._gen_native_expr(node.children[1], var_types, loop_var)
+            if tmp1 == None:
+                return None
             right = tmp1[0]
             rt = tmp1[1]
             op = node.value
@@ -2480,6 +2491,48 @@ class CodeGen:
             return None
         return None
 
+    def _infer_func_types(self, body_node, var_types):
+        for stmt in body_node.children:
+            if stmt.type == "ASSIGN":
+                target = stmt.children[0]
+                if target.type == "NAME":
+                    val = stmt.children[1]
+                    t = self._infer_type_heuristic(val, var_types, None)
+                    if t != None:
+                        var_types[target.value] = t
+                elif target.type == "TUPLE":
+                    val = stmt.children[1]
+                    if val.type == "TUPLE":
+                        for i in range(len(target.children)):
+                            if target.children[i].type == "NAME" and i < len(val.children):
+                                t = self._infer_type_heuristic(val.children[i], var_types, None)
+                                if t != None:
+                                    var_types[target.children[i].value] = t
+            elif stmt.type == "AUGASSIGN":
+                target = stmt.children[0]
+                if target.type == "NAME" and target.value in var_types:
+                    pass
+            elif stmt.type == "FOR":
+                iter_node = stmt.children[0]
+                if iter_node.type == "CALL" and iter_node.children[0].type == "NAME" and iter_node.children[0].value == "range":
+                    var_types[stmt.value] = CodeGen.NATIVE_INT
+                body = stmt.children[1]
+                self._infer_func_types(body, var_types)
+            elif stmt.type == "WHILE":
+                body = stmt.children[1]
+                self._infer_func_types(body, var_types)
+            elif stmt.type == "IF":
+                _i = 0
+                while _i < len(stmt.children):
+                    if _i + 1 < len(stmt.children):
+                        body = stmt.children[_i + 1]
+                        self._infer_func_types(body, var_types)
+                    else:
+                        self._infer_func_types(stmt.children[_i], var_types)
+                    _i = _i + 2
+            elif stmt.type == "TYPEDEF" or stmt.type == "DEF" or stmt.type == "ASYNC_DEF":
+                pass
+
     def _type_from_body_use(self, var_name, body_node, loop_var):
         var_types_dummy = {loop_var: CodeGen.NATIVE_INT}
         for stmt in body_node.children:
@@ -2490,6 +2543,12 @@ class CodeGen:
                     t = self._infer_type_heuristic(val, var_types_dummy, loop_var)
                     if t != None:
                         return t
+                elif target.type == "TUPLE" and val.type == "TUPLE":
+                    for i in range(len(target.children)):
+                        if target.children[i].type == "NAME" and target.children[i].value == var_name and i < len(val.children):
+                            t = self._infer_type_heuristic(val.children[i], var_types_dummy, loop_var)
+                            if t != None:
+                                return t
             elif stmt.type == "AUGASSIGN":
                 val = stmt.children[1]
                 t = self._infer_type_heuristic(val, var_types_dummy, loop_var)
@@ -2542,6 +2601,17 @@ class CodeGen:
                 if target.type == "NAME":
                     lhs_map[target.value] = stmt
                     lhs_keys_list.append(target.value)
+                elif target.type == "TUPLE":
+                    all_names = True
+                    for elem in target.children:
+                        if elem.type != "NAME":
+                            all_names = False
+                            break
+                    if not all_names:
+                        return False
+                    for elem in target.children:
+                        lhs_map[elem.value] = stmt
+                        lhs_keys_list.append(elem.value)
                 else:
                     # Can't native-optimize tuple/other targets
                     return False
@@ -2636,12 +2706,56 @@ class CodeGen:
             target = stmt.children[0]
             if target.type == "NAME":
                 tmp0 = self._gen_native_expr(stmt.children[1], var_types, loop_var)
+                if tmp0 == None:
+                    return None
                 val_c = tmp0[0]
                 t = var_types.get(target.value, None)
                 if t == CodeGen.NATIVE_FLOAT:
                     return "_d_" + target.value + " = " + val_c + ";"
                 if t == CodeGen.NATIVE_INT:
                     return "_i_" + target.value + " = " + val_c + ";"
+            elif target.type == "TUPLE":
+                val = stmt.children[1]
+                if val.type == "TUPLE":
+                    exprs = []
+                    for i in range(len(target.children)):
+                        if i >= len(val.children):
+                            return None
+                        expr = self._gen_native_expr(val.children[i], var_types, loop_var)
+                        if expr == None:
+                            return None
+                        lhs_t = var_types.get(target.children[i].value, None)
+                        if lhs_t == None:
+                            return None
+                        expr_c = expr[0]
+                        expr_t = expr[1]
+                        if lhs_t == CodeGen.NATIVE_FLOAT and expr_t == CodeGen.NATIVE_INT:
+                            expr_c = "(double)(" + expr_c + ")"
+                            expr_t = CodeGen.NATIVE_FLOAT
+                        elif lhs_t == CodeGen.NATIVE_INT and expr_t == CodeGen.NATIVE_FLOAT:
+                            expr_c = "(long long)(" + expr_c + ")"
+                            expr_t = CodeGen.NATIVE_INT
+                        if expr_t != lhs_t:
+                            return None
+                        exprs.append(expr_c)
+                    temp_id = str(self._native_temp_counter)
+                    self._native_temp_counter += 1
+                    parts = []
+                    for i in range(len(target.children)):
+                        vname = target.children[i].value
+                        t = var_types.get(vname, None)
+                        if t == CodeGen.NATIVE_FLOAT:
+                            parts.append("double _nt" + temp_id + "_" + str(i) + " = " + exprs[i])
+                        elif t == CodeGen.NATIVE_INT:
+                            parts.append("long long _nt" + temp_id + "_" + str(i) + " = " + exprs[i])
+                    for i in range(len(target.children)):
+                        vname = target.children[i].value
+                        t = var_types.get(vname, None)
+                        if t == CodeGen.NATIVE_FLOAT:
+                            parts.append("_d_" + vname + " = _nt" + temp_id + "_" + str(i))
+                        elif t == CodeGen.NATIVE_INT:
+                            parts.append("_i_" + vname + " = _nt" + temp_id + "_" + str(i))
+                    return "{ " + "; ".join(parts) + "; }"
         if stmt.type == "AUGASSIGN":
             target = stmt.children[0]
             if target.type == "NAME":
@@ -2872,6 +2986,13 @@ class CodeGen:
                 body_node = node.children[1]
                 var_types = {}
                 var_types[var_name] = CodeGen.NATIVE_INT
+                _idx = 0
+                while _idx < len(self.local_vars):
+                    _k = self.local_vars[_idx]
+                    if _k in self._var_types:
+                        if not (_k in var_types):
+                            var_types[_k] = self._var_types[_k]
+                    _idx = _idx + 1
                 can_native = self._scan_body_vars(body_node, var_types, var_name)
                 lhs_keys_list = self._scan_body_vars(body_node, var_types, var_name)
                 if lhs_keys_list != False:
