@@ -112,6 +112,7 @@ static const char* get_type_name(TurboObject* obj) {
         case TYPE_LIST: return "list";
         case TYPE_TUPLE: return "tuple";
         case TYPE_SET: return "set";
+        case TYPE_MODULE: return "module";
         case TYPE_DICT: return "dict";
         case TYPE_FUNC: return "function";
         case TYPE_CLASS: return "type";
@@ -1554,9 +1555,46 @@ static bool is_equal(TurboObject* a, TurboObject* b) {
                 if (!found) return false;
             }
             return true;
+        case TYPE_MODULE:
+            return false;
         default:
             return false;
     }
+}
+
+TurboObject* make_module(void) {
+    TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
+    obj->type = TYPE_MODULE;
+    obj->module_val.dict = make_dict();
+    return obj;
+}
+
+TurboObject* turbo_module_get(TurboObject* mod, const char* name) {
+    if (mod->type != TYPE_MODULE) {
+        fprintf(stderr, "TypeError: expected module\n");
+        exit(1);
+    }
+    TurboObject* key = make_str(name);
+    for (int i = 0; i < mod->module_val.dict->dict_val.length; i++) {
+        if (is_equal(mod->module_val.dict->dict_val.keys[i], key)) {
+            return mod->module_val.dict->dict_val.values[i];
+        }
+    }
+    fprintf(stderr, "AttributeError: module has no attribute '%s'\n", name);
+    exit(1);
+}
+
+void turbo_module_set(TurboObject* mod, const char* name, TurboObject* val) {
+    if (mod->type != TYPE_MODULE) {
+        fprintf(stderr, "TypeError: expected module\n");
+        exit(1);
+    }
+    turbo_setitem(mod->module_val.dict, make_str(name), val);
+}
+
+TurboObject* turbo_import_module(const char* name) {
+    (void)name;
+    return turbo_none;
 }
 
 // Compare two bignums: returns >0 if a > b, 0 if ==, <0 if a < b
@@ -1691,6 +1729,7 @@ bool turbo_is_truthy(TurboObject* val) {
         case TYPE_LIST: return val->list_val.length > 0;
         case TYPE_TUPLE: return val->tuple_val.length > 0;
         case TYPE_SET: return val->set_val.length > 0;
+        case TYPE_MODULE: return true;
         case TYPE_DICT: return val->dict_val.length > 0;
         default: return true;
     }
@@ -1935,6 +1974,9 @@ TurboObject* turbo_getattr(TurboObject* obj, const char* name) {
         fprintf(stderr, "AttributeError: '%s' object has no attribute '%s'\n", cls->class_val.name, name);
         exit(1);
     }
+    if (obj->type == TYPE_MODULE) {
+        return turbo_module_get(obj, name);
+    }
     fprintf(stderr, "AttributeError: object has no attributes\n");
     exit(1);
 }
@@ -1955,6 +1997,10 @@ void turbo_setattr(TurboObject* obj, const char* name, TurboObject* val) {
         obj->inst_val.keys[obj->inst_val.length] = strdup(name);
         obj->inst_val.values[obj->inst_val.length] = val;
         obj->inst_val.length++;
+        return;
+    }
+    if (obj->type == TYPE_MODULE) {
+        turbo_module_set(obj, name, val);
         return;
     }
     fprintf(stderr, "AttributeError: cannot set attribute on non-instance\n");
@@ -2170,6 +2216,8 @@ TurboObject* turbo_str(TurboObject* val) {
             free(s3);
             return res;
         }
+        case TYPE_MODULE:
+            return make_str("<module>");
         default:
             return make_str("<object>");
     }
@@ -3145,6 +3193,13 @@ TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int ar
             turbo_file_close(obj);
             return turbo_none;
         }
+    }
+    if (obj->type == TYPE_MODULE) {
+        TurboObject* func = turbo_module_get(obj, method_name);
+        if (func->type == TYPE_FUNC) {
+            return func->func_val.func_ptr(argc, args);
+        }
+        return turbo_call(func, argc, args);
     }
     fprintf(stderr, "AttributeError: object has no method '%s'\n", method_name);
     exit(1);

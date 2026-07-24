@@ -2,7 +2,7 @@
 set -e
 
 echo "=== Cleaning up previous build artifacts ==="
-rm -f test.c test_bin stage1_turbo.c stage1_turbo stage2_turbo.c stage2_turbo
+rm -f test.c test_bin test_stage2_bin stage1_turbo.c stage1_turbo stage2_turbo.c stage2_turbo
 
 echo "=== Step 1: Compiling and running test.py using stage0 (python3) ==="
 python3 turbo.py test.py -o test.c

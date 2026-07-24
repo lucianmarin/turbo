@@ -123,8 +123,8 @@ Features from Python not yet implemented in Turbo.
 
 ## Module System
 
-- [ ] Real `import` — actual module loading (currently a stub)
-- [ ] `__init__.py` — package initialization
+- [x] Real `import` — actual module loading (currently a stub)
+- [x] `__init__.py` — package initialization
 - [ ] Standard library: `sys`, `os`, `math`, `json`, `re`, `time`, etc.
 
 ## Other
@@ -134,4 +134,4 @@ Features from Python not yet implemented in Turbo.
 - [ ] Docstrings (triple-quoted expression statements) — lexer parses, not extracted or used
 - [ ] Step parameter in slicing: `seq[start:stop:step]`
 - [ ] Garbage collector or reference counting (currently malloc-only)
-- [ ] Package system / `__init__.py`
+- [x] Package system / `__init__.py`

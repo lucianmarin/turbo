@@ -782,9 +782,50 @@ class Parser:
 
         elif t.type == "import":
             self.pos = self.pos + 1
-            mod_name = self.consume("NAME").value
+            mod_parts = self.consume("NAME").value
+            while self.peek().type == '.':
+                self.pos = self.pos + 1
+                mod_parts = mod_parts + '.' + self.consume("NAME").value
+            alias = ASTNode("CONST_NONE", "", [])
+            if self.match("as"):
+                alias = ASTNode("NAME", self.consume("NAME").value, [])
+            if self.peek().type == ',':
+                modules = [ASTNode("IMPORT", mod_parts, [alias])]
+                while self.match(','):
+                    mod_parts = self.consume("NAME").value
+                    while self.peek().type == '.':
+                        self.pos = self.pos + 1
+                        mod_parts = mod_parts + '.' + self.consume("NAME").value
+                    alias = ASTNode("CONST_NONE", "", [])
+                    if self.match("as"):
+                        alias = ASTNode("NAME", self.consume("NAME").value, [])
+                    modules.append(ASTNode("IMPORT", mod_parts, [alias]))
+                self.consume('NEWLINE')
+                return ASTNode("IMPORT_LIST", "", modules)
             self.consume('NEWLINE')
-            return ASTNode("IMPORT", mod_name, [])
+            return ASTNode("IMPORT", mod_parts, [alias])
+
+        elif t.type == "from":
+            self.pos = self.pos + 1
+            mod_parts = self.consume("NAME").value
+            while self.peek().type == '.':
+                self.pos = self.pos + 1
+                mod_parts = mod_parts + '.' + self.consume("NAME").value
+            self.consume("import")
+            imported = []
+            while True:
+                name = self.consume("NAME").value
+                alias = ASTNode("CONST_NONE", "", [])
+                if self.match("as"):
+                    alias = ASTNode("NAME", self.consume("NAME").value, [])
+                if alias.type == "CONST_NONE":
+                    imported.append(ASTNode("NAME", name, []))
+                else:
+                    imported.append(ASTNode("IMPORT_AS", "", [ASTNode("NAME", name, []), alias]))
+                if not self.match(','):
+                    break
+            self.consume('NEWLINE')
+            return ASTNode("FROM_IMPORT", mod_parts, imported)
 
         elif t.type == "raise":
             self.pos = self.pos + 1
@@ -1063,6 +1104,43 @@ def collect_locals(node, locals_list):
         if not found:
             locals_list.append(name)
 
+    if node.type == "IMPORT":
+        name = node.value.split('.')[0]
+        alias_node = node.children[0]
+        if alias_node.type == "NAME":
+            name = alias_node.value
+        found = False
+        i = 0
+        while i < len(locals_list):
+            if locals_list[i] == name:
+                found = True
+                break
+            i = i + 1
+        if not found:
+            locals_list.append(name)
+        return
+
+    if node.type == "FROM_IMPORT":
+        imported = node.children
+        i_idx = 0
+        while i_idx < len(imported):
+            item = imported[i_idx]
+            if item.type == "NAME":
+                name = item.value
+            elif item.type == "IMPORT_AS":
+                name = item.children[1].value
+            found = False
+            i = 0
+            while i < len(locals_list):
+                if locals_list[i] == name:
+                    found = True
+                    break
+                i = i + 1
+            if not found:
+                locals_list.append(name)
+            i_idx = i_idx + 1
+        return
+
     if node.type == "DEF" or node.type == "ASYNC_DEF" or node.type == "LAMBDA":
         return
 
@@ -1128,6 +1206,67 @@ def escape_c_string(s):
         i = i + 1
     return res
 
+stdlib_list = ["sys", "os", "math", "json", "re", "time", "datetime", "random", "collections", "itertools", "functools", "pathlib", "subprocess", "typing"]
+
+def is_stdlib_module(name):
+    s_idx = 0
+    while s_idx < len(stdlib_list):
+        if stdlib_list[s_idx] == name:
+            return True
+        s_idx = s_idx + 1
+    return False
+
+def try_open_file(path):
+    try:
+        f = open(path, "r")
+        f.close()
+        return True
+    except:
+        return False
+
+def find_module_file(module_name, input_dir):
+    parts = module_name.split('.')
+    if input_dir == "" or input_dir == ".":
+        base_path = ""
+    else:
+        base_path = input_dir
+    if base_path != "":
+        if base_path[len(base_path)-1] != '/':
+            base_path = base_path + '/'
+    f_idx = 0
+    while f_idx < len(parts):
+        base_path = base_path + parts[f_idx] + '/'
+        f_idx = f_idx + 1
+    if base_path[len(base_path)-1] == '/':
+        base_path = base_path[0:len(base_path)-1]
+    candidates = base_path + ".py"
+    if try_open_file(candidates):
+        return candidates
+    candidates = base_path + ".turbo"
+    if try_open_file(candidates):
+        return candidates
+    return None
+
+def find_package_init(module_name, input_dir):
+    parts = module_name.split('.')
+    base_path = input_dir
+    if base_path == "" or base_path == ".":
+        base_path = ""
+    if base_path != "":
+        if base_path[len(base_path)-1] != '/':
+            base_path = base_path + '/'
+    p_idx = 0
+    while p_idx < len(parts):
+        base_path = base_path + parts[p_idx] + '/'
+        p_idx = p_idx + 1
+    candidates = base_path + "__init__.py"
+    if try_open_file(candidates):
+        return candidates
+    candidates = base_path + "__init__.turbo"
+    if try_open_file(candidates):
+        return candidates
+    return None
+
 class CodeGen:
     def __init__(self):
         self.header = ""
@@ -1139,6 +1278,9 @@ class CodeGen:
         self.else_loop_counter = 0
         self.is_generator = False
         self.lambda_counter = 0
+        self.processed_modules = set()
+        self.input_dir = "."
+        self.builtins_list = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter"]
 
     def write_header(self, s):
         self.header = self.header + s
@@ -1428,12 +1570,12 @@ class CodeGen:
             print("CodeGen error: unknown expression " + node.type)
             return "turbo_none"
 
-    def gen_func_def(self, node, class_name):
+    def gen_func_def(self, node, class_name, mod_prefix=""):
         func_name = node.value
         if class_name != "":
             impl_name = "t_impl_" + class_name + "_" + func_name
         else:
-            impl_name = "t_impl_" + func_name
+            impl_name = "t_impl_" + mod_prefix + func_name
         
         params_node = node.children[0]
         body_node = node.children[1]
@@ -1510,35 +1652,40 @@ class CodeGen:
         self.local_vars = old_locals
         
         if class_name == "":
-            self.write_header("TurboObject* t_" + func_name + " = NULL;\n")
-            self.write_main("t_" + func_name + " = make_func(t_impl_" + func_name + ', "' + func_name + '");')
-            d_idx = 2
-            while d_idx < len(node.children):
-                if node.children[d_idx].type == "DECORATOR":
-                    decorator_c = self.gen_expr(node.children[d_idx].children[0])
-                    self.write_main("t_" + func_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + func_name + "});")
-                d_idx = d_idx + 1
+            self.write_header("TurboObject* t_" + mod_prefix + func_name + " = NULL;\n")
+            if mod_prefix == "":
+                self.write_main("t_" + func_name + " = make_func(t_impl_" + func_name + ', "' + func_name + '");')
+                d_idx = 2
+                while d_idx < len(node.children):
+                    if node.children[d_idx].type == "DECORATOR":
+                        decorator_c = self.gen_expr(node.children[d_idx].children[0])
+                        self.write_main("t_" + func_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + func_name + "});")
+                    d_idx = d_idx + 1
 
-    def gen_class_def(self, node):
+    def gen_class_def(self, node, mod_prefix=""):
         class_name = node.value
-        self.write_header("TurboObject* t_" + class_name + " = NULL;\n")
-        self.write_main("t_" + class_name + ' = make_class("' + class_name + '");')
+        full_name = mod_prefix + class_name
+        self.write_header("TurboObject* t_" + full_name + " = NULL;\n")
+        if mod_prefix == "":
+            self.write_main("t_" + class_name + ' = make_class("' + class_name + '");')
         
         suite = node.children[0]
         m_idx = 0
         while m_idx < len(suite.children):
             m_node = suite.children[m_idx]
             if m_node.type == "DEF" or m_node.type == "ASYNC_DEF":
-                self.gen_func_def(m_node, class_name)
+                self.gen_func_def(m_node, full_name)
                 method_name = m_node.value
-                self.write_main("turbo_class_add_method(t_" + class_name + ', "' + method_name + '", t_impl_' + class_name + '_' + method_name + ');')
+                if mod_prefix == "":
+                    self.write_main("turbo_class_add_method(t_" + class_name + ', "' + method_name + '", t_impl_' + class_name + '_' + method_name + ');')
             m_idx = m_idx + 1
         
         d_idx = 1
         while d_idx < len(node.children):
             if node.children[d_idx].type == "DECORATOR":
                 decorator_c = self.gen_expr(node.children[d_idx].children[0])
-                self.write_main("t_" + class_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + class_name + "});")
+                if mod_prefix == "":
+                    self.write_main("t_" + class_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + class_name + "});")
             d_idx = d_idx + 1
 
     def _gen_comp_loops(self, gen_node, container, append_code):
@@ -1575,6 +1722,174 @@ class CodeGen:
         code = code + "} "
         return code
 
+    def _load_module(self, module_name):
+        if is_stdlib_module(module_name.split('.')[0]):
+            return None
+        mod_file = find_module_file(module_name, self.input_dir)
+        if mod_file is None:
+            init_file = find_package_init(module_name, self.input_dir)
+            if init_file != None:
+                mod_file = init_file
+        if mod_file is None:
+            return None
+        f_in = open(mod_file, "r")
+        text = f_in.read()
+        f_in.close()
+        lexer = Lexer(text)
+        lexer.tokenize()
+        parser = Parser(lexer.tokens)
+        return parser.parse_module()
+
+    def _gen_import(self, node, is_in_func):
+        module_name = node.value
+        alias_node = node.children[0]
+        local_name = module_name.split('.')[0]
+        if alias_node.type == "NAME":
+            local_name = alias_node.value
+        if is_stdlib_module(module_name.split('.')[0]):
+            self.write_code("/* import " + module_name + " (stdlib) */;", is_in_func)
+            return
+        if module_name in self.processed_modules:
+            self.write_code("t_" + local_name + " = t_init_module_" + module_name.replace('.', '_') + "();", is_in_func)
+            return
+        module_ast = self._load_module(module_name)
+        if module_ast is None:
+            self.write_code("/* import " + module_name + " (not found) */;", is_in_func)
+            return
+        self.processed_modules.add(module_name)
+        prefix = module_name.replace('.', '_') + '_'
+        init_func_name = "t_init_module_" + module_name.replace('.', '_')
+        mod_var_name = "t_module_" + module_name.replace('.', '_')
+        mod_globals = []
+        collect_globals(module_ast, mod_globals)
+        g_idx = 0
+        while g_idx < len(mod_globals):
+            g_name = mod_globals[g_idx]
+            is_builtin = False
+            b_idx = 0
+            while b_idx < len(self.builtins_list):
+                if self.builtins_list[b_idx] == g_name:
+                    is_builtin = True
+                    break
+                b_idx = b_idx + 1
+            if not is_builtin:
+                self.write_header("TurboObject* t_" + prefix + g_name + " = NULL;\n")
+            g_idx = g_idx + 1
+        self.gen_module_init(module_name, module_ast)
+        self.write_code("t_" + local_name + " = " + init_func_name + "();", is_in_func)
+
+    def _gen_from_import(self, node, is_in_func):
+        module_name = node.value
+        imported = node.children
+        if is_stdlib_module(module_name.split('.')[0]):
+            self.write_code("/* from " + module_name + " import ... (stdlib) */;", is_in_func)
+            return
+        if not (module_name in self.processed_modules):
+            module_ast = self._load_module(module_name)
+            if module_ast is None:
+                self.write_code("/* from " + module_name + " import ... (not found) */;", is_in_func)
+                return
+            self.processed_modules.add(module_name)
+            prefix = module_name.replace('.', '_') + '_'
+            mod_globals = []
+            collect_globals(module_ast, mod_globals)
+            g_idx = 0
+            while g_idx < len(mod_globals):
+                g_name = mod_globals[g_idx]
+                is_builtin = False
+                b_idx = 0
+                while b_idx < len(self.builtins_list):
+                    if self.builtins_list[b_idx] == g_name:
+                        is_builtin = True
+                        break
+                    b_idx = b_idx + 1
+                if not is_builtin:
+                    self.write_header("TurboObject* t_" + prefix + g_name + " = NULL;\n")
+                g_idx = g_idx + 1
+            self.gen_module_init(module_name, module_ast)
+        init_func_name = "t_init_module_" + module_name.replace('.', '_')
+        i_idx = 0
+        while i_idx < len(imported):
+            item = imported[i_idx]
+            if item.type == "NAME":
+                orig_name = item.value
+                self.write_code("t_" + orig_name + " = turbo_module_get(" + init_func_name + "(), \"" + orig_name + "\");", is_in_func)
+            elif item.type == "IMPORT_AS":
+                orig_name = item.children[0].value
+                alias_name = item.children[1].value
+                self.write_code("t_" + alias_name + " = turbo_module_get(" + init_func_name + "(), \"" + orig_name + "\");", is_in_func)
+            i_idx = i_idx + 1
+
+    def gen_module_init(self, module_name, module_ast):
+        prefix = module_name.replace('.', '_') + '_'
+        init_func_name = "t_init_module_" + module_name.replace('.', '_')
+        stmts = module_ast.children
+        s_idx = 0
+        while s_idx < len(stmts):
+            stmt = stmts[s_idx]
+            if stmt.type == "DEF" or stmt.type == "ASYNC_DEF":
+                old_is_gen = self.is_generator
+                self.gen_func_def(stmt, "", prefix)
+                self.is_generator = old_is_gen
+            elif stmt.type == "CLASS":
+                old_is_gen = self.is_generator
+                self.gen_class_def(stmt, prefix)
+                self.is_generator = old_is_gen
+            s_idx = s_idx + 1
+        self.write_header("TurboObject* " + init_func_name + "(void);\n")
+        self.funcs = self.funcs + "TurboObject* " + init_func_name + "(void) {\n"
+        self.funcs = self.funcs + "    static int _init_done = 0;\n"
+        self.funcs = self.funcs + "    static TurboObject* _mod_obj = NULL;\n"
+        self.funcs = self.funcs + "    if (_init_done) return _mod_obj;\n"
+        self.funcs = self.funcs + "    _init_done = 1;\n"
+        self.funcs = self.funcs + "    TurboObject* mod = make_module();\n"
+        s_idx = 0
+        while s_idx < len(stmts):
+            stmt = stmts[s_idx]
+            if stmt.type == "DEF" or stmt.type == "ASYNC_DEF":
+                func_name = stmt.value
+                self.funcs = self.funcs + "    " + "turbo_module_set(mod, \"" + func_name + "\", make_func(t_impl_" + prefix + func_name + ", \"" + func_name + "\"));\n"
+            elif stmt.type == "CLASS":
+                class_name = stmt.value
+                self.funcs = self.funcs + "    " + "t_" + prefix + class_name + " = make_class(\"" + class_name + "\");\n"
+                suite = stmt.children[0]
+                m_idx = 0
+                while m_idx < len(suite.children):
+                    m_node = suite.children[m_idx]
+                    if m_node.type == "DEF" or m_node.type == "ASYNC_DEF":
+                        method_name = m_node.value
+                        self.funcs = self.funcs + "    " + "turbo_class_add_method(t_" + prefix + class_name + ", \"" + method_name + "\", t_impl_" + prefix + class_name + "_" + method_name + ");\n"
+                    m_idx = m_idx + 1
+                self.funcs = self.funcs + "    " + "turbo_module_set(mod, \"" + class_name + "\", t_" + prefix + class_name + ");\n"
+            elif stmt.type == "ASSIGN":
+                target = stmt.children[0]
+                val_node = stmt.children[1]
+                if target.type == "NAME":
+                    var_name = target.value
+                    val_c = self.gen_expr(val_node)
+                    self.funcs = self.funcs + "    " + "t_" + prefix + var_name + " = " + val_c + ";\n"
+                    self.funcs = self.funcs + "    " + "turbo_module_set(mod, \"" + var_name + "\", t_" + prefix + var_name + ");\n"
+            elif stmt.type == "AUGASSIGN":
+                target = stmt.children[0]
+                val_node = stmt.children[1]
+                op = stmt.value
+                if target.type == "NAME":
+                    var_name = target.value
+                    if op == '+=':
+                        self.funcs = self.funcs + "    t_" + prefix + var_name + " = turbo_add(t_" + prefix + var_name + ", " + self.gen_expr(val_node) + ");\n"
+                        self.funcs = self.funcs + "    turbo_module_set(mod, \"" + var_name + "\", t_" + prefix + var_name + ");\n"
+            elif stmt.type == "EXPR":
+                expr_c = self.gen_expr(stmt.children[0])
+                self.funcs = self.funcs + "    " + "(void)(" + expr_c + ");\n"
+            elif stmt.type == "IMPORT" or stmt.type == "IMPORT_LIST" or stmt.type == "FROM_IMPORT":
+                pass
+            else:
+                pass
+            s_idx = s_idx + 1
+        self.funcs = self.funcs + "    _mod_obj = mod;\n"
+        self.funcs = self.funcs + "    return mod;\n"
+        self.funcs = self.funcs + "}\n\n"
+
     def gen_block_stmts(self, block_node, is_in_func):
         stmts = block_node.children
         s_idx = 0
@@ -1586,7 +1901,14 @@ class CodeGen:
         if node.type == "PASS":
             self.write_code("/* pass */;", is_in_func)
         elif node.type == "IMPORT":
-            self.write_code("/* import " + node.value + " */;", is_in_func)
+            self._gen_import(node, is_in_func)
+        elif node.type == "IMPORT_LIST":
+            c_idx = 0
+            while c_idx < len(node.children):
+                self._gen_import(node.children[c_idx], is_in_func)
+                c_idx = c_idx + 1
+        elif node.type == "FROM_IMPORT":
+            self._gen_from_import(node, is_in_func)
         elif node.type == "BREAK":
             if len(self.else_loop_stack) > 0:
                 self.write_code(self.else_loop_stack[-1] + " = 1; break;", is_in_func)
@@ -1972,14 +2294,27 @@ def main():
     parser = Parser(lexer.tokens)
     module_ast = parser.parse_module()
     
+    input_dir = ""
+    last_slash = -1
+    s_idx = 0
+    while s_idx < len(input_file):
+        if input_file[s_idx] == '/':
+            last_slash = s_idx
+        s_idx = s_idx + 1
+    if last_slash >= 0:
+        input_dir = input_file[0:last_slash]
+    if input_dir == "":
+        input_dir = "."
+    
     cg = CodeGen()
+    cg.input_dir = input_dir
     
     globals_list = []
     collect_globals(module_ast, globals_list)
     
     # Declare globals in C header
     g_idx = 0
-    builtins = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter"]
+    builtins = cg.builtins_list
     while g_idx < len(globals_list):
         g_name = globals_list[g_idx]
         is_builtin = False

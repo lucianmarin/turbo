@@ -1,3 +1,11 @@
 __pycache__
 .pycache
 
+# build artifacts
+test.c
+test_bin
+test_stage2_bin
+stage1_turbo.c
+stage1_turbo
+stage2_turbo.c
+stage2_turbo

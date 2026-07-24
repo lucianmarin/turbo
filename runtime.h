@@ -20,7 +20,8 @@ typedef enum {
     TYPE_COMPLEX,
     TYPE_BYTES,
     TYPE_TUPLE,
-    TYPE_SET
+    TYPE_SET,
+    TYPE_MODULE
 } TurboType;
 
 typedef struct TurboObject TurboObject;
@@ -91,6 +92,9 @@ struct TurboObject {
         struct {
             FILE* handle;
         } file_val;
+        struct {
+            TurboObject* dict;
+        } module_val;
     };
 };
 
@@ -167,6 +171,10 @@ TurboObject* make_func(TurboCFunction func, const char* name);
 TurboObject* make_class(const char* name);
 TurboObject* make_instance(TurboObject* class_obj);
 TurboObject* make_file(FILE* handle);
+TurboObject* make_module(void);
+TurboObject* turbo_module_get(TurboObject* mod, const char* name);
+void turbo_module_set(TurboObject* mod, const char* name, TurboObject* val);
+TurboObject* turbo_import_module(const char* name);
 
 TurboObject* turbo_add(TurboObject* a, TurboObject* b);
 TurboObject* turbo_sub(TurboObject* a, TurboObject* b);
