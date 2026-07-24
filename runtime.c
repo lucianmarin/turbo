@@ -1085,12 +1085,17 @@ TurboObject* make_int(const char* str) {
     TurboObject* obj = (TurboObject*)malloc(sizeof(TurboObject));
     obj->type = TYPE_INT;
     int sign = 0;
+    int slen = strlen(str);
+    while (slen > 0 && (str[slen-1] == ' ' || str[slen-1] == '\t' || str[slen-1] == '\n' || str[slen-1] == '\r'))
+        slen--;
     const char* p = str;
     if (*p == '-') { sign = 1; p++; }
     else if (*p == '+') { p++; }
-    int len = strlen(p);
+    int len = slen - (p - str);
+    if (len < 0) len = 0;
     char* digits = (char*)malloc(len + 1);
-    memcpy(digits, p, len + 1);
+    memcpy(digits, p, len);
+    digits[len] = '\0';
     strip_leading_zeros(digits, &len);
     obj->int_val.digits = digits;
     obj->int_val.length = len;

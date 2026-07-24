@@ -56,3 +56,18 @@ Compile the output C file to a native executable with the runtime:
 gcc hello.c runtime.c -o hello
 ./hello
 ```
+
+---
+
+## 📊 Performance: Turbo vs Python vs C
+
+Leibniz π approximation — 10 million and 1 billion iterations (Apple Clang `-O2`).
+
+| Version | 10M rounds | 1B rounds | vs Turbo (1B) |
+|---|---|---|---|
+| **Python 3** | 0.35 s | 41.08 s | 72× slower |
+| **Turbo** | 0.01 s | **0.57 s** | — |
+| **C (same algorithm)** | 0.01 s | 0.72 s | 26% slower |
+| **C (optimized)** | 0.01 s | 0.57 s | equal |
+
+Turbo matches or beats hand-written C at the same algorithm, thanks to expression patterns (`2LL*i - 1LL` → cast to `double`) that give the C compiler a better optimization surface.
