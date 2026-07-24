@@ -2694,6 +2694,89 @@ TurboObject* turbo_str_count(TurboObject* self, TurboObject* sub) {
     return make_int_from_ll(count);
 }
 
+TurboObject* turbo_str_format(TurboObject* self, int argc, TurboObject** args) {
+    const char* fmt = self->str_val.chars;
+    int fmt_len = self->str_val.length;
+    int total_len = 0;
+    int arg_idx = 0;
+    int i = 0;
+    while (i < fmt_len) {
+        if (fmt[i] == '{') {
+            i++;
+            if (i < fmt_len && fmt[i] == '{') {
+                total_len++;
+                i++;
+            } else {
+                int idx = arg_idx;
+                if (i < fmt_len && fmt[i] >= '0' && fmt[i] <= '9') {
+                    idx = 0;
+                    while (i < fmt_len && fmt[i] >= '0' && fmt[i] <= '9') {
+                        idx = idx * 10 + (fmt[i] - '0');
+                        i++;
+                    }
+                }
+                if (i < fmt_len) i++;
+                if (idx >= argc) {
+                    fprintf(stderr, "IndexError: tuple index out of range\n");
+                    exit(1);
+                }
+                TurboObject* arg_str = turbo_str(args[idx]);
+                total_len += arg_str->str_val.length;
+                arg_idx = idx + 1 > arg_idx ? idx + 1 : arg_idx;
+            }
+        } else if (fmt[i] == '}') {
+            i++;
+            if (i < fmt_len && fmt[i] == '}') {
+                total_len++;
+                i++;
+            }
+        } else {
+            total_len++;
+            i++;
+        }
+    }
+    char* result = (char*)malloc(total_len + 1);
+    int pos = 0;
+    arg_idx = 0;
+    i = 0;
+    while (i < fmt_len) {
+        if (fmt[i] == '{') {
+            i++;
+            if (i < fmt_len && fmt[i] == '{') {
+                result[pos++] = '{';
+                i++;
+            } else {
+                int idx = arg_idx;
+                if (i < fmt_len && fmt[i] >= '0' && fmt[i] <= '9') {
+                    idx = 0;
+                    while (i < fmt_len && fmt[i] >= '0' && fmt[i] <= '9') {
+                        idx = idx * 10 + (fmt[i] - '0');
+                        i++;
+                    }
+                }
+                if (i < fmt_len) i++;
+                TurboObject* arg_str = turbo_str(args[idx]);
+                memcpy(result + pos, arg_str->str_val.chars, arg_str->str_val.length);
+                pos += arg_str->str_val.length;
+                arg_idx = idx + 1 > arg_idx ? idx + 1 : arg_idx;
+            }
+        } else if (fmt[i] == '}') {
+            i++;
+            if (i < fmt_len && fmt[i] == '}') {
+                result[pos++] = '}';
+                i++;
+            }
+        } else {
+            result[pos++] = fmt[i];
+            i++;
+        }
+    }
+    result[pos] = '\0';
+    TurboObject* res = make_str_len(result, pos);
+    free(result);
+    return res;
+}
+
 // List method implementations
 void turbo_list_extend(TurboObject* list_obj, TurboObject* other) {
     if (other->type != TYPE_LIST) {
@@ -3080,6 +3163,9 @@ TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int ar
                 exit(1);
             }
             return turbo_str_count(obj, args[0]);
+        }
+        if (strcmp(method_name, "format") == 0) {
+            return turbo_str_format(obj, argc, args);
         }
     }
     if (obj->type == TYPE_DICT) {

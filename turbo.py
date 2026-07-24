@@ -46,6 +46,91 @@ class Lexer:
         self.indent_stack = [0]
         self.tokens = []
 
+    def _tokenize_expr(self, text, line_num):
+        tokens = []
+        p = 0
+        while p < len(text):
+            c = text[p]
+            if c == ' ' or c == '\t':
+                p = p + 1
+                continue
+            if p + 1 < len(text):
+                two = text[p:p+2]
+                if two in ('==', '!=', '<=', '>=', '+=', '-=', '*=', '/=', '%=', '**', '//', '<<', '>>', '&=', '|=', '^=', ':=', '->', '@='):
+                    tokens.append(Token(two, two, line_num))
+                    p = p + 2
+                    continue
+            if c in '+-*/%=<>()[]{}:.,&|^~!@':
+                tokens.append(Token(c, c, line_num))
+                p = p + 1
+                continue
+            if c >= '0' and c <= '9':
+                val = ""
+                is_float = False
+                while p < len(text):
+                    ch = text[p]
+                    if ch >= '0' and ch <= '9':
+                        val = val + ch
+                        p = p + 1
+                    elif ch == '.':
+                        is_float = True
+                        val = val + ch
+                        p = p + 1
+                    elif ch == 'e' or ch == 'E':
+                        is_float = True
+                        val = val + ch
+                        p = p + 1
+                    elif ch == 'j' or ch == 'J':
+                        val = val + ch
+                        p = p + 1
+                        tokens.append(Token("IMAG", val, line_num))
+                        break
+                    else:
+                        break
+                if is_float:
+                    tokens.append(Token("FLOAT", val, line_num))
+                else:
+                    if val != "":
+                        tokens.append(Token("NUMBER", val, line_num))
+                continue
+            if c == '"' or c == "'":
+                quote = c
+                val = ""
+                p = p + 1
+                while p < len(text) and text[p] != quote:
+                    if text[p] == '\\':
+                        p = p + 1
+                        if p < len(text):
+                            ec = text[p]
+                            if ec == 'n':
+                                val = val + "\n"
+                            elif ec == 't':
+                                val = val + "\t"
+                            elif ec == 'r':
+                                val = val + "\r"
+                            else:
+                                val = val + ec
+                        p = p + 1
+                    else:
+                        val = val + text[p]
+                        p = p + 1
+                p = p + 1
+                tokens.append(Token("STRING", val, line_num))
+                continue
+            if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_':
+                val = ""
+                while p < len(text) and ((text[p] >= 'a' and text[p] <= 'z') or (text[p] >= 'A' and text[p] <= 'Z') or (text[p] >= '0' and text[p] <= '9') or text[p] == '_'):
+                    val = val + text[p]
+                    p = p + 1
+                keywords = ["def", "class", "if", "elif", "else", "while", "for", "in", "return", "and", "or", "not", "pass", "None", "True", "False", "import", "break", "continue", "raise", "assert", "del", "global", "nonlocal", "try", "except", "finally", "with", "as", "from", "async", "await", "match", "case", "yield", "lambda"]
+                if val in keywords:
+                    tokens.append(Token(val, val, line_num))
+                else:
+                    tokens.append(Token("NAME", val, line_num))
+                continue
+            p = p + 1
+        return tokens
+
     def tokenize(self):
         lines = self.text.split("\n")
         line_idx = 0
@@ -144,27 +229,95 @@ class Lexer:
             if c == 'f' and p + 1 < len(line) and (line[p+1] == '"' or line[p+1] == "'"):
                 p = p + 1
                 quote = line[p]
-                val = ""
                 p = p + 1
+                segments = []
+                lit = ""
                 while p < len(line) and line[p] != quote:
                     if line[p] == '\\':
                         p = p + 1
                         if p < len(line):
                             ec = line[p]
                             if ec == 'n':
-                                val = val + "\n"
+                                lit = lit + "\n"
                             elif ec == 't':
-                                val = val + "\t"
+                                lit = lit + "\t"
                             elif ec == 'r':
-                                val = val + "\r"
+                                lit = lit + "\r"
                             else:
-                                val = val + ec
+                                lit = lit + ec
                         p = p + 1
+                    elif line[p] == '{':
+                        p = p + 1
+                        if p < len(line) and line[p] == '{':
+                            lit = lit + '{'
+                            p = p + 1
+                        else:
+                            segments.append(("lit", lit))
+                            lit = ""
+                            depth = 1
+                            expr_text = ""
+                            while p < len(line) and depth > 0:
+                                if line[p] == '{':
+                                    depth = depth + 1
+                                    expr_text = expr_text + '{'
+                                    p = p + 1
+                                elif line[p] == '}':
+                                    depth = depth - 1
+                                    if depth > 0:
+                                        expr_text = expr_text + '}'
+                                    p = p + 1
+                                elif line[p] == '"' or line[p] == "'":
+                                    q = line[p]
+                                    expr_text = expr_text + q
+                                    p = p + 1
+                                    while p < len(line) and line[p] != q:
+                                        if line[p] == '\\':
+                                            expr_text = expr_text + '\\'
+                                            p = p + 1
+                                            if p < len(line):
+                                                expr_text = expr_text + line[p]
+                                                p = p + 1
+                                        else:
+                                            expr_text = expr_text + line[p]
+                                            p = p + 1
+                                    if p < len(line):
+                                        expr_text = expr_text + line[p]
+                                        p = p + 1
+                                else:
+                                    expr_text = expr_text + line[p]
+                                    p = p + 1
+                            segments.append(("expr", expr_text))
+                            lit = ""
+                    elif line[p] == '}':
+                        p = p + 1
+                        if p < len(line) and line[p] == '}':
+                            lit = lit + '}'
+                            p = p + 1
                     else:
-                        val = val + line[p]
+                        lit = lit + line[p]
                         p = p + 1
                 p = p + 1
-                self.tokens.append(Token("STRING", val, line_num))
+                segments.append(("lit", lit))
+                seg_idx = 0
+                while seg_idx < len(segments):
+                    seg_type = segments[seg_idx][0]
+                    seg_val = segments[seg_idx][1]
+                    if seg_type == "lit" and seg_val != "":
+                        if seg_idx > 0:
+                            self.tokens.append(Token("+", "+", line_num))
+                        self.tokens.append(Token("STRING", seg_val, line_num))
+                    elif seg_type == "expr" and seg_val != "":
+                        if seg_idx > 0:
+                            self.tokens.append(Token("+", "+", line_num))
+                        self.tokens.append(Token("NAME", "str", line_num))
+                        self.tokens.append(Token("(", "(", line_num))
+                        expr_tokens = self._tokenize_expr(seg_val, line_num)
+                        et_idx = 0
+                        while et_idx < len(expr_tokens):
+                            self.tokens.append(expr_tokens[et_idx])
+                            et_idx = et_idx + 1
+                        self.tokens.append(Token(")", ")", line_num))
+                    seg_idx = seg_idx + 1
                 continue
             
             # Triple-quoted strings """ or '''

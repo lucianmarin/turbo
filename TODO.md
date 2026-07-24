@@ -56,8 +56,8 @@ Features from Python not yet implemented in Turbo.
 - [x] `.strip()` / `.lstrip()` / `.rstrip()` — trim whitespace
 - [x] `.startswith(prefix)` / `.endswith(suffix)` — prefix/suffix check
 - [x] `.count(sub)` — count occurrences
-- [ ] `.format(*args)` — string formatting
-- [ ] f-strings: `f"hello {name}"` — lexer tokenizes as plain string, no expression interpolation
+- [x] `.format(*args)` — string formatting
+- [x] f-strings: `f"hello {name}"` — lexer tokenizes as plain string, no expression interpolation
 - [x] Triple-quoted strings: `"""..."""` / `'''...'''`
 
 ## List Methods

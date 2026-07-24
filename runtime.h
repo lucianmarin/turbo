@@ -248,6 +248,7 @@ TurboObject* turbo_str_rstrip(TurboObject* self);
 TurboObject* turbo_str_startswith(TurboObject* self, TurboObject* prefix);
 TurboObject* turbo_str_endswith(TurboObject* self, TurboObject* suffix);
 TurboObject* turbo_str_count(TurboObject* self, TurboObject* sub);
+TurboObject* turbo_str_format(TurboObject* self, int argc, TurboObject** args);
 
 // Dict methods
 TurboObject* turbo_dict_keys(TurboObject* self);
