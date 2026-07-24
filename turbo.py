@@ -1026,7 +1026,7 @@ def collect_locals(node, locals_list):
         if not found:
             locals_list.append(name)
 
-    if node.type == "DEF" or node.type == "ASYNC_DEF":
+    if node.type == "DEF" or node.type == "ASYNC_DEF" or node.type == "LAMBDA":
         return
 
     idx = 0
@@ -1101,6 +1101,7 @@ class CodeGen:
         self.else_loop_stack = []
         self.else_loop_counter = 0
         self.is_generator = False
+        self.lambda_counter = 0
 
     def write_header(self, s):
         self.header = self.header + s
@@ -1311,7 +1312,51 @@ class CodeGen:
                 return "({ TurboObject* _w = " + val_expr + "; t_" + target.value + " = _w; _w; })"
             return val_expr
         elif node.type == "LAMBDA":
-            return "turbo_none /* lambda */"
+            lambda_num = self.lambda_counter
+            self.lambda_counter = self.lambda_counter + 1
+            impl_name = "t_impl_lambda_" + str(lambda_num)
+            params_node = node.children[0]
+            body_node = node.children[1]
+
+            old_locals = self.local_vars
+            self.local_vars = []
+            p_idx = 0
+            while p_idx < len(params_node.children):
+                self.local_vars.append(params_node.children[p_idx].value)
+                p_idx = p_idx + 1
+            collect_locals(body_node, self.local_vars)
+
+            self.write_header("TurboObject* " + impl_name + "(int argc, TurboObject** args);\n")
+
+            self.funcs = self.funcs + "TurboObject* " + impl_name + "(int argc, TurboObject** args) {\n"
+
+            p_idx = 0
+            while p_idx < len(params_node.children):
+                p_name = params_node.children[p_idx].value
+                self.funcs = self.funcs + "    TurboObject* t_" + p_name + " = (argc > " + str(p_idx) + ") ? args[" + str(p_idx) + "] : turbo_none;\n"
+                p_idx = p_idx + 1
+
+            l_idx = 0
+            while l_idx < len(self.local_vars):
+                l_name = self.local_vars[l_idx]
+                is_param = False
+                p_idx = 0
+                while p_idx < len(params_node.children):
+                    if params_node.children[p_idx].value == l_name:
+                        is_param = True
+                        break
+                    p_idx = p_idx + 1
+                if not is_param:
+                    self.funcs = self.funcs + "    TurboObject* t_" + l_name + " = turbo_none;\n"
+                l_idx = l_idx + 1
+
+            body_code = self.gen_expr(body_node)
+            self.funcs = self.funcs + "    return " + body_code + ";\n"
+            self.funcs = self.funcs + "}\n\n"
+
+            self.local_vars = old_locals
+
+            return "make_func(" + impl_name + ', "<lambda>")'
         elif node.type == "YIELD":
             val_c = self.gen_expr(node.children[0])
             return "({ TurboObject* __yv = " + val_c + "; turbo_list_append(__yield_values, __yv); turbo_none; })"
