@@ -15,8 +15,12 @@ Features from Python not yet implemented in Turbo.
 
 - [x] `try` / `except` / `else` / `finally` — implemented with setjmp/longjmp; supports bare `except:`, typed `except ExcType:`, `except ExcType as e:`, `else`, and `finally`
 - [x] `raise` — raises a catchable exception via `turbo_raise()`; prints "Unhandled exception" and exits if no matching handler
-- [ ] `assert` — parsed, codegen checks truthiness and calls `exit(1)` on failure; assertion message is silently dropped
-- [ ] `with` — parsed, codegen assigns context manager to variable and wraps body in bare block; no `__enter__` / `__exit__` calls
+- [x] `assert` — parsed, codegen checks truthiness and calls `exit(1)` on failure; assertion message is evaluated and printed when present
+- [x] `with` — parsed, codegen assigns context manager to variable and wraps body in bare block; no `__enter__` / `__exit__` calls
+  - [x] calls `__enter__()` and binds result to `as` variable
+  - [x] wraps body in try/finally via setjmp/longjmp
+  - [x] calls `__exit__(exc_type, exc_val, None)` with proper args
+  - [x] re-raises exception if `__exit__` returns false
 - [ ] `async` / `await` — parsed but codegen produces normal sync def/for/with
 - [ ] `match` / `case` — parsed as stub, pattern matching not implemented
 - [ ] `for` / `else`, `while` / `else` — else clauses on loops

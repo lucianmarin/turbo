@@ -95,6 +95,33 @@ def test_bigint():
     print("e < 0:", e < 0)
     print("e > 0:", e > 0)
 
+class Ctx:
+    def __init__(self):
+        self.entered = False
+        self.exited = False
+        self.info = ""
+
+    def __enter__(self):
+        self.entered = True
+        return 42
+
+    def __exit__(self, a, b, c):
+        self.exited = True
+        if a == None:
+            self.info = "ok"
+        else:
+            self.info = "exc"
+        return False
+
+def test_with():
+    print("With statement:")
+    c = Ctx()
+    with c as val:
+        print("  val:", val)
+        print("  entered:", c.entered)
+    print("  exited:", c.exited)
+    print("  info:", c.info)
+
 def main():
     test_arithmetic()
     test_comparisons()
@@ -103,5 +130,6 @@ def main():
     test_loops()
     test_classes()
     test_bigint()
+    test_with()
 
 main()
