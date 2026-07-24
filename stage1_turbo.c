@@ -15,6 +15,7 @@ TurboObject* t_impl_Lexer_tokenize(int argc, TurboObject** args);
 TurboObject* t_impl_Lexer_tokenize_line(int argc, TurboObject** args);
 TurboObject* t_impl_Lexer_collect_locals(int argc, TurboObject** args);
 TurboObject* t_impl_Lexer_collect_globals(int argc, TurboObject** args);
+TurboObject* t_impl_Lexer_scan_global_nonlocal_names(int argc, TurboObject** args);
 TurboObject* t_impl_Lexer_escape_c_string(int argc, TurboObject** args);
 TurboObject* t_impl_Lexer_main(int argc, TurboObject** args);
 
@@ -530,6 +531,37 @@ TurboObject* t_impl_Lexer_collect_globals(int argc, TurboObject** args) {
     return turbo_none;
 }
 
+TurboObject* t_impl_Lexer_scan_global_nonlocal_names(int argc, TurboObject** args) {
+    TurboObject* t_body_node = (argc > 0) ? args[0] : turbo_none;
+    TurboObject* t_names = turbo_none;
+    TurboObject* t_stmts = turbo_none;
+    TurboObject* t_idx = turbo_none;
+    TurboObject* t_stmt = turbo_none;
+    TurboObject* t_list_node = turbo_none;
+    TurboObject* t_n_idx = turbo_none;
+    TurboObject* t_name_node = turbo_none;
+    t_names = make_list();
+    t_stmts = turbo_getattr(t_body_node, "children");
+    t_idx = make_int("0");
+    while (turbo_is_truthy(turbo_lt(t_idx, turbo_call(t_len, 1, (TurboObject*[]){t_stmts})))) {
+        t_stmt = turbo_getitem(t_stmts, t_idx);
+        if (turbo_is_truthy(({ TurboObject* _lh = turbo_eq(turbo_getattr(t_stmt, "type"), make_str("GLOBAL")); turbo_is_truthy(_lh) ? _lh : turbo_eq(turbo_getattr(t_stmt, "type"), make_str("NONLOCAL")); }))) {
+            t_list_node = turbo_getitem(turbo_getattr(t_stmt, "children"), make_int("0"));
+            t_n_idx = make_int("0");
+            while (turbo_is_truthy(turbo_lt(t_n_idx, turbo_call(t_len, 1, (TurboObject*[]){turbo_getattr(t_list_node, "children")})))) {
+                t_name_node = turbo_getitem(turbo_getattr(t_list_node, "children"), t_n_idx);
+                if (turbo_is_truthy(turbo_eq(turbo_getattr(t_name_node, "type"), make_str("NAME")))) {
+                    turbo_call_method(t_names, "append", 1, (TurboObject*[]){turbo_getattr(t_name_node, "value")});
+                }
+                t_n_idx = turbo_add(t_n_idx, make_int("1"));
+            }
+        }
+        t_idx = turbo_add(t_idx, make_int("1"));
+    }
+    return t_names;
+    return turbo_none;
+}
+
 TurboObject* t_impl_Lexer_escape_c_string(int argc, TurboObject** args) {
     TurboObject* t_s = (argc > 0) ? args[0] : turbo_none;
     TurboObject* t_res = turbo_none;
@@ -671,6 +703,7 @@ void turbo_main(void) {
     turbo_class_add_method(t_Lexer, "tokenize_line", t_impl_Lexer_tokenize_line);
     turbo_class_add_method(t_Lexer, "collect_locals", t_impl_Lexer_collect_locals);
     turbo_class_add_method(t_Lexer, "collect_globals", t_impl_Lexer_collect_globals);
+    turbo_class_add_method(t_Lexer, "scan_global_nonlocal_names", t_impl_Lexer_scan_global_nonlocal_names);
     turbo_class_add_method(t_Lexer, "escape_c_string", t_impl_Lexer_escape_c_string);
     turbo_class_add_method(t_Lexer, "main", t_impl_Lexer_main);
 }

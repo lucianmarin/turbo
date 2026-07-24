@@ -25,7 +25,7 @@ Features from Python not yet implemented in Turbo.
 - [x] `match` / `case` — pattern matching implemented via if/elif chain; supports literal, capture, and wildcard (`_`) patterns
 - [x] `for` / `else`, `while` / `else` — else clauses on loops
 - [x] `del` — removes list elements and dict keys via `turbo_delitem`; variables set to `turbo_none`
-- [ ] `global` / `nonlocal` — parsed, codegen emits C comments only; no effect on scoping
+- [x] `global` / `nonlocal` — names excluded from local variable declarations; `global` resolves to module-level globals; `nonlocal` prevents local shadowing (full closure support not yet implemented)
 - [ ] `yield` / `yield from` — parsed but codegen is a stub (returns `turbo_none`)
 - [ ] `lambda` — parsed but codegen is a stub (returns `turbo_none`)
 - [ ] `@decorator` — parsed, decorator AST attached to def/class, but never applied in codegen

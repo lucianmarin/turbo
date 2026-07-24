@@ -1038,6 +1038,23 @@ def collect_globals(block_node, globals_list):
         collect_locals(node, globals_list)
         idx = idx + 1
 
+def scan_global_nonlocal_names(body_node):
+    names = []
+    stmts = body_node.children
+    idx = 0
+    while idx < len(stmts):
+        stmt = stmts[idx]
+        if stmt.type == "GLOBAL" or stmt.type == "NONLOCAL":
+            list_node = stmt.children[0]
+            n_idx = 0
+            while n_idx < len(list_node.children):
+                name_node = list_node.children[n_idx]
+                if name_node.type == "NAME":
+                    names.append(name_node.value)
+                n_idx = n_idx + 1
+        idx = idx + 1
+    return names
+
 def escape_c_string(s):
     res = ""
     i = 0
@@ -1303,6 +1320,25 @@ class CodeGen:
             self.local_vars.append(params_node.children[p_idx].value)
             p_idx = p_idx + 1
         collect_locals(body_node, self.local_vars)
+
+        global_names = scan_global_nonlocal_names(body_node)
+
+        if len(global_names) > 0:
+            new_locals = []
+            l_idx = 0
+            while l_idx < len(self.local_vars):
+                l_name = self.local_vars[l_idx]
+                is_global = False
+                n_idx = 0
+                while n_idx < len(global_names):
+                    if global_names[n_idx] == l_name:
+                        is_global = True
+                        break
+                    n_idx = n_idx + 1
+                if not is_global:
+                    new_locals.append(l_name)
+                l_idx = l_idx + 1
+            self.local_vars = new_locals
         
         self.write_header("TurboObject* " + impl_name + "(int argc, TurboObject** args);\n")
         
@@ -1553,8 +1589,12 @@ class CodeGen:
                 self.write_code("t_" + target.value + " = turbo_none;", is_in_func)
             else:
                 self.write_code("/* del */", is_in_func)
-        elif node.type == "GLOBAL" or node.type == "NONLOCAL":
-            self.write_code("/* " + node.type + " declaration */", is_in_func)
+        elif node.type == "GLOBAL":
+            if is_in_func:
+                self.write_code("/* global: names resolved to module scope */", is_in_func)
+        elif node.type == "NONLOCAL":
+            if is_in_func:
+                self.write_code("/* nonlocal: names resolved to enclosing function scope */", is_in_func)
         elif node.type == "WITH":
             expr_c = self.gen_expr(node.children[0])
             alias_node = node.children[1]
