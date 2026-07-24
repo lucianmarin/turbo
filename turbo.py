@@ -374,11 +374,87 @@ class Lexer:
                 self.tokens.append(Token("STRING", val, line_num))
                 continue
             
-            # Numeric literals (int, float, and complex imaginary)
+            # Numeric literals (int, float, hex, octal, binary, complex imaginary)
             if c >= '0' and c <= '9':
                 val = ""
                 is_float = False
                 has_j = False
+                # Check for hex / octal / binary prefix
+                if c == '0' and p + 1 < len(line):
+                    peek = line[p + 1]
+                    if peek == 'x' or peek == 'X':
+                        hex_str = ''
+                        p = p + 2
+                        while p < len(line):
+                            ch = line[p]
+                            if (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F'):
+                                hex_str = hex_str + ch
+                                p = p + 1
+                            else:
+                                break
+                        if hex_str == '':
+                            val = '0'
+                        else:
+                            # Convert hex to decimal (avoid int() with base arg)
+                            dec_val = 0
+                            h_idx = 0
+                            while h_idx < len(hex_str):
+                                ch = hex_str[h_idx]
+                                if ch >= '0' and ch <= '9':
+                                    d = ord(ch) - 48
+                                elif ch >= 'a' and ch <= 'f':
+                                    d = ord(ch) - 87
+                                else:
+                                    d = ord(ch) - 55
+                                dec_val = dec_val * 16 + d
+                                h_idx = h_idx + 1
+                            val = str(dec_val)
+                        self.tokens.append(Token("NUMBER", val, line_num))
+                        continue
+                    elif peek == 'o' or peek == 'O':
+                        octal_str = ''
+                        p = p + 2
+                        while p < len(line):
+                            ch = line[p]
+                            if ch >= '0' and ch <= '7':
+                                octal_str = octal_str + ch
+                                p = p + 1
+                            else:
+                                break
+                        if octal_str == '':
+                            val = '0'
+                        else:
+                            dec_val = 0
+                            h_idx = 0
+                            while h_idx < len(octal_str):
+                                d = ord(octal_str[h_idx]) - 48
+                                dec_val = dec_val * 8 + d
+                                h_idx = h_idx + 1
+                            val = str(dec_val)
+                        self.tokens.append(Token("NUMBER", val, line_num))
+                        continue
+                    elif peek == 'b' or peek == 'B':
+                        bin_str = ''
+                        p = p + 2
+                        while p < len(line):
+                            ch = line[p]
+                            if ch == '0' or ch == '1':
+                                bin_str = bin_str + ch
+                                p = p + 1
+                            else:
+                                break
+                        if bin_str == '':
+                            val = '0'
+                        else:
+                            dec_val = 0
+                            h_idx = 0
+                            while h_idx < len(bin_str):
+                                d = ord(bin_str[h_idx]) - 48
+                                dec_val = dec_val * 2 + d
+                                h_idx = h_idx + 1
+                            val = str(dec_val)
+                        self.tokens.append(Token("NUMBER", val, line_num))
+                        continue
                 while p < len(line):
                     ch = line[p]
                     if ch >= '0' and ch <= '9':
@@ -1177,6 +1253,15 @@ class Parser:
 
         else:
             expr = self.parse_expr()
+            # Handle bare tuple: a, b = ... or a, b (expression)
+            if self.peek().type == ',':
+                elements = [expr]
+                while self.try_match(','):
+                    if self.peek().type in (')', ']', '}', ':', ';', 'NEWLINE', 'EOF'):
+                        break
+                    elements.append(self.parse_expr())
+                if len(elements) > 1:
+                    expr = ASTNode("TUPLE", "", elements)
             next_t = self.peek()
             if next_t.type == ':=':
                 self.pos = self.pos + 1
@@ -1198,6 +1283,15 @@ class Parser:
             elif next_t.type == '=':
                 self.pos = self.pos + 1
                 value = self.parse_expr()
+                # Handle tuple on right side: ... = a, b
+                if self.peek().type == ',':
+                    elements = [value]
+                    while self.try_match(','):
+                        if self.peek().type in (')', ']', '}', ':', ';', 'NEWLINE', 'EOF'):
+                            break
+                        elements.append(self.parse_expr())
+                    if len(elements) > 1:
+                        value = ASTNode("TUPLE", "", elements)
                 self.consume('NEWLINE')
                 return ASTNode("ASSIGN", "", [expr, value])
             elif next_t.type == '+=' or next_t.type == '-=' or next_t.type == '*=' or next_t.type == '/=' or next_t.type == '%=' or next_t.type == '**=' or next_t.type == '//=' or next_t.type == '&=' or next_t.type == '|=' or next_t.type == '^=' or next_t.type == '>>=' or next_t.type == '<<=' or next_t.type == '@=':
@@ -1246,6 +1340,22 @@ def collect_locals(node, locals_list):
                 i = i + 1
             if not found:
                 locals_list.append(name)
+        elif target.type == "TUPLE":
+            for elem in target.children:
+                if elem.type == "NAME":
+                    name = elem.value
+                    found = False
+                    i = 0
+                    while i < len(locals_list):
+                        if locals_list[i] == name:
+                            found = True
+                            break
+                        i = i + 1
+                    if not found:
+                        locals_list.append(name)
+                elif elem.type == "TUPLE":
+                    # Nested tuple unpacking: recurse into the helper
+                    collect_locals(elem, locals_list)
     elif node.type == "FOR" or node.type == "ASYNC_FOR":
         name = node.value
         found = False
@@ -1804,12 +1914,14 @@ class CodeGen:
             print("CodeGen error: unknown expression " + node.type)
             return "turbo_none"
 
-    def gen_func_def(self, node, class_name, mod_prefix):
+    def gen_func_def(self, node, class_name, mod_prefix, is_nested):
         func_name = node.value
+        # For nested functions, use a unique impl name but keep var_name simple
         if class_name != "":
             impl_name = "t_impl_" + class_name + "_" + func_name
         else:
             impl_name = "t_impl_" + mod_prefix + func_name
+        var_name = func_name  # name used for the module-level variable t_<name>
         
         params_node = node.children[0]
         body_node = node.children[1]
@@ -1873,21 +1985,46 @@ class CodeGen:
             self.funcs = self.funcs + "    TurboObject* __yield_values = make_list();\n"
             
         self.indent_level = 1
+
+        # Extract nested function defs and generate them at module scope
+        nested_funcs = []
+        remaining_stmts = []
+        for stmt in body_node.children:
+            if stmt.type == "DEF" or stmt.type == "ASYNC_DEF":
+                nested_funcs.append(stmt)
+            else:
+                remaining_stmts.append(stmt)
+        # Generate nested functions at module scope
+        # Buffer their implementations so they appear AFTER the parent function
+        nested_func_buf = ""
+        for nf in nested_funcs:
+            nested_mod_prefix = mod_prefix + func_name + "_nested_"
+            saved_funcs = self.funcs
+            self.funcs = ""
+            self.gen_func_def(nf, "", nested_mod_prefix, True)
+            nested_func_buf = nested_func_buf + self.funcs
+            self.funcs = saved_funcs
+            # Initialize module-level variable inside parent function body
+            self.funcs = self.funcs + "    t_" + nf.value + " = make_func(t_impl_" + nested_mod_prefix + nf.value + ', "' + nf.value + '");\n'
+        body_node.children = remaining_stmts
+
         self.gen_block_stmts(body_node, True)
         
         if generator_func:
             self.funcs = self.funcs + "    return __yield_values;\n"
         else:
             self.funcs = self.funcs + "    return turbo_none;\n"
-        self.funcs = self.funcs + "}\n\n"
+        self.funcs = self.funcs + "}\n"
+        self.funcs = self.funcs + nested_func_buf
+        self.funcs = self.funcs + "\n"
         
         self.is_generator = old_generator
         
         self.local_vars = old_locals
         
         if class_name == "":
-            self.write_header("TurboObject* t_" + mod_prefix + func_name + " = NULL;\n")
-            if mod_prefix == "":
+            self.write_header("TurboObject* t_" + var_name + " = NULL;\n")
+            if not is_nested:
                 self.write_main("t_" + func_name + " = make_func(t_impl_" + func_name + ', "' + func_name + '");')
                 d_idx = 2
                 while d_idx < len(node.children):
@@ -1979,7 +2116,7 @@ class CodeGen:
                             elif dec_c.value == "property":
                                 is_property = True
                     md_idx = md_idx + 1
-                self.gen_func_def(m_node, full_name, "")
+                self.gen_func_def(m_node, full_name, "", False)
                 if is_static:
                     if mod_prefix == "":
                         self.write_main("turbo_class_set_attr(t_" + class_name + ', "' + method_name + '", make_staticmethod(t_impl_' + class_name + '_' + method_name + ', "' + method_name + '"));')
@@ -2166,7 +2303,7 @@ class CodeGen:
             stmt = stmts[s_idx]
             if stmt.type == "DEF" or stmt.type == "ASYNC_DEF":
                 old_is_gen = self.is_generator
-                self.gen_func_def(stmt, "", prefix)
+                self.gen_func_def(stmt, "", prefix, False)
                 self.is_generator = old_is_gen
             elif stmt.type == "CLASS":
                 old_is_gen = self.is_generator
@@ -2405,6 +2542,9 @@ class CodeGen:
                 if target.type == "NAME":
                     lhs_map[target.value] = stmt
                     lhs_keys_list.append(target.value)
+                else:
+                    # Can't native-optimize tuple/other targets
+                    return False
             s_idx = s_idx + 1
         # Check if all stmt types are ASSIGN or AUGASSIGN
         t_idx = 0
@@ -2596,6 +2736,40 @@ class CodeGen:
                     obj_c = self.gen_expr(target.children[0])
                     idx_c = self.gen_expr(target.children[1])
                     self.write_code('turbo_setitem(' + obj_c + ', ' + idx_c + ', ' + val_c + ');', is_in_func)
+                elif target.type == "TUPLE":
+                    self.write_code("{", is_in_func)
+                    self.indent_level = self.indent_level + 1
+                    self.write_code("TurboObject* _tmp = " + val_c + ";", is_in_func)
+                    self.write_code("int _tup_len = _tmp->type == TYPE_LIST ? _tmp->list_val.length : _tmp->tuple_val.length;", is_in_func)
+                    e_idx = 0
+                    while e_idx < len(target.children):
+                        elem = target.children[e_idx]
+                        idx_c = "make_int_from_ll(" + str(e_idx) + "LL)"
+                        if elem.type == "NAME":
+                            self.write_code("t_" + elem.value + " = (_tup_len > " + str(e_idx) + ") ? turbo_getitem(_tmp, " + idx_c + ") : turbo_none;", is_in_func)
+                        elif elem.type == "ATTR":
+                            obj_c = self.gen_expr(elem.children[0])
+                            self.write_code('if (_tup_len > ' + str(e_idx) + ') { turbo_setattr(' + obj_c + ', "' + elem.value + '", turbo_getitem(_tmp, ' + idx_c + ')); }', is_in_func)
+                        elif elem.type == "SUBSCRIPT":
+                            obj_c = self.gen_expr(elem.children[0])
+                            idx2_c = self.gen_expr(elem.children[1])
+                            self.write_code('if (_tup_len > ' + str(e_idx) + ') { turbo_setitem(' + obj_c + ', ' + idx2_c + ', turbo_getitem(_tmp, ' + idx_c + ')); }', is_in_func)
+                        elif elem.type == "TUPLE":
+                            self.write_code("{", is_in_func)
+                            self.indent_level = self.indent_level + 1
+                            self.write_code("TurboObject* _sub = turbo_getitem(_tmp, " + idx_c + ");", is_in_func)
+                            sub_idx = 0
+                            while sub_idx < len(elem.children):
+                                sub_elem = elem.children[sub_idx]
+                                sub_idx_c = "make_int_from_ll(" + str(sub_idx) + "LL)"
+                                if sub_elem.type == "NAME":
+                                    self.write_code("t_" + sub_elem.value + " = turbo_getitem(_sub, " + sub_idx_c + ");", is_in_func)
+                                sub_idx = sub_idx + 1
+                            self.indent_level = self.indent_level - 1
+                            self.write_code("}", is_in_func)
+                        e_idx = e_idx + 1
+                    self.indent_level = self.indent_level - 1
+                    self.write_code("}", is_in_func)
         elif node.type == "AUGASSIGN":
             if self.pending_native_vars != None:
                 pnv = self.pending_native_vars
@@ -3008,7 +3182,7 @@ class CodeGen:
             self.indent_level = self.indent_level - 1
             self.write_code("}", is_in_func)
         elif node.type == "DEF" or node.type == "ASYNC_DEF":
-            self.gen_func_def(node, "", "")
+            self.gen_func_def(node, "", "", False)
         elif node.type == "CLASS":
             self.gen_class_def(node, "")
 
