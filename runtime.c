@@ -34,6 +34,8 @@ TurboObject* t_float = NULL;
 TurboObject* t_bool = NULL;
 TurboObject* t_list = NULL;
 TurboObject* t_dict = NULL;
+TurboObject* t_tuple = NULL;
+TurboObject* t_set = NULL;
 TurboObject* t_super = NULL;
 TurboObject* t_iter = NULL;
 TurboObject* t_next = NULL;
@@ -113,6 +115,7 @@ static const char* get_type_name(TurboObject* obj) {
         case TYPE_TUPLE: return "tuple";
         case TYPE_SET: return "set";
         case TYPE_MODULE: return "module";
+        case TYPE_SUPER: return "super";
         case TYPE_DICT: return "dict";
         case TYPE_FUNC: return "function";
         case TYPE_CLASS: return "type";
@@ -459,6 +462,80 @@ static TurboObject* builtin_dict(int argc, TurboObject** args) {
     exit(1);
 }
 
+static TurboObject* builtin_tuple(int argc, TurboObject** args) {
+    if (argc != 1) {
+        fprintf(stderr, "TypeError: tuple() takes exactly 1 argument\n");
+        exit(1);
+    }
+    TurboObject* obj = args[0];
+    if (obj->type == TYPE_LIST) {
+        return make_tuple_from_list(obj);
+    }
+    if (obj->type == TYPE_TUPLE) {
+        TurboObject* res = make_tuple();
+        for (int i = 0; i < obj->tuple_val.length; i++) {
+            turbo_tuple_append(res, obj->tuple_val.items[i]);
+        }
+        return res;
+    }
+    if (obj->type == TYPE_STR) {
+        TurboObject* res = make_tuple();
+        for (int i = 0; i < obj->str_val.length; i++) {
+            char temp[2] = { obj->str_val.chars[i], '\0' };
+            turbo_tuple_append(res, make_str(temp));
+        }
+        return res;
+    }
+    if (obj->type == TYPE_SET) {
+        TurboObject* res = make_tuple();
+        for (int i = 0; i < obj->set_val.length; i++) {
+            turbo_tuple_append(res, obj->set_val.items[i]);
+        }
+        return res;
+    }
+    fprintf(stderr, "TypeError: tuple() argument must be iterable\n");
+    exit(1);
+}
+
+static TurboObject* builtin_set(int argc, TurboObject** args) {
+    if (argc != 1) {
+        fprintf(stderr, "TypeError: set() takes exactly 1 argument\n");
+        exit(1);
+    }
+    TurboObject* obj = args[0];
+    if (obj->type == TYPE_SET) {
+        TurboObject* res = make_set();
+        for (int i = 0; i < obj->set_val.length; i++) {
+            turbo_set_add(res, obj->set_val.items[i]);
+        }
+        return res;
+    }
+    if (obj->type == TYPE_LIST) {
+        TurboObject* res = make_set();
+        for (int i = 0; i < obj->list_val.length; i++) {
+            turbo_set_add(res, obj->list_val.items[i]);
+        }
+        return res;
+    }
+    if (obj->type == TYPE_TUPLE) {
+        TurboObject* res = make_set();
+        for (int i = 0; i < obj->tuple_val.length; i++) {
+            turbo_set_add(res, obj->tuple_val.items[i]);
+        }
+        return res;
+    }
+    if (obj->type == TYPE_STR) {
+        TurboObject* res = make_set();
+        for (int i = 0; i < obj->str_val.length; i++) {
+            char temp[2] = { obj->str_val.chars[i], '\0' };
+            turbo_set_add(res, make_str(temp));
+        }
+        return res;
+    }
+    fprintf(stderr, "TypeError: set() argument must be iterable\n");
+    exit(1);
+}
+
 static TurboObject* builtin_super(int argc, TurboObject** args) {
     (void)argc;
     (void)args;
@@ -471,8 +548,16 @@ static TurboObject* builtin_iter(int argc, TurboObject** args) {
         exit(1);
     }
     TurboObject* obj = args[0];
-    if (obj->type == TYPE_LIST || obj->type == TYPE_STR) {
+    if (obj->type == TYPE_LIST) {
         return turbo_slice(obj, make_int_from_ll(0), turbo_none);
+    }
+    if (obj->type == TYPE_STR) {
+        TurboObject* res = make_list();
+        for (int i = 0; i < obj->str_val.length; i++) {
+            char temp[2] = { obj->str_val.chars[i], '\0' };
+            turbo_list_append(res, make_str(temp));
+        }
+        return res;
     }
     if (obj->type == TYPE_DICT) {
         return turbo_dict_keys(obj);
@@ -481,9 +566,27 @@ static TurboObject* builtin_iter(int argc, TurboObject** args) {
 }
 
 static TurboObject* builtin_next(int argc, TurboObject** args) {
-    (void)argc;
-    (void)args;
-    return turbo_none;
+    if (argc < 1 || argc > 2) {
+        fprintf(stderr, "TypeError: next() takes 1 or 2 arguments\n");
+        exit(1);
+    }
+    if (args[0]->type != TYPE_LIST) {
+        fprintf(stderr, "TypeError: next() argument must be an iterator (list)\n");
+        exit(1);
+    }
+    TurboObject* lst = args[0];
+    if (lst->list_val.length == 0) {
+        if (argc == 2) {
+            return args[1];
+        }
+        return turbo_none;
+    }
+    TurboObject* item = lst->list_val.items[0];
+    for (int i = 0; i < lst->list_val.length - 1; i++) {
+        lst->list_val.items[i] = lst->list_val.items[i + 1];
+    }
+    lst->list_val.length--;
+    return item;
 }
 
 static TurboObject* builtin_all(int argc, TurboObject** args) {
@@ -720,6 +823,8 @@ void turbo_init(void) {
     t_bool = make_func(builtin_bool, "bool");
     t_list = make_func(builtin_list, "list");
     t_dict = make_func(builtin_dict, "dict");
+    t_tuple = make_func(builtin_tuple, "tuple");
+    t_set = make_func(builtin_set, "set");
     t_super = make_func(builtin_super, "super");
     t_iter = make_func(builtin_iter, "iter");
     t_next = make_func(builtin_next, "next");
@@ -1977,6 +2082,21 @@ TurboObject* turbo_getattr(TurboObject* obj, const char* name) {
     if (obj->type == TYPE_MODULE) {
         return turbo_module_get(obj, name);
     }
+    if (obj->type == TYPE_SUPER) {
+        TurboObject* sup_obj = obj->super_val.obj;
+        if (sup_obj != NULL && sup_obj->type == TYPE_INSTANCE) {
+            TurboObject* cls = sup_obj->inst_val.class_obj;
+            for (int i = 0; i < cls->class_val.method_count; i++) {
+                if (strcmp(cls->class_val.method_names[i], name) == 0) {
+                    return make_func(cls->class_val.method_funcs[i], name);
+                }
+            }
+            fprintf(stderr, "AttributeError: 'super' object has no attribute '%s'\n", name);
+            exit(1);
+        }
+        fprintf(stderr, "AttributeError: 'super' object has no attribute '%s'\n", name);
+        exit(1);
+    }
     fprintf(stderr, "AttributeError: object has no attributes\n");
     exit(1);
 }
@@ -2218,6 +2338,18 @@ TurboObject* turbo_str(TurboObject* val) {
         }
         case TYPE_MODULE:
             return make_str("<module>");
+        case TYPE_SUPER: {
+            TurboObject* sup_obj = val->super_val.obj;
+            if (sup_obj != NULL && sup_obj->type == TYPE_INSTANCE) {
+                const char* cls_name = sup_obj->inst_val.class_obj->class_val.name;
+                char* s = (char*)malloc(strlen(cls_name) + 12);
+                sprintf(s, "<super: %s>", cls_name);
+                TurboObject* res = make_str(s);
+                free(s);
+                return res;
+            }
+            return make_str("<super>");
+        }
         default:
             return make_str("<object>");
     }
@@ -2997,6 +3129,27 @@ TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int ar
             }
         }
         fprintf(stderr, "AttributeError: '%s' object has no method '%s'\n", cls->class_val.name, method_name);
+        exit(1);
+    }
+    if (obj->type == TYPE_SUPER) {
+        TurboObject* sup_obj = obj->super_val.obj;
+        if (sup_obj != NULL && sup_obj->type == TYPE_INSTANCE) {
+            TurboObject* cls = sup_obj->inst_val.class_obj;
+            for (int i = 0; i < cls->class_val.method_count; i++) {
+                if (strcmp(cls->class_val.method_names[i], method_name) == 0) {
+                    int call_argc = argc + 1;
+                    TurboObject** call_args = (TurboObject**)malloc(sizeof(TurboObject*) * call_argc);
+                    call_args[0] = sup_obj;
+                    for (int j = 0; j < argc; j++) {
+                        call_args[j + 1] = args[j];
+                    }
+                    TurboObject* res = cls->class_val.method_funcs[i](call_argc, call_args);
+                    free(call_args);
+                    return res;
+                }
+            }
+        }
+        fprintf(stderr, "AttributeError: 'super' object has no method '%s'\n", method_name);
         exit(1);
     }
     if (obj->type == TYPE_LIST) {

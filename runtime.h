@@ -21,7 +21,8 @@ typedef enum {
     TYPE_BYTES,
     TYPE_TUPLE,
     TYPE_SET,
-    TYPE_MODULE
+    TYPE_MODULE,
+    TYPE_SUPER
 } TurboType;
 
 typedef struct TurboObject TurboObject;
@@ -95,6 +96,9 @@ struct TurboObject {
         struct {
             TurboObject* dict;
         } module_val;
+        struct {
+            TurboObject* obj;
+        } super_val;
     };
 };
 
@@ -128,6 +132,8 @@ extern TurboObject* t_float;
 extern TurboObject* t_bool;
 extern TurboObject* t_list;
 extern TurboObject* t_dict;
+extern TurboObject* t_tuple;
+extern TurboObject* t_set;
 extern TurboObject* t_super;
 extern TurboObject* t_iter;
 extern TurboObject* t_next;

@@ -96,10 +96,10 @@ Features from Python not yet implemented in Turbo.
 - [x] `float(x)` — convert to float
 - [x] `bool(x)` — convert to bool
 - [x] `list(x)` / `dict(x)` — type constructors
-- [ ] `tuple(x)` / `set(x)` — type constructors (runtime exists, not wired as builtins)
-- [ ] `super()` — access parent class (stub, returns None)
-- [ ] `eval(expr)` / `exec(code)` — dynamic evaluation
-- [ ] `iter(obj)` / `next(obj)` — iterator protocol (`iter` returns list slice copy; `next` returns None stub)
+- [x] `tuple(x)` / `set(x)` — type constructors
+- [ ] `super()` — access parent class (stub, returns None; requires inheritance support)
+- [ ] `eval(expr)` / `exec(code)` — dynamic evaluation (requires runtime compiler embedding)
+- [x] `iter(obj)` / `next(obj)` — iterator protocol (`iter` returns list; `next` pops from front with optional default)
 - [x] `all(iterable)` / `any(iterable)` — predicate checks
 - [x] `sum(iterable)` / `min(iterable)` / `max(iterable)` — aggregation
 - [x] `sorted(iterable)` — return sorted list
