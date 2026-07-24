@@ -525,11 +525,17 @@ class Parser:
             return first
         elif t.type == '[':
             self.pos = self.pos + 1
-            elements = []
             if self.peek().type != ']':
-                elements.append(self.parse_expr())
+                first_expr = self.parse_expr()
+                if self.peek().type == "for":
+                    gen = self.parse_listcomp_generators()
+                    self.consume(']')
+                    return ASTNode("LISTCOMP", "", [first_expr, gen])
+                elements = [first_expr]
                 while self.match(','):
                     elements.append(self.parse_expr())
+            else:
+                elements = []
             self.consume(']')
             return ASTNode("LIST", "", elements)
         elif t.type == '{':
@@ -617,6 +623,24 @@ class Parser:
         else:
             expr = self.parse_expr()
             return ASTNode("PATTERN_LIT", "", [expr])
+
+    def parse_listcomp_generators(self):
+        self.consume("for")
+        var_name = self.consume("NAME").value
+        self.consume("in")
+        iterable = self.parse_and()
+        if_cond = ASTNode("CONST_NONE", "", [])
+        if self.peek().type == "if":
+            self.pos = self.pos + 1
+            if_cond = self.parse_and()
+            while self.peek().type == "if":
+                self.pos = self.pos + 1
+                next_cond = self.parse_and()
+                if_cond = ASTNode("AND", "", [if_cond, next_cond])
+        next_gen = ASTNode("CONST_NONE", "", [])
+        if self.peek().type == "for":
+            next_gen = self.parse_listcomp_generators()
+        return ASTNode("GENERATOR", var_name, [iterable, if_cond, next_gen])
 
     def parse_stmt(self):
         t = self.peek()
@@ -1287,6 +1311,13 @@ class CodeGen:
                 a_idx = a_idx + 1
             c_code = c_code + " _set; })"
             return c_code
+        elif node.type == "LISTCOMP":
+            elem_c = self.gen_expr(node.children[0])
+            gen = node.children[1]
+            c_code = "({ TurboObject* _lc = make_list(); "
+            c_code = c_code + self.gen_listcomp_loops(elem_c, gen)
+            c_code = c_code + " _lc; })"
+            return c_code
         elif node.type == "DICT":
             keys = node.children[0].children
             values = node.children[1].children
@@ -1481,6 +1512,28 @@ class CodeGen:
                 decorator_c = self.gen_expr(node.children[d_idx].children[0])
                 self.write_main("t_" + class_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + class_name + "});")
             d_idx = d_idx + 1
+
+    def gen_listcomp_loops(self, elem_c, gen_node):
+        if gen_node.type == "CONST_NONE":
+            return "turbo_list_append(_lc, " + elem_c + "); "
+        var_name = gen_node.value
+        iter_c = self.gen_expr(gen_node.children[0])
+        if_cond = gen_node.children[1]
+        if_c = ""
+        if if_cond.type != "CONST_NONE":
+            if_c = "if (turbo_is_truthy(" + self.gen_expr(if_cond) + ")) "
+        next_gen = gen_node.children[2]
+        inner = ""
+        if next_gen.type != "CONST_NONE":
+            inner = self.gen_listcomp_loops(elem_c, next_gen)
+        else:
+            inner = "turbo_list_append(_lc, " + elem_c + "); "
+        code = "{ TurboObject* _lci = " + iter_c + "; "
+        code = code + "if (_lci->type == TYPE_LIST) { for (int _lci_i = 0; _lci_i < _lci->list_val.length; _lci_i++) { TurboObject* t_" + var_name + " = _lci->list_val.items[_lci_i]; " + if_c + "{ " + inner + " } } } "
+        code = code + "else if (_lci->type == TYPE_TUPLE) { for (int _lci_i = 0; _lci_i < _lci->tuple_val.length; _lci_i++) { TurboObject* t_" + var_name + " = _lci->tuple_val.items[_lci_i]; " + if_c + "{ " + inner + " } } } "
+        code = code + "else if (_lci->type == TYPE_STR) { for (int _lci_i = 0; _lci_i < _lci->str_val.length; _lci_i++) { char _lci_tmp[2] = {_lci->str_val.chars[_lci_i], '\\0'}; TurboObject* t_" + var_name + " = make_str(_lci_tmp); " + if_c + "{ " + inner + " } } } "
+        code = code + "} "
+        return code
 
     def gen_block_stmts(self, block_node, is_in_func):
         stmts = block_node.children
