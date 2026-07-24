@@ -545,10 +545,15 @@ class Parser:
                 return ASTNode("DICT", "", [ASTNode("LIST", "", []), ASTNode("LIST", "", [])])
             first = self.parse_expr()
             if self.peek().type == ':':
-                # Dict literal
+                # Dict literal or dict comprehension
                 self.pos = self.pos + 1
+                value = self.parse_expr()
+                if self.peek().type == "for":
+                    gen = self.parse_listcomp_generators()
+                    self.consume('}')
+                    return ASTNode("DICTCOMP", "", [first, value, gen])
                 keys = [first]
-                values = [self.parse_expr()]
+                values = [value]
                 while self.match(','):
                     key = self.parse_expr()
                     self.consume(':')
@@ -558,7 +563,11 @@ class Parser:
                 self.consume('}')
                 return ASTNode("DICT", "", [ASTNode("LIST", "", keys), ASTNode("LIST", "", values)])
             else:
-                # Set literal
+                # Set literal or set comprehension
+                if self.peek().type == "for":
+                    gen = self.parse_listcomp_generators()
+                    self.consume('}')
+                    return ASTNode("SETCOMP", "", [first, gen])
                 elements = [first]
                 while self.match(','):
                     if self.peek().type == '}':
@@ -626,7 +635,11 @@ class Parser:
 
     def parse_listcomp_generators(self):
         self.consume("for")
-        var_name = self.consume("NAME").value
+        targets = [self.consume("NAME").value]
+        while self.peek().type == ',':
+            self.pos = self.pos + 1
+            targets.append(self.consume("NAME").value)
+        var_name = ",".join(targets)
         self.consume("in")
         iterable = self.parse_and()
         if_cond = ASTNode("CONST_NONE", "", [])
@@ -1311,12 +1324,27 @@ class CodeGen:
                 a_idx = a_idx + 1
             c_code = c_code + " _set; })"
             return c_code
+        elif node.type == "SETCOMP":
+            elem_c = self.gen_expr(node.children[0])
+            gen = node.children[1]
+            c_code = "({ TurboObject* _sc = make_set(); "
+            c_code = c_code + self._gen_comp_loops(gen, "_sc", "turbo_set_add(_sc, " + elem_c + ")")
+            c_code = c_code + " _sc; })"
+            return c_code
         elif node.type == "LISTCOMP":
             elem_c = self.gen_expr(node.children[0])
             gen = node.children[1]
             c_code = "({ TurboObject* _lc = make_list(); "
-            c_code = c_code + self.gen_listcomp_loops(elem_c, gen)
+            c_code = c_code + self._gen_comp_loops(gen, "_lc", "turbo_list_append(_lc, " + elem_c + ")")
             c_code = c_code + " _lc; })"
+            return c_code
+        elif node.type == "DICTCOMP":
+            key_c = self.gen_expr(node.children[0])
+            val_c = self.gen_expr(node.children[1])
+            gen = node.children[2]
+            c_code = "({ TurboObject* _dc = make_dict(); "
+            c_code = c_code + self._gen_comp_loops(gen, "_dc", "turbo_setitem(_dc, " + key_c + ", " + val_c + ")")
+            c_code = c_code + " _dc; })"
             return c_code
         elif node.type == "DICT":
             keys = node.children[0].children
@@ -1513,10 +1541,10 @@ class CodeGen:
                 self.write_main("t_" + class_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + class_name + "});")
             d_idx = d_idx + 1
 
-    def gen_listcomp_loops(self, elem_c, gen_node):
+    def _gen_comp_loops(self, gen_node, container, append_code):
         if gen_node.type == "CONST_NONE":
-            return "turbo_list_append(_lc, " + elem_c + "); "
-        var_name = gen_node.value
+            return append_code + "; "
+        targets = gen_node.value.split(',')
         iter_c = self.gen_expr(gen_node.children[0])
         if_cond = gen_node.children[1]
         if_c = ""
@@ -1525,13 +1553,25 @@ class CodeGen:
         next_gen = gen_node.children[2]
         inner = ""
         if next_gen.type != "CONST_NONE":
-            inner = self.gen_listcomp_loops(elem_c, next_gen)
+            inner = self._gen_comp_loops(next_gen, container, append_code)
         else:
-            inner = "turbo_list_append(_lc, " + elem_c + "); "
+            inner = append_code + "; "
+        if len(targets) == 1:
+            sv = "TurboObject* t_" + gen_node.value + " = _lci->list_val.items[_lci_i];"
+            svt = "TurboObject* t_" + gen_node.value + " = _lci->tuple_val.items[_lci_i];"
+            svs = "char _lci_tmp[2] = {_lci->str_val.chars[_lci_i], '\\0'}; TurboObject* t_" + gen_node.value + " = make_str(_lci_tmp);"
+        else:
+            sv = "TurboObject* _lc_tmp = _lci->list_val.items[_lci_i]; "
+            svt = "TurboObject* _lc_tmp = _lci->tuple_val.items[_lci_i]; "
+            svs = ""
+            for i, t in enumerate(targets):
+                sv += "TurboObject* t_" + t + " = turbo_getitem(_lc_tmp, make_int_from_ll(" + str(i) + ")); "
+                svt += "TurboObject* t_" + t + " = turbo_getitem(_lc_tmp, make_int_from_ll(" + str(i) + ")); "
         code = "{ TurboObject* _lci = " + iter_c + "; "
-        code = code + "if (_lci->type == TYPE_LIST) { for (int _lci_i = 0; _lci_i < _lci->list_val.length; _lci_i++) { TurboObject* t_" + var_name + " = _lci->list_val.items[_lci_i]; " + if_c + "{ " + inner + " } } } "
-        code = code + "else if (_lci->type == TYPE_TUPLE) { for (int _lci_i = 0; _lci_i < _lci->tuple_val.length; _lci_i++) { TurboObject* t_" + var_name + " = _lci->tuple_val.items[_lci_i]; " + if_c + "{ " + inner + " } } } "
-        code = code + "else if (_lci->type == TYPE_STR) { for (int _lci_i = 0; _lci_i < _lci->str_val.length; _lci_i++) { char _lci_tmp[2] = {_lci->str_val.chars[_lci_i], '\\0'}; TurboObject* t_" + var_name + " = make_str(_lci_tmp); " + if_c + "{ " + inner + " } } } "
+        code = code + "if (_lci->type == TYPE_LIST) { for (int _lci_i = 0; _lci_i < _lci->list_val.length; _lci_i++) { " + sv + if_c + "{ " + inner + " } } } "
+        code = code + "else if (_lci->type == TYPE_TUPLE) { for (int _lci_i = 0; _lci_i < _lci->tuple_val.length; _lci_i++) { " + svt + if_c + "{ " + inner + " } } } "
+        if len(targets) == 1:
+            code = code + "else if (_lci->type == TYPE_STR) { for (int _lci_i = 0; _lci_i < _lci->str_val.length; _lci_i++) { " + svs + if_c + "{ " + inner + " } } } "
         code = code + "} "
         return code
 
