@@ -61,13 +61,17 @@ gcc hello.c runtime.c -o hello
 
 ## 📊 Performance: Turbo vs Python vs C
 
-Leibniz π approximation — 10 million and 1 billion iterations (Apple Clang `-O2`).
+Benchmark suite (`perf/`) comparing Python 3, Turbo (LLVM IR), and hand-written C (`clang -O2`).
 
-| Version | 10M rounds | 1B rounds | vs Turbo (1B) |
-|---|---|---|---|
-| **Python 3** | 0.35 s | 41.08 s | 72× slower |
-| **Turbo** | 0.01 s | **0.57 s** | — |
-| **C (same algorithm)** | 0.01 s | 0.72 s | 26% slower |
-| **C (optimized)** | 0.01 s | 0.57 s | equal |
+| Benchmark | Python 3 (ms) | Turbo LLVM IR (ms) | C `clang -O2` (ms) | Turbo vs Python |
+|---|---:|---:|---:|---:|
+| `fib_iterative` | 10,658.46 | **7.28** | 9.03 | **1,464.7x** |
+| `fib_recursive` | 10,188.20 | **323.49** | 327.84 | **31.5x** (1.00x C) |
+| `ackermann` | 3,513.94 | **10.38** | 10.39 | **338.7x** (1.00x C) |
+| `pi_wallis` | 531.06 | **8.67** | 9.28 | **61.2x** (1.00x C) |
+| `leibniz` | 81,281.36 | **1,131.65** | 1,103.76 | **71.8x** (1.02x C) |
+| `matmult` | 10,506.18 | **520.35** | 7.67* / 211.21 | **20.2x** |
+| `sieve` | 300.48 | **86.47** | 17.61 | **3.5x** |
+| `collatz` | 11,316.72 | **3,042.91** | 205.10 | **3.7x** |
 
-Turbo matches or beats hand-written C at the same algorithm, thanks to expression patterns (`2LL*i - 1LL` → cast to `double`) that give the C compiler a better optimization surface.
+*\*Note: `matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (7.67 ms); with a volatile sink, C 512×512 matmult takes ~211 ms vs Turbo's 520 ms.*

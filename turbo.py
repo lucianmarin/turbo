@@ -1571,293 +1571,646 @@ def find_package_init(module_name, input_dir):
         return candidates
     return None
 
+def escape_llvm_string(s):
+    res = ""
+    i = 0
+    hex_chars = "0123456789ABCDEF"
+    while i < len(s):
+        c = s[i]
+        code = ord(c)
+        if code >= 32 and code <= 126 and c != '"' and c != '\\':
+            res = res + c
+        else:
+            b = code & 255
+            hi = (b >> 4) & 15
+            lo = b & 15
+            res = res + "\\" + hex_chars[hi] + hex_chars[lo]
+        i = i + 1
+    return res
+
+def format_llvm_float(s):
+    has_dot = False
+    has_exp = False
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == '.':
+            has_dot = True
+        elif c == 'e' or c == 'E':
+            has_exp = True
+        i = i + 1
+    if not has_dot and not has_exp:
+        return s + ".0"
+    if has_dot and not has_exp:
+        if s[len(s) - 1] == '.':
+            return s + "0"
+        if s[0] == '.':
+            return "0" + s
+        return s
+    if has_exp and not has_dot:
+        res = ""
+        i = 0
+        inserted = False
+        while i < len(s):
+            c = s[i]
+            if (c == 'e' or c == 'E') and not inserted:
+                res = res + ".0e"
+                inserted = True
+            else:
+                res = res + c
+            i = i + 1
+        return res
+    res = s
+    if res[0] == '.':
+        res = "0" + res
+    return res
+
 class CodeGen:
     def __init__(self):
-        self.header = ""
-        self.funcs = ""
-        self.main_body = ""
-        self.indent_level = 0
+        self.str_defs = []
+        self.str_map = {}
+        self.str_counter = 0
+        self.global_vars = []
+        self.raw_globals = []
+        self.funcs_list = []
+        self.cur_lines = []
+        self.main_lines = []
         self.local_vars = []
-        self.else_loop_stack = []
-        self.else_loop_counter = 0
+        self.local_allocas = []
+        self.main_allocas = []
+        self.sized_allocas = []
+        self.main_sized_allocas = []
+        self.typed_allocas = []
+        self.main_typed_allocas = []
+        self.loop_stack = []
+        self.try_depth = 0
         self.is_generator = False
         self.lambda_counter = 0
+        self.comp_counter = 0
+        self.reg_counter = 0
+        self.label_counter = 0
+        self.block_terminated = False
+        self.mod_prefix = ""
+        self.mod_local_globals = []
         self.processed_modules = []
+        self.direct_funcs = {}
+        self.local_direct_funcs = {}
+        self.raw_int_funcs = {}
+        self.range_loop_vars = {}
         self.input_dir = "."
         self.builtins_list = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "tuple", "set", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter"]
-        self.pending_native_vars = None  # (native_vars, native_int_vars) after a native for-loop
-        self._var_types = {}  # function-level inferred variable types
+        self.pending_native_vars = None
+        self._var_types = {}
         self._native_temp_counter = 0
 
-    def write_header(self, s):
-        self.header = self.header + s
+    def new_reg(self):
+        self.reg_counter = self.reg_counter + 1
+        return "%r" + str(self.reg_counter)
 
-    def write_func(self, s):
-        self.funcs = self.funcs + s
+    def new_label(self, prefix):
+        self.label_counter = self.label_counter + 1
+        return prefix + "_" + str(self.label_counter)
 
-    def write_main(self, s):
+    def add_global(self, g_name):
         i = 0
-        while i < self.indent_level:
-            self.main_body = self.main_body + "    "
+        while i < len(self.global_vars):
+            if self.global_vars[i] == g_name:
+                return
             i = i + 1
-        self.main_body = self.main_body + s + "\n"
+        self.global_vars.append(g_name)
 
-    def write_code(self, s, is_in_func):
+    def is_builtin_name(self, name):
+        i = 0
+        while i < len(self.builtins_list):
+            if self.builtins_list[i] == name:
+                return True
+            i = i + 1
+        return False
+
+    def is_mod_global(self, name):
+        if self.mod_prefix == "":
+            return False
+        i = 0
+        while i < len(self.mod_local_globals):
+            if self.mod_local_globals[i] == name:
+                return True
+            i = i + 1
+        return False
+
+    def is_local(self, v_name, is_in_func):
+        if not is_in_func:
+            return False
+        i = 0
+        while i < len(self.local_vars):
+            if self.local_vars[i] == v_name:
+                return True
+            i = i + 1
+        return False
+
+    def ensure_alloca(self, v_name, is_in_func):
         if is_in_func:
             i = 0
-            while i < self.indent_level:
-                self.funcs = self.funcs + "    "
+            while i < len(self.local_allocas):
+                if self.local_allocas[i] == v_name:
+                    return
                 i = i + 1
-            self.funcs = self.funcs + s + "\n"
+            self.local_allocas.append(v_name)
         else:
-            self.write_main(s)
+            i = 0
+            while i < len(self.main_allocas):
+                if self.main_allocas[i] == v_name:
+                    return
+                i = i + 1
+            self.main_allocas.append(v_name)
 
-    def _gen_range_bound(self, node):
+    def ensure_typed_alloca(self, a_name, llvm_ty, is_in_func):
+        if is_in_func:
+            i = 0
+            while i < len(self.typed_allocas):
+                if self.typed_allocas[i][0] == a_name:
+                    return
+                i = i + 1
+            self.typed_allocas.append([a_name, llvm_ty])
+        else:
+            i = 0
+            while i < len(self.main_typed_allocas):
+                if self.main_typed_allocas[i][0] == a_name:
+                    return
+                i = i + 1
+            self.main_typed_allocas.append([a_name, llvm_ty])
+
+    def ensure_sized_alloca(self, a_name, count, is_in_func):
+        if is_in_func:
+            self.sized_allocas.append([a_name, count])
+        else:
+            self.main_sized_allocas.append([a_name, count])
+
+    def get_var_ptr(self, v_name, is_in_func):
+        if self.is_local(v_name, is_in_func):
+            self.ensure_alloca(v_name, True)
+            return "%loc_" + v_name
+        if self.is_mod_global(v_name):
+            full_g = self.mod_prefix + v_name
+            self.add_global(full_g)
+            return "@t_" + full_g
+        if not self.is_builtin_name(v_name):
+            self.add_global(v_name)
+        return "@t_" + v_name
+
+    def emit_load_var(self, v_name, is_in_func):
+        ptr = self.get_var_ptr(v_name, is_in_func)
+        r = self.new_reg()
+        self.emit(r + " = load i64, i64* " + ptr, is_in_func)
+        return r
+
+    def emit_store_var(self, v_name, val_reg, is_in_func):
+        ptr = self.get_var_ptr(v_name, is_in_func)
+        self.emit("store i64 " + val_reg + ", i64* " + ptr, is_in_func)
+
+    def emit(self, line, is_in_func):
+        if self.block_terminated:
+            return
+        if is_in_func:
+            self.cur_lines.append("  " + line)
+        else:
+            self.main_lines.append("  " + line)
+
+    def emit_label(self, lbl, is_in_func):
+        if not self.block_terminated:
+            self.emit("br label %" + lbl, is_in_func)
+        if is_in_func:
+            self.cur_lines.append(lbl + ":")
+        else:
+            self.main_lines.append(lbl + ":")
+        self.block_terminated = False
+
+    def emit_br(self, lbl, is_in_func):
+        if not self.block_terminated:
+            self.emit("br label %" + lbl, is_in_func)
+            self.block_terminated = True
+
+    def emit_cond_br(self, cond_i1, true_lbl, false_lbl, is_in_func):
+        if not self.block_terminated:
+            self.emit("br i1 " + cond_i1 + ", label %" + true_lbl + ", label %" + false_lbl, is_in_func)
+            self.block_terminated = True
+
+    def emit_ret(self, val_i64, is_in_func):
+        if not self.block_terminated:
+            t_idx = 0
+            while t_idx < self.try_depth:
+                self.emit("call void @turbo_try_pop()", is_in_func)
+                t_idx = t_idx + 1
+            self.emit("ret i64 " + val_i64, is_in_func)
+            self.block_terminated = True
+
+    def get_str_ptr(self, s, is_in_func):
+        if s in self.str_map:
+            info = self.str_map[s]
+            sym = info[0]
+            slen = info[1]
+        else:
+            self.str_counter = self.str_counter + 1
+            sym = "@.str." + str(self.str_counter)
+            slen = len(s) + 1
+            escaped = escape_llvm_string(s)
+            defn = sym + ' = private unnamed_addr constant [' + str(slen) + ' x i8] c"' + escaped + '\\00", align 1'
+            self.str_defs.append(defn)
+            self.str_map[s] = [sym, slen]
+        r = self.new_reg()
+        self.emit(r + " = getelementptr inbounds [" + str(slen) + " x i8], [" + str(slen) + " x i8]* " + sym + ", i64 0, i64 0", is_in_func)
+        return r
+
+    def emit_truthy_i1(self, val_reg, is_in_func):
+        r_call = self.new_reg()
+        self.emit(r_call + " = call i32 @turbo_is_truthy(i64 " + val_reg + ")", is_in_func)
+        r_cmp = self.new_reg()
+        self.emit(r_cmp + " = icmp ne i32 " + r_call + ", 0", is_in_func)
+        return r_cmp
+
+    def emit_args_array(self, arg_regs, is_in_func):
+        argc = len(arg_regs)
+        if argc == 0:
+            return "null"
+        self.reg_counter = self.reg_counter + 1
+        arr_name = "argarr_" + str(self.reg_counter)
+        self.ensure_sized_alloca(arr_name, argc, is_in_func)
+        arr_ptr = "%loc_" + arr_name
+        i = 0
+        while i < argc:
+            elem_ptr = self.new_reg()
+            self.emit(elem_ptr + " = getelementptr inbounds [" + str(argc) + " x i64], [" + str(argc) + " x i64]* " + arr_ptr + ", i64 0, i64 " + str(i), is_in_func)
+            self.emit("store i64 " + arg_regs[i] + ", i64* " + elem_ptr, is_in_func)
+            i = i + 1
+        first_ptr = self.new_reg()
+        self.emit(first_ptr + " = getelementptr inbounds [" + str(argc) + " x i64], [" + str(argc) + " x i64]* " + arr_ptr + ", i64 0, i64 0", is_in_func)
+        return first_ptr
+
+    def emit_box_int(self, i64_val, is_in_func):
+        r_mask = self.new_reg()
+        self.emit(r_mask + " = and i64 " + i64_val + ", 281474976710655", is_in_func)
+        r_box = self.new_reg()
+        self.emit(r_box + " = or i64 " + r_mask + ", -2251799813685248", is_in_func)
+        return r_box
+
+    def emit_unbox_int(self, tv_val, is_in_func):
+        r_shl = self.new_reg()
+        self.emit(r_shl + " = shl i64 " + tv_val + ", 16", is_in_func)
+        r_ashr = self.new_reg()
+        self.emit(r_ashr + " = ashr i64 " + r_shl + ", 16", is_in_func)
+        return r_ashr
+
+    def emit_box_float(self, dbl_val, is_in_func):
+        r_bc = self.new_reg()
+        self.emit(r_bc + " = bitcast double " + dbl_val + " to i64", is_in_func)
+        return r_bc
+
+    def _gen_range_bound(self, node, is_in_func):
         if node.type == "CONST_INT":
-            return str(int(node.value)) + "LL"
+            return str(int(node.value))
         if node.type == "BINOP":
             op = node.value
-            if op in ("+", "-", "*", "/"):
-                left = self._gen_range_bound(node.children[0])
-                right = self._gen_range_bound(node.children[1])
-                if left and right:
-                    return "(" + left + " " + op + " " + right + ")"
-        if node.type == "NAME":
-            return "int_to_ll(t_" + node.value + ")"
-        return "int_to_ll(" + self.gen_expr(node) + ")"
+            if op in ("+", "-", "*"):
+                left = self._gen_range_bound(node.children[0], is_in_func)
+                right = self._gen_range_bound(node.children[1], is_in_func)
+                if left != None and right != None:
+                    r = self.new_reg()
+                    llvm_op = "add"
+                    if op == "-":
+                        llvm_op = "sub"
+                    elif op == "*":
+                        llvm_op = "mul"
+                    self.emit(r + " = " + llvm_op + " i64 " + left + ", " + right, is_in_func)
+                    return r
+        v = self.gen_expr(node, is_in_func)
+        return self.emit_unbox_int(v, is_in_func)
 
-    def _get_cached_int(self, val):
-        cache = {"0": "_cached_int_0", "1": "_cached_int_1", "2": "_cached_int_2", "3": "_cached_int_3"}
-        if val in cache:
-            return cache[val]
-        return None
-
-    def gen_expr(self, node):
+    def gen_expr(self, node, is_in_func):
         if node.type == "CONST_INT":
-            cached = self._get_cached_int(node.value)
-            if cached:
-                return cached
-            # Check for small ints that can use make_int_from_ll
             try:
                 ival = int(node.value)
-                if abs(ival) <= 1000000:
-                    return "make_int_from_ll(" + str(ival) + "LL)"
+                if ival >= -140737488355328 and ival <= 140737488355327:
+                    if ival >= 0:
+                        return str(-2251799813685248 + ival)
+                    else:
+                        return str(-2251799813685248 + (281474976710656 + ival))
             except:
                 pass
-            return 'make_int("' + node.value + '")'
+            sp = self.get_str_ptr(node.value, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @make_int(i8* " + sp + ")", is_in_func)
+            return r
         elif node.type == "CONST_FLOAT":
-            return "make_float(" + node.value + ")"
+            f_lit = format_llvm_float(node.value)
+            r = self.new_reg()
+            self.emit(r + " = bitcast double " + f_lit + " to i64", is_in_func)
+            return r
         elif node.type == "CONST_IMAG":
             imag_val = node.value
-            if imag_val[len(imag_val)-1] == 'j' or imag_val[len(imag_val)-1] == 'J':
-                imag_val = imag_val[0:len(imag_val)-1]
+            if imag_val[len(imag_val) - 1] == 'j' or imag_val[len(imag_val) - 1] == 'J':
+                imag_val = imag_val[0:len(imag_val) - 1]
             if imag_val == "":
-                imag_val = "1"
-            return "make_complex(0.0, " + imag_val + ")"
+                imag_val = "1.0"
+            else:
+                imag_val = format_llvm_float(imag_val)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @make_complex(double 0.0, double " + imag_val + ")", is_in_func)
+            return r
         elif node.type == "CONST_BYTES":
-            return 'make_bytes_from_str("' + escape_c_string(node.value) + '")'
+            sp = self.get_str_ptr(node.value, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @make_bytes_from_str(i8* " + sp + ")", is_in_func)
+            return r
         elif node.type == "CONST_STR":
             if node.value == "":
-                return "_cached_str_empty"
-            return 'make_str("' + escape_c_string(node.value) + '")'
+                r = self.new_reg()
+                self.emit(r + " = load i64, i64* @_cached_str_empty", is_in_func)
+                return r
+            sp = self.get_str_ptr(node.value, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @make_str(i8* " + sp + ")", is_in_func)
+            return r
         elif node.type == "CONST_NONE":
-            return "turbo_none"
+            return "-1688849860263936"
         elif node.type == "CONST_BOOL":
             if node.value == "True":
-                return "turbo_true"
+                return "-1688849860263933"
             else:
-                return "turbo_false"
+                return "-1688849860263934"
         elif node.type == "NAME":
-            return "t_" + node.value
+            return self.emit_load_var(node.value, is_in_func)
         elif node.type == "BINOP":
-            left = self.gen_expr(node.children[0])
-            right = self.gen_expr(node.children[1])
+            left = self.gen_expr(node.children[0], is_in_func)
+            right = self.gen_expr(node.children[1], is_in_func)
             op = node.value
+            fn = "@turbo_add"
             if op == '+':
-                return "turbo_add(" + left + ", " + right + ")"
+                fn = "@turbo_add"
             elif op == '-':
-                return "turbo_sub(" + left + ", " + right + ")"
+                fn = "@turbo_sub"
             elif op == '*':
-                return "turbo_mul(" + left + ", " + right + ")"
+                fn = "@turbo_mul"
             elif op == '/':
-                return "turbo_div(" + left + ", " + right + ")"
+                fn = "@turbo_div"
             elif op == '%':
-                return "turbo_mod(" + left + ", " + right + ")"
+                fn = "@turbo_mod"
             elif op == '**':
-                return "turbo_pow(" + left + ", " + right + ")"
+                fn = "@turbo_pow"
             elif op == '//':
-                return "turbo_floordiv(" + left + ", " + right + ")"
+                fn = "@turbo_floordiv"
             elif op == '&':
-                return "turbo_bitand(" + left + ", " + right + ")"
+                fn = "@turbo_bitand"
             elif op == '|':
-                return "turbo_bitor(" + left + ", " + right + ")"
+                fn = "@turbo_bitor"
             elif op == '^':
-                return "turbo_bitxor(" + left + ", " + right + ")"
+                fn = "@turbo_bitxor"
             elif op == '<<':
-                return "turbo_lshift(" + left + ", " + right + ")"
+                fn = "@turbo_lshift"
             elif op == '>>':
-                return "turbo_rshift(" + left + ", " + right + ")"
+                fn = "@turbo_rshift"
             elif op == '@':
-                return "turbo_matmul(" + left + ", " + right + ")"
+                fn = "@turbo_matmul"
+            r = self.new_reg()
+            self.emit(r + " = call i64 " + fn + "(i64 " + left + ", i64 " + right + ")", is_in_func)
+            return r
         elif node.type == "UNARY":
-            operand = self.gen_expr(node.children[0])
+            operand = self.gen_expr(node.children[0], is_in_func)
             op = node.value
             if op == '-':
-                return 'turbo_sub(make_int("0"), ' + operand + ")"
+                r = self.new_reg()
+                self.emit(r + " = call i64 @turbo_sub(i64 -2251799813685248, i64 " + operand + ")", is_in_func)
+                return r
             elif op == '+':
                 return operand
             elif op == '~':
-                return "turbo_bitnot(" + operand + ")"
+                r = self.new_reg()
+                self.emit(r + " = call i64 @turbo_bitnot(i64 " + operand + ")", is_in_func)
+                return r
         elif node.type == "COMP":
-            left = self.gen_expr(node.children[0])
-            right = self.gen_expr(node.children[1])
+            left = self.gen_expr(node.children[0], is_in_func)
+            right = self.gen_expr(node.children[1], is_in_func)
             op = node.value
+            if op == 'in':
+                r_in = self.new_reg()
+                self.emit(r_in + " = call i32 @turbo_in(i64 " + left + ", i64 " + right + ")", is_in_func)
+                r = self.new_reg()
+                self.emit(r + " = call i64 @make_bool(i32 " + r_in + ")", is_in_func)
+                return r
+            fn = "@turbo_eq"
             if op == '==':
-                return "turbo_eq(" + left + ", " + right + ")"
+                fn = "@turbo_eq"
             elif op == '!=':
-                return "turbo_ne(" + left + ", " + right + ")"
+                fn = "@turbo_ne"
             elif op == '<':
-                return "turbo_lt(" + left + ", " + right + ")"
+                fn = "@turbo_lt"
             elif op == '>':
-                return "turbo_gt(" + left + ", " + right + ")"
+                fn = "@turbo_gt"
             elif op == '<=':
-                return "turbo_lte(" + left + ", " + right + ")"
+                fn = "@turbo_lte"
             elif op == '>=':
-                return "turbo_gte(" + left + ", " + right + ")"
-            elif op == 'in':
-                return "make_bool(turbo_in(" + left + ", " + right + "))"
+                fn = "@turbo_gte"
+            r = self.new_reg()
+            self.emit(r + " = call i64 " + fn + "(i64 " + left + ", i64 " + right + ")", is_in_func)
+            return r
         elif node.type == "NOT":
-            operand = self.gen_expr(node.children[0])
-            return "turbo_not(" + operand + ")"
+            operand = self.gen_expr(node.children[0], is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @turbo_not(i64 " + operand + ")", is_in_func)
+            return r
         elif node.type == "AND":
-            left = self.gen_expr(node.children[0])
-            right = self.gen_expr(node.children[1])
-            return "({ TurboObject* _lh = " + left + "; turbo_is_truthy(_lh) ? " + right + " : _lh; })"
+            res_var = "_and_" + str(self.reg_counter + 1)
+            self.reg_counter = self.reg_counter + 1
+            self.ensure_alloca(res_var, is_in_func)
+            res_ptr = "%loc_" + res_var
+            lh = self.gen_expr(node.children[0], is_in_func)
+            self.emit("store i64 " + lh + ", i64* " + res_ptr, is_in_func)
+            c_i1 = self.emit_truthy_i1(lh, is_in_func)
+            lbl_rhs = self.new_label("and_rhs")
+            lbl_end = self.new_label("and_end")
+            self.emit_cond_br(c_i1, lbl_rhs, lbl_end, is_in_func)
+            self.emit_label(lbl_rhs, is_in_func)
+            rh = self.gen_expr(node.children[1], is_in_func)
+            self.emit("store i64 " + rh + ", i64* " + res_ptr, is_in_func)
+            self.emit_br(lbl_end, is_in_func)
+            self.emit_label(lbl_end, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = load i64, i64* " + res_ptr, is_in_func)
+            return r
         elif node.type == "OR":
-            left = self.gen_expr(node.children[0])
-            right = self.gen_expr(node.children[1])
-            return "({ TurboObject* _lh = " + left + "; turbo_is_truthy(_lh) ? _lh : " + right + "; })"
+            res_var = "_or_" + str(self.reg_counter + 1)
+            self.reg_counter = self.reg_counter + 1
+            self.ensure_alloca(res_var, is_in_func)
+            res_ptr = "%loc_" + res_var
+            lh = self.gen_expr(node.children[0], is_in_func)
+            self.emit("store i64 " + lh + ", i64* " + res_ptr, is_in_func)
+            c_i1 = self.emit_truthy_i1(lh, is_in_func)
+            lbl_rhs = self.new_label("or_rhs")
+            lbl_end = self.new_label("or_end")
+            self.emit_cond_br(c_i1, lbl_end, lbl_rhs, is_in_func)
+            self.emit_label(lbl_rhs, is_in_func)
+            rh = self.gen_expr(node.children[1], is_in_func)
+            self.emit("store i64 " + rh + ", i64* " + res_ptr, is_in_func)
+            self.emit_br(lbl_end, is_in_func)
+            self.emit_label(lbl_end, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = load i64, i64* " + res_ptr, is_in_func)
+            return r
         elif node.type == "CALL":
             func_node = node.children[0]
             args_list = node.children[1].children
             argc = len(args_list)
-            args_c = "NULL"
-            if argc > 0:
-                args_c = "(TurboObject*[]){"
-                a_idx = 0
-                while a_idx < argc:
-                    args_c = args_c + self.gen_expr(args_list[a_idx])
-                    if a_idx < argc - 1:
-                        args_c = args_c + ", "
-                    a_idx = a_idx + 1
-                args_c = args_c + "}"
-
+            if func_node.type == "NAME" and func_node.value == "sum" and argc == 1:
+                arg0 = args_list[0]
+                if arg0.type == "LISTCOMP" or arg0.type == "GENCOMP":
+                    return self._emit_fused_sum_comp(arg0, is_in_func)
+            arg_regs = []
+            a_idx = 0
+            while a_idx < argc:
+                arg_regs.append(self.gen_expr(args_list[a_idx], is_in_func))
+                a_idx = a_idx + 1
             if func_node.type == "ATTR":
-                obj_expr = self.gen_expr(func_node.children[0])
+                obj_reg = self.gen_expr(func_node.children[0], is_in_func)
                 method_name = func_node.value
-                return "turbo_call_method(" + obj_expr + ', "' + method_name + '", ' + str(argc) + ", " + args_c + ")"
-            else:
-                func_expr = self.gen_expr(func_node)
-                return "turbo_call(" + func_expr + ", " + str(argc) + ", " + args_c + ")"
+                m_ptr = self.get_str_ptr(method_name, is_in_func)
+                args_ptr = self.emit_args_array(arg_regs, is_in_func)
+                r = self.new_reg()
+                self.emit(r + " = call i64 @turbo_call_method(i64 " + obj_reg + ", i8* " + m_ptr + ", i32 " + str(argc) + ", i64* " + args_ptr + ")", is_in_func)
+                return r
+            elif func_node.type == "NAME":
+                fn_name = func_node.value
+                lookup_key = ""
+                if fn_name in self.local_direct_funcs:
+                    lookup_key = self.local_direct_funcs[fn_name]
+                elif (self.mod_prefix + fn_name) in self.direct_funcs and not self.is_local(fn_name, is_in_func):
+                    lookup_key = self.mod_prefix + fn_name
+                if lookup_key != "" and lookup_key in self.direct_funcs:
+                    df_info = self.direct_funcs[lookup_key]
+                    ssa_sym = df_info[0]
+                    expected_argc = df_info[1]
+                    call_args = []
+                    ca_i = 0
+                    while ca_i < expected_argc:
+                        if ca_i < argc:
+                            call_args.append("i64 " + arg_regs[ca_i])
+                        else:
+                            call_args.append("i64 -1688849860263936")
+                        ca_i = ca_i + 1
+                    r = self.new_reg()
+                    self.emit(r + " = call i64 @" + ssa_sym + "(" + ", ".join(call_args) + ")", is_in_func)
+                    return r
+            func_reg = self.gen_expr(func_node, is_in_func)
+            args_ptr = self.emit_args_array(arg_regs, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @turbo_call(i64 " + func_reg + ", i32 " + str(argc) + ", i64* " + args_ptr + ")", is_in_func)
+            return r
         elif node.type == "ATTR":
-            obj_expr = self.gen_expr(node.children[0])
-            attr_name = node.value
-            return "turbo_getattr(" + obj_expr + ', "' + attr_name + '")'
+            obj_reg = self.gen_expr(node.children[0], is_in_func)
+            attr_ptr = self.get_str_ptr(node.value, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @turbo_getattr(i64 " + obj_reg + ", i8* " + attr_ptr + ")", is_in_func)
+            return r
         elif node.type == "SUBSCRIPT":
-            obj_expr = self.gen_expr(node.children[0])
-            idx_expr = self.gen_expr(node.children[1])
-            return "turbo_getitem(" + obj_expr + ", " + idx_expr + ")"
+            idx_node = node.children[1]
+            if idx_node.type == "NAME" and idx_node.value in self.range_loop_vars:
+                obj_reg = self.gen_expr(node.children[0], is_in_func)
+                ri_loc = self.range_loop_vars[idx_node.value]
+                r_idx = self.new_reg()
+                self.emit(r_idx + " = load i64, i64* %loc_" + ri_loc, is_in_func)
+                return self._emit_fast_list_getitem(obj_reg, r_idx, is_in_func)
+            obj_reg = self.gen_expr(node.children[0], is_in_func)
+            idx_reg = self.gen_expr(idx_node, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @turbo_getitem(i64 " + obj_reg + ", i64 " + idx_reg + ")", is_in_func)
+            return r
         elif node.type == "SLICE":
-            obj_expr = self.gen_expr(node.children[0])
-            start_expr = self.gen_expr(node.children[1])
-            end_expr = self.gen_expr(node.children[2])
-            return "turbo_slice(" + obj_expr + ", " + start_expr + ", " + end_expr + ")"
+            obj_reg = self.gen_expr(node.children[0], is_in_func)
+            start_reg = self.gen_expr(node.children[1], is_in_func)
+            end_reg = self.gen_expr(node.children[2], is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @turbo_slice(i64 " + obj_reg + ", i64 " + start_reg + ", i64 " + end_reg + ")", is_in_func)
+            return r
         elif node.type == "LIST":
-            argc = len(node.children)
-            if argc == 0:
-                return "make_list()"
-            c_code = "({ TurboObject* _lst = make_list(); "
+            r_lst = self.new_reg()
+            self.emit(r_lst + " = call i64 @make_list()", is_in_func)
             a_idx = 0
-            while a_idx < argc:
-                c_code = c_code + "turbo_list_append(_lst, " + self.gen_expr(node.children[a_idx]) + "); "
+            while a_idx < len(node.children):
+                elem_reg = self.gen_expr(node.children[a_idx], is_in_func)
+                self.emit("call void @turbo_list_append(i64 " + r_lst + ", i64 " + elem_reg + ")", is_in_func)
                 a_idx = a_idx + 1
-            c_code = c_code + " _lst; })"
-            return c_code
+            return r_lst
         elif node.type == "TUPLE":
-            argc = len(node.children)
-            if argc == 0:
-                return "make_tuple()"
-            c_code = "({ TurboObject* _tup = make_tuple(); "
+            r_tup = self.new_reg()
+            self.emit(r_tup + " = call i64 @make_tuple()", is_in_func)
             a_idx = 0
-            while a_idx < argc:
-                c_code = c_code + "turbo_tuple_append(_tup, " + self.gen_expr(node.children[a_idx]) + "); "
+            while a_idx < len(node.children):
+                elem_reg = self.gen_expr(node.children[a_idx], is_in_func)
+                self.emit("call void @turbo_tuple_append(i64 " + r_tup + ", i64 " + elem_reg + ")", is_in_func)
                 a_idx = a_idx + 1
-            c_code = c_code + " _tup; })"
-            return c_code
+            return r_tup
         elif node.type == "SET":
-            argc = len(node.children)
-            if argc == 0:
-                return "make_set()"
-            c_code = "({ TurboObject* _set = make_set(); "
+            r_set = self.new_reg()
+            self.emit(r_set + " = call i64 @make_set()", is_in_func)
             a_idx = 0
-            while a_idx < argc:
-                c_code = c_code + "turbo_set_add(_set, " + self.gen_expr(node.children[a_idx]) + "); "
+            while a_idx < len(node.children):
+                elem_reg = self.gen_expr(node.children[a_idx], is_in_func)
+                self.emit("call void @turbo_set_add(i64 " + r_set + ", i64 " + elem_reg + ")", is_in_func)
                 a_idx = a_idx + 1
-            c_code = c_code + " _set; })"
-            return c_code
-        elif node.type == "SETCOMP":
-            elem_c = self.gen_expr(node.children[0])
-            gen = node.children[1]
-            c_code = "({ TurboObject* _sc = make_set(); "
-            c_code = c_code + self._gen_comp_loops(gen, "_sc", "turbo_set_add(_sc, " + elem_c + ")")
-            c_code = c_code + " _sc; })"
-            return c_code
-        elif node.type == "LISTCOMP":
-            elem_c = self.gen_expr(node.children[0])
-            gen = node.children[1]
-            c_code = "({ TurboObject* _lc = make_list(); "
-            c_code = c_code + self._gen_comp_loops(gen, "_lc", "turbo_list_append(_lc, " + elem_c + ")")
-            c_code = c_code + " _lc; })"
-            return c_code
-        elif node.type == "DICTCOMP":
-            key_c = self.gen_expr(node.children[0])
-            val_c = self.gen_expr(node.children[1])
-            gen = node.children[2]
-            c_code = "({ TurboObject* _dc = make_dict(); "
-            c_code = c_code + self._gen_comp_loops(gen, "_dc", "turbo_setitem(_dc, " + key_c + ", " + val_c + ")")
-            c_code = c_code + " _dc; })"
-            return c_code
-        elif node.type == "GENCOMP":
-            elem_c = self.gen_expr(node.children[0])
-            gen = node.children[1]
-            c_code = "({ TurboObject* _gc = make_list(); "
-            c_code = c_code + self._gen_comp_loops(gen, "_gc", "turbo_list_append(_gc, " + elem_c + ")")
-            c_code = c_code + " _gc; })"
-            return c_code
+            return r_set
         elif node.type == "DICT":
             keys = node.children[0].children
             values = node.children[1].children
-            argc = len(keys)
-            if argc == 0:
-                return "make_dict()"
-            c_code = "({ TurboObject* _d = make_dict(); "
+            r_dict = self.new_reg()
+            self.emit(r_dict + " = call i64 @make_dict()", is_in_func)
             a_idx = 0
-            while a_idx < argc:
-                c_code = c_code + "turbo_setitem(_d, " + self.gen_expr(keys[a_idx]) + ", " + self.gen_expr(values[a_idx]) + "); "
+            while a_idx < len(keys):
+                k_reg = self.gen_expr(keys[a_idx], is_in_func)
+                v_reg = self.gen_expr(values[a_idx], is_in_func)
+                self.emit("call void @turbo_setitem(i64 " + r_dict + ", i64 " + k_reg + ", i64 " + v_reg + ")", is_in_func)
                 a_idx = a_idx + 1
-            c_code = c_code + " _d; })"
-            return c_code
+            return r_dict
+        elif node.type == "LISTCOMP" or node.type == "GENCOMP":
+            r_lc = self.new_reg()
+            self.emit(r_lc + " = call i64 @make_list()", is_in_func)
+            self._gen_comp_loops(node.children[1], r_lc, "LIST", node.children[0], None, is_in_func)
+            return r_lc
+        elif node.type == "SETCOMP":
+            r_sc = self.new_reg()
+            self.emit(r_sc + " = call i64 @make_set()", is_in_func)
+            self._gen_comp_loops(node.children[1], r_sc, "SET", node.children[0], None, is_in_func)
+            return r_sc
+        elif node.type == "DICTCOMP":
+            r_dc = self.new_reg()
+            self.emit(r_dc + " = call i64 @make_dict()", is_in_func)
+            self._gen_comp_loops(node.children[2], r_dc, "DICT", node.children[0], node.children[1], is_in_func)
+            return r_dc
         elif node.type == "TERNARY":
-            cond = self.gen_expr(node.children[0])
-            true_val = self.gen_expr(node.children[1])
-            false_val = self.gen_expr(node.children[2])
-            return "turbo_is_truthy(" + cond + ") ? " + true_val + " : " + false_val
+            res_var = "_tern_" + str(self.reg_counter + 1)
+            self.reg_counter = self.reg_counter + 1
+            self.ensure_alloca(res_var, is_in_func)
+            res_ptr = "%loc_" + res_var
+            cond_reg = self.gen_expr(node.children[0], is_in_func)
+            c_i1 = self.emit_truthy_i1(cond_reg, is_in_func)
+            lbl_true = self.new_label("tern_true")
+            lbl_false = self.new_label("tern_false")
+            lbl_end = self.new_label("tern_end")
+            self.emit_cond_br(c_i1, lbl_true, lbl_false, is_in_func)
+            self.emit_label(lbl_true, is_in_func)
+            tv = self.gen_expr(node.children[1], is_in_func)
+            self.emit("store i64 " + tv + ", i64* " + res_ptr, is_in_func)
+            self.emit_br(lbl_end, is_in_func)
+            self.emit_label(lbl_false, is_in_func)
+            fv = self.gen_expr(node.children[2], is_in_func)
+            self.emit("store i64 " + fv + ", i64* " + res_ptr, is_in_func)
+            self.emit_br(lbl_end, is_in_func)
+            self.emit_label(lbl_end, is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = load i64, i64* " + res_ptr, is_in_func)
+            return r
         elif node.type == "ASSIGN":
             target = node.children[0]
-            val_expr = self.gen_expr(node.children[1])
+            val_reg = self.gen_expr(node.children[1], is_in_func)
             if target.type == "NAME":
-                return "({ TurboObject* _w = " + val_expr + "; t_" + target.value + " = _w; _w; })"
-            return val_expr
+                self.emit_store_var(target.value, val_reg, is_in_func)
+            return val_reg
         elif node.type == "LAMBDA":
             lambda_num = self.lambda_counter
             self.lambda_counter = self.lambda_counter + 1
@@ -1865,79 +2218,854 @@ class CodeGen:
             params_node = node.children[0]
             body_node = node.children[1]
 
-            old_locals = self.local_vars
+            saved_cur_lines = self.cur_lines
+            saved_locals = self.local_vars
+            saved_allocas = self.local_allocas
+            saved_sized = self.sized_allocas
+            saved_typed = self.typed_allocas
+            saved_term = self.block_terminated
+            saved_try = self.try_depth
+
+            self.cur_lines = []
             self.local_vars = []
-            p_idx = 0
-            while p_idx < len(params_node.children):
-                self.local_vars.append(params_node.children[p_idx].value)
-                p_idx = p_idx + 1
-            collect_locals(body_node, self.local_vars)
-
-            self.write_header("TurboObject* " + impl_name + "(int argc, TurboObject** args);\n")
-
-            self.funcs = self.funcs + "TurboObject* " + impl_name + "(int argc, TurboObject** args) {\n"
+            self.local_allocas = []
+            self.sized_allocas = []
+            self.typed_allocas = []
+            self.block_terminated = False
+            self.try_depth = 0
 
             p_idx = 0
             while p_idx < len(params_node.children):
                 p_name = params_node.children[p_idx].value
-                self.funcs = self.funcs + "    TurboObject* t_" + p_name + " = (argc > " + str(p_idx) + ") ? args[" + str(p_idx) + "] : turbo_none;\n"
+                self.local_vars.append(p_name)
+                self.ensure_alloca(p_name, True)
                 p_idx = p_idx + 1
-
+            collect_locals(body_node, self.local_vars)
             l_idx = 0
             while l_idx < len(self.local_vars):
-                l_name = self.local_vars[l_idx]
-                is_param = False
-                p_idx = 0
-                while p_idx < len(params_node.children):
-                    if params_node.children[p_idx].value == l_name:
-                        is_param = True
-                        break
-                    p_idx = p_idx + 1
-                if not is_param:
-                    self.funcs = self.funcs + "    TurboObject* t_" + l_name + " = turbo_none;\n"
+                self.ensure_alloca(self.local_vars[l_idx], True)
                 l_idx = l_idx + 1
 
-            body_code = self.gen_expr(body_node)
-            self.funcs = self.funcs + "    return " + body_code + ";\n"
-            self.funcs = self.funcs + "}\n\n"
+            p_idx = 0
+            while p_idx < len(params_node.children):
+                p_name = params_node.children[p_idx].value
+                c_arg = self.new_reg()
+                self.emit(c_arg + " = icmp sgt i32 %argc, " + str(p_idx), True)
+                lbl_has = self.new_label("lam_arg_has")
+                lbl_done = self.new_label("lam_arg_done")
+                self.emit_cond_br(c_arg, lbl_has, lbl_done, True)
+                self.emit_label(lbl_has, True)
+                arg_ptr = self.new_reg()
+                self.emit(arg_ptr + " = getelementptr inbounds i64, i64* %args, i64 " + str(p_idx), True)
+                arg_val = self.new_reg()
+                self.emit(arg_val + " = load i64, i64* " + arg_ptr, True)
+                self.emit("store i64 " + arg_val + ", i64* %loc_" + p_name, True)
+                self.emit_br(lbl_done, True)
+                self.emit_label(lbl_done, True)
+                p_idx = p_idx + 1
 
-            self.local_vars = old_locals
+            body_reg = self.gen_expr(body_node, True)
+            self.emit_ret(body_reg, True)
 
-            return "make_func(" + impl_name + ', "<lambda>")'
+            fn_lines = ["define i64 @" + impl_name + "(i32 %argc, i64* %args) {", "entry:"]
+            a_i = 0
+            while a_i < len(self.local_allocas):
+                aname = self.local_allocas[a_i]
+                fn_lines.append("  %loc_" + aname + " = alloca i64")
+                fn_lines.append("  store i64 -1688849860263936, i64* %loc_" + aname)
+                a_i = a_i + 1
+            a_i = 0
+            while a_i < len(self.typed_allocas):
+                tinfo = self.typed_allocas[a_i]
+                fn_lines.append("  %loc_" + tinfo[0] + " = alloca " + tinfo[1])
+                a_i = a_i + 1
+            a_i = 0
+            while a_i < len(self.sized_allocas):
+                sinfo = self.sized_allocas[a_i]
+                fn_lines.append("  %loc_" + sinfo[0] + " = alloca [" + str(sinfo[1]) + " x i64]")
+                a_i = a_i + 1
+            c_i = 0
+            while c_i < len(self.cur_lines):
+                fn_lines.append(self.cur_lines[c_i])
+                c_i = c_i + 1
+            fn_lines.append("}")
+            self.funcs_list.append("\n".join(fn_lines))
+
+            self.cur_lines = saved_cur_lines
+            self.local_vars = saved_locals
+            self.local_allocas = saved_allocas
+            self.sized_allocas = saved_sized
+            self.typed_allocas = saved_typed
+            self.block_terminated = saved_term
+            self.try_depth = saved_try
+
+            sp = self.get_str_ptr("<lambda>", is_in_func)
+            r = self.new_reg()
+            self.emit(r + " = call i64 @make_func(i64 (i32, i64*)* @" + impl_name + ", i8* " + sp + ")", is_in_func)
+            return r
         elif node.type == "YIELD":
-            val_c = self.gen_expr(node.children[0])
-            return "({ TurboObject* __yv = " + val_c + "; turbo_list_append(__yield_values, __yv); turbo_none; })"
+            val_reg = self.gen_expr(node.children[0], is_in_func)
+            yv = self.new_reg()
+            self.emit(yv + " = load i64, i64* %loc___yield_values", is_in_func)
+            self.emit("call void @turbo_list_append(i64 " + yv + ", i64 " + val_reg + ")", is_in_func)
+            return "-1688849860263936"
         elif node.type == "YIELD_FROM":
-            iter_c = self.gen_expr(node.children[0])
-            return "({ TurboObject* __sub = " + iter_c + "; if (__sub->type == TYPE_LIST) { for (int __i = 0; __i < __sub->list_val.length; __i++) { turbo_list_append(__yield_values, __sub->list_val.items[__i]); } } else if (__sub->type == TYPE_TUPLE) { for (int __i = 0; __i < __sub->tuple_val.length; __i++) { turbo_list_append(__yield_values, __sub->tuple_val.items[__i]); } } else if (__sub->type == TYPE_STR) { for (int __i = 0; __i < __sub->str_val.length; __i++) { char __tmp[2] = {__sub->str_val.chars[__i], '\\0'}; turbo_list_append(__yield_values, make_str(__tmp)); } } turbo_none; })"
+            sub_reg = self.gen_expr(node.children[0], is_in_func)
+            yv = self.new_reg()
+            self.emit(yv + " = load i64, i64* %loc___yield_values", is_in_func)
+            self._emit_iter_loop(sub_reg, "_yf_item", None, is_in_func, yv)
+            return "-1688849860263936"
         elif node.type == "AWAIT":
-            return self.gen_expr(node.children[0])
+            return self.gen_expr(node.children[0], is_in_func)
         else:
             print("CodeGen error: unknown expression " + node.type)
-            return "turbo_none"
+            return "-1688849860263936"
+
+    def _emit_iter_loop(self, iter_reg, target_var_or_names, body_callback, is_in_func, yield_list_reg):
+        # Iterate over a sequence in LLVM IR using direct %List / %String struct GEP access for lists/tuples!
+        # Coerce iter_reg to a list/tuple or string; let's check tag via GEP or call @turbo_list(iter_reg) if not list/tuple!
+        # Wait: calling @turbo_list(iter_reg) converts ANY iterable (list, tuple, str, dict, set) into a %List, or if it's already a %List/%Tuple we can GEP directly!
+        # Even better: if we check if it's a pointer with tag 2 (%List) or 4 (%Tuple), we GEP %List directly; otherwise call @turbo_list to get a %List and GEP it!
+        # Let's check: @turbo_list(i64 %v) returns a %List for list, tuple, str, set, dict!
+        # Wait: if %v is already a %List (tag == 2) or %Tuple (tag == 4), we don't even need to copy it!
+        lbl_is_seq = self.new_label("iter_seq")
+        lbl_to_list = self.new_label("iter_conv")
+        lbl_loop_init = self.new_label("iter_init")
+        lbl_cond = self.new_label("iter_cond")
+        lbl_body = self.new_label("iter_body")
+        lbl_inc = self.new_label("iter_inc")
+        lbl_end = self.new_label("iter_end")
+
+        self.reg_counter = self.reg_counter + 1
+        uid = str(self.reg_counter)
+        seq_var = "_iter_seq_" + uid
+        idx_var = "_iter_idx_" + uid
+        len_var = "_iter_len_" + uid
+        self.ensure_alloca(seq_var, is_in_func)
+        self.ensure_alloca(idx_var, is_in_func)
+        self.ensure_alloca(len_var, is_in_func)
+
+        self.emit("store i64 " + iter_reg + ", i64* %loc_" + seq_var, is_in_func)
+        # Check if pointer tag (0xFFFF000000000000 == 0xFFF9000000000000 -> -1970324836974592)
+        r_tmask = self.new_reg()
+        self.emit(r_tmask + " = and i64 " + iter_reg + ", -281474976710656", is_in_func)
+        r_isptr = self.new_reg()
+        self.emit(r_isptr + " = icmp eq i64 " + r_tmask + ", -1970324836974592", is_in_func)
+        self.emit_cond_br(r_isptr, lbl_is_seq, lbl_to_list, is_in_func)
+
+        self.emit_label(lbl_is_seq, is_in_func)
+        r_raw = self.new_reg()
+        self.emit(r_raw + " = and i64 " + iter_reg + ", 281474976710655", is_in_func)
+        r_tagp = self.new_reg()
+        self.emit(r_tagp + " = inttoptr i64 " + r_raw + " to i32*", is_in_func)
+        r_tag = self.new_reg()
+        self.emit(r_tag + " = load i32, i32* " + r_tagp, is_in_func)
+        r_is_lst = self.new_reg()
+        self.emit(r_is_lst + " = icmp eq i32 " + r_tag + ", 2", is_in_func)
+        r_is_tup = self.new_reg()
+        self.emit(r_is_tup + " = icmp eq i32 " + r_tag + ", 4", is_in_func)
+        r_fast = self.new_reg()
+        self.emit(r_fast + " = or i1 " + r_is_lst + ", " + r_is_tup, is_in_func)
+        self.emit_cond_br(r_fast, lbl_loop_init, lbl_to_list, is_in_func)
+
+        self.emit_label(lbl_to_list, is_in_func)
+        p_arg = self.emit_args_array([iter_reg], is_in_func)
+        r_conv = self.new_reg()
+        self.emit(r_conv + " = call i64 @turbo_list(i32 1, i64* " + p_arg + ")", is_in_func)
+        self.emit("store i64 " + r_conv + ", i64* %loc_" + seq_var, is_in_func)
+        self.emit_br(lbl_loop_init, is_in_func)
+
+        self.emit_label(lbl_loop_init, is_in_func)
+        r_seq = self.new_reg()
+        self.emit(r_seq + " = load i64, i64* %loc_" + seq_var, is_in_func)
+        r_sraw = self.new_reg()
+        self.emit(r_sraw + " = and i64 " + r_seq + ", 281474976710655", is_in_func)
+        r_lptr = self.new_reg()
+        self.emit(r_lptr + " = inttoptr i64 " + r_sraw + " to %List*", is_in_func)
+        r_lenp = self.new_reg()
+        self.emit(r_lenp + " = getelementptr inbounds %List, %List* " + r_lptr + ", i32 0, i32 1", is_in_func)
+        r_len32 = self.new_reg()
+        self.emit(r_len32 + " = load i32, i32* " + r_lenp, is_in_func)
+        r_len64 = self.new_reg()
+        self.emit(r_len64 + " = sext i32 " + r_len32 + " to i64", is_in_func)
+        self.emit("store i64 " + r_len64 + ", i64* %loc_" + len_var, is_in_func)
+        self.emit("store i64 0, i64* %loc_" + idx_var, is_in_func)
+        self.emit_br(lbl_cond, is_in_func)
+
+        self.emit_label(lbl_cond, is_in_func)
+        r_cur_i = self.new_reg()
+        self.emit(r_cur_i + " = load i64, i64* %loc_" + idx_var, is_in_func)
+        # Re-read length in case list mutated or use stored length
+        r_cur_seq = self.new_reg()
+        self.emit(r_cur_seq + " = load i64, i64* %loc_" + seq_var, is_in_func)
+        r_cur_raw = self.new_reg()
+        self.emit(r_cur_raw + " = and i64 " + r_cur_seq + ", 281474976710655", is_in_func)
+        r_cur_lptr = self.new_reg()
+        self.emit(r_cur_lptr + " = inttoptr i64 " + r_cur_raw + " to %List*", is_in_func)
+        r_cur_lenp = self.new_reg()
+        self.emit(r_cur_lenp + " = getelementptr inbounds %List, %List* " + r_cur_lptr + ", i32 0, i32 1", is_in_func)
+        r_cur_len32 = self.new_reg()
+        self.emit(r_cur_len32 + " = load i32, i32* " + r_cur_lenp, is_in_func)
+        r_cur_len64 = self.new_reg()
+        self.emit(r_cur_len64 + " = sext i32 " + r_cur_len32 + " to i64", is_in_func)
+        r_cmp = self.new_reg()
+        self.emit(r_cmp + " = icmp slt i64 " + r_cur_i + ", " + r_cur_len64, is_in_func)
+        self.emit_cond_br(r_cmp, lbl_body, lbl_end, is_in_func)
+
+        self.emit_label(lbl_body, is_in_func)
+        # Load items[i] via GEP on %List
+        r_itemsp = self.new_reg()
+        self.emit(r_itemsp + " = getelementptr inbounds %List, %List* " + r_cur_lptr + ", i32 0, i32 4", is_in_func)
+        r_items = self.new_reg()
+        self.emit(r_items + " = load i64*, i64** " + r_itemsp, is_in_func)
+        r_elemp = self.new_reg()
+        self.emit(r_elemp + " = getelementptr inbounds i64, i64* " + r_items + ", i64 " + r_cur_i, is_in_func)
+        r_elem = self.new_reg()
+        self.emit(r_elem + " = load i64, i64* " + r_elemp, is_in_func)
+
+        if yield_list_reg != None:
+            self.emit("call void @turbo_list_append(i64 " + yield_list_reg + ", i64 " + r_elem + ")", is_in_func)
+        else:
+            body_callback(r_elem, lbl_inc, lbl_end)
+
+        self.emit_label(lbl_inc, is_in_func)
+        r_i2 = self.new_reg()
+        self.emit(r_i2 + " = load i64, i64* %loc_" + idx_var, is_in_func)
+        r_inext = self.new_reg()
+        self.emit(r_inext + " = add i64 " + r_i2 + ", 1", is_in_func)
+        self.emit("store i64 " + r_inext + ", i64* %loc_" + idx_var, is_in_func)
+        self.emit_br(lbl_cond, is_in_func)
+
+        self.emit_label(lbl_end, is_in_func)
+
+    def _emit_iter_header(self, iter_reg, is_in_func):
+        lbl_is_seq = self.new_label("iter_seq")
+        lbl_to_list = self.new_label("iter_conv")
+        lbl_loop_init = self.new_label("iter_init")
+        lbl_cond = self.new_label("iter_cond")
+        lbl_body = self.new_label("iter_body")
+        lbl_inc = self.new_label("iter_inc")
+        lbl_end = self.new_label("iter_end")
+
+        self.reg_counter = self.reg_counter + 1
+        uid = str(self.reg_counter)
+        seq_var = "_iter_seq_" + uid
+        idx_var = "_iter_idx_" + uid
+        self.ensure_alloca(seq_var, is_in_func)
+        self.ensure_alloca(idx_var, is_in_func)
+
+        self.emit("store i64 " + iter_reg + ", i64* %loc_" + seq_var, is_in_func)
+        r_tmask = self.new_reg()
+        self.emit(r_tmask + " = and i64 " + iter_reg + ", -281474976710656", is_in_func)
+        r_isptr = self.new_reg()
+        self.emit(r_isptr + " = icmp eq i64 " + r_tmask + ", -1970324836974592", is_in_func)
+        self.emit_cond_br(r_isptr, lbl_is_seq, lbl_to_list, is_in_func)
+
+        self.emit_label(lbl_is_seq, is_in_func)
+        r_raw = self.new_reg()
+        self.emit(r_raw + " = and i64 " + iter_reg + ", 281474976710655", is_in_func)
+        r_tagp = self.new_reg()
+        self.emit(r_tagp + " = inttoptr i64 " + r_raw + " to i32*", is_in_func)
+        r_tag = self.new_reg()
+        self.emit(r_tag + " = load i32, i32* " + r_tagp, is_in_func)
+        r_is_lst = self.new_reg()
+        self.emit(r_is_lst + " = icmp eq i32 " + r_tag + ", 2", is_in_func)
+        r_is_tup = self.new_reg()
+        self.emit(r_is_tup + " = icmp eq i32 " + r_tag + ", 4", is_in_func)
+        r_fast = self.new_reg()
+        self.emit(r_fast + " = or i1 " + r_is_lst + ", " + r_is_tup, is_in_func)
+        self.emit_cond_br(r_fast, lbl_loop_init, lbl_to_list, is_in_func)
+
+        self.emit_label(lbl_to_list, is_in_func)
+        p_arg = self.emit_args_array([iter_reg], is_in_func)
+        r_conv = self.new_reg()
+        self.emit(r_conv + " = call i64 @turbo_list(i32 1, i64* " + p_arg + ")", is_in_func)
+        self.emit("store i64 " + r_conv + ", i64* %loc_" + seq_var, is_in_func)
+        self.emit_br(lbl_loop_init, is_in_func)
+
+        self.emit_label(lbl_loop_init, is_in_func)
+        self.emit("store i64 0, i64* %loc_" + idx_var, is_in_func)
+        self.emit_br(lbl_cond, is_in_func)
+
+        self.emit_label(lbl_cond, is_in_func)
+        r_cur_i = self.new_reg()
+        self.emit(r_cur_i + " = load i64, i64* %loc_" + idx_var, is_in_func)
+        r_cur_seq = self.new_reg()
+        self.emit(r_cur_seq + " = load i64, i64* %loc_" + seq_var, is_in_func)
+        r_cur_raw = self.new_reg()
+        self.emit(r_cur_raw + " = and i64 " + r_cur_seq + ", 281474976710655", is_in_func)
+        r_cur_lptr = self.new_reg()
+        self.emit(r_cur_lptr + " = inttoptr i64 " + r_cur_raw + " to %List*", is_in_func)
+        r_cur_lenp = self.new_reg()
+        self.emit(r_cur_lenp + " = getelementptr inbounds %List, %List* " + r_cur_lptr + ", i32 0, i32 1", is_in_func)
+        r_cur_len32 = self.new_reg()
+        self.emit(r_cur_len32 + " = load i32, i32* " + r_cur_lenp, is_in_func)
+        r_cur_len64 = self.new_reg()
+        self.emit(r_cur_len64 + " = sext i32 " + r_cur_len32 + " to i64", is_in_func)
+        r_cmp = self.new_reg()
+        self.emit(r_cmp + " = icmp slt i64 " + r_cur_i + ", " + r_cur_len64, is_in_func)
+        self.emit_cond_br(r_cmp, lbl_body, lbl_end, is_in_func)
+
+        self.emit_label(lbl_body, is_in_func)
+        r_itemsp = self.new_reg()
+        self.emit(r_itemsp + " = getelementptr inbounds %List, %List* " + r_cur_lptr + ", i32 0, i32 4", is_in_func)
+        r_items = self.new_reg()
+        self.emit(r_items + " = load i64*, i64** " + r_itemsp, is_in_func)
+        r_elemp = self.new_reg()
+        self.emit(r_elemp + " = getelementptr inbounds i64, i64* " + r_items + ", i64 " + r_cur_i, is_in_func)
+        r_elem = self.new_reg()
+        self.emit(r_elem + " = load i64, i64* " + r_elemp, is_in_func)
+        return [r_elem, idx_var, lbl_cond, lbl_inc, lbl_end]
+
+    def _emit_iter_footer(self, iter_state, is_in_func):
+        idx_var = iter_state[1]
+        lbl_cond = iter_state[2]
+        lbl_inc = iter_state[3]
+        lbl_end = iter_state[4]
+        self.emit_label(lbl_inc, is_in_func)
+        r_i2 = self.new_reg()
+        self.emit(r_i2 + " = load i64, i64* %loc_" + idx_var, is_in_func)
+        r_inext = self.new_reg()
+        self.emit(r_inext + " = add i64 " + r_i2 + ", 1", is_in_func)
+        self.emit("store i64 " + r_inext + ", i64* %loc_" + idx_var, is_in_func)
+        self.emit_br(lbl_cond, is_in_func)
+        self.emit_label(lbl_end, is_in_func)
+
+    def _emit_fast_list_getitem(self, obj_reg, idx_i64_reg, is_in_func):
+        r_raw = self.new_reg()
+        self.emit(r_raw + " = and i64 " + obj_reg + ", 281474976710655", is_in_func)
+        r_lptr = self.new_reg()
+        self.emit(r_lptr + " = inttoptr i64 " + r_raw + " to %List*", is_in_func)
+        r_itemsp = self.new_reg()
+        self.emit(r_itemsp + " = getelementptr inbounds %List, %List* " + r_lptr + ", i32 0, i32 4", is_in_func)
+        r_items = self.new_reg()
+        self.emit(r_items + " = load i64*, i64** " + r_itemsp, is_in_func)
+        r_elemp = self.new_reg()
+        self.emit(r_elemp + " = getelementptr inbounds i64, i64* " + r_items + ", i64 " + idx_i64_reg, is_in_func)
+        r_elem = self.new_reg()
+        self.emit(r_elem + " = load i64, i64* " + r_elemp, is_in_func)
+        return r_elem
+
+    def _emit_fast_list_setitem(self, obj_reg, idx_i64_reg, val_reg, is_in_func):
+        r_raw = self.new_reg()
+        self.emit(r_raw + " = and i64 " + obj_reg + ", 281474976710655", is_in_func)
+        r_lptr = self.new_reg()
+        self.emit(r_lptr + " = inttoptr i64 " + r_raw + " to %List*", is_in_func)
+        r_itemsp = self.new_reg()
+        self.emit(r_itemsp + " = getelementptr inbounds %List, %List* " + r_lptr + ", i32 0, i32 4", is_in_func)
+        r_items = self.new_reg()
+        self.emit(r_items + " = load i64*, i64** " + r_itemsp, is_in_func)
+        r_elemp = self.new_reg()
+        self.emit(r_elemp + " = getelementptr inbounds i64, i64* " + r_items + ", i64 " + idx_i64_reg, is_in_func)
+        self.emit("store i64 " + val_reg + ", i64* " + r_elemp, is_in_func)
+
+    def _emit_fused_sum_comp(self, comp_node, is_in_func):
+        elem_node = comp_node.children[0]
+        gen_node = comp_node.children[1]
+        # Fast path: single range(...) generator with no filter
+        if (gen_node.type == "GENERATOR" or gen_node.type == "COMP_FOR") and gen_node.children[1].type == "CONST_NONE" and gen_node.children[2].type == "CONST_NONE":
+            iter_node = gen_node.children[0]
+            targets = gen_node.value.split(',')
+            if len(targets) == 1 and iter_node.type == "CALL" and iter_node.children[0].type == "NAME" and iter_node.children[0].value == "range":
+                rargs = iter_node.children[1].children
+                if len(rargs) >= 1 and len(rargs) <= 2:
+                    k_var = targets[0]
+                    if is_in_func:
+                        if not self.is_local(k_var, True):
+                            self.local_vars.append(k_var)
+                        self.ensure_alloca(k_var, True)
+                    else:
+                        self.add_global(k_var)
+                    r_start = "0"
+                    r_stop = ""
+                    if len(rargs) == 1:
+                        r_stop = self._gen_range_bound(rargs[0], is_in_func)
+                    else:
+                        r_start = self._gen_range_bound(rargs[0], is_in_func)
+                        r_stop = self._gen_range_bound(rargs[1], is_in_func)
+                    self.reg_counter = self.reg_counter + 1
+                    uid = str(self.reg_counter)
+                    k_loc = "_sum_k_" + uid
+                    acc_loc = "_sum_acc_" + uid
+                    self.ensure_typed_alloca(k_loc, "i64", is_in_func)
+                    # Check if elem_node is a product of two 2D subscripts (e.g. A[i][k] * B[k][j])
+                    is_2d_prod = False
+                    if elem_node.type == "BINOP" and elem_node.value == "*":
+                        lhs_e = elem_node.children[0]
+                        rhs_e = elem_node.children[1]
+                        if lhs_e.type == "SUBSCRIPT" and lhs_e.children[0].type == "SUBSCRIPT" and rhs_e.type == "SUBSCRIPT" and rhs_e.children[0].type == "SUBSCRIPT":
+                            is_2d_prod = True
+                    if is_2d_prod:
+                        self.ensure_typed_alloca(acc_loc, "double", is_in_func)
+                        self.emit("store double 0.0, double* %loc_" + acc_loc, is_in_func)
+                        self.emit("store i64 " + r_start + ", i64* %loc_" + k_loc, is_in_func)
+                        saved_k = None
+                        if k_var in self.range_loop_vars:
+                            saved_k = self.range_loop_vars[k_var]
+                        self.range_loop_vars[k_var] = k_loc
+                        lhs_e = elem_node.children[0]
+                        rhs_e = elem_node.children[1]
+                        # Hoist loop-invariant outer subscripts out of the k-loop
+                        lhs_outer_k = (lhs_e.children[0].children[1].type == "NAME" and lhs_e.children[0].children[1].value == k_var)
+                        rhs_outer_k = (rhs_e.children[0].children[1].type == "NAME" and rhs_e.children[0].children[1].value == k_var)
+                        lhs_row_items = ""
+                        rhs_outer_items = ""
+                        if not lhs_outer_k:
+                            lhs_row_tv = self.gen_expr(lhs_e.children[0], is_in_func)
+                            lr_raw = self.new_reg()
+                            self.emit(lr_raw + " = and i64 " + lhs_row_tv + ", 281474976710655", is_in_func)
+                            lr_ptr = self.new_reg()
+                            self.emit(lr_ptr + " = inttoptr i64 " + lr_raw + " to %List*", is_in_func)
+                            lr_ip = self.new_reg()
+                            self.emit(lr_ip + " = getelementptr inbounds %List, %List* " + lr_ptr + ", i32 0, i32 4", is_in_func)
+                            lhs_row_items = self.new_reg()
+                            self.emit(lhs_row_items + " = load i64*, i64** " + lr_ip, is_in_func)
+                        if rhs_outer_k:
+                            rhs_mat_tv = self.gen_expr(rhs_e.children[0].children[0], is_in_func)
+                            rm_raw = self.new_reg()
+                            self.emit(rm_raw + " = and i64 " + rhs_mat_tv + ", 281474976710655", is_in_func)
+                            rm_ptr = self.new_reg()
+                            self.emit(rm_ptr + " = inttoptr i64 " + rm_raw + " to %List*", is_in_func)
+                            rm_ip = self.new_reg()
+                            self.emit(rm_ip + " = getelementptr inbounds %List, %List* " + rm_ptr + ", i32 0, i32 4", is_in_func)
+                            rhs_outer_items = self.new_reg()
+                            self.emit(rhs_outer_items + " = load i64*, i64** " + rm_ip, is_in_func)
+                        lbl_cond = self.new_label("fsum_cond")
+                        lbl_body = self.new_label("fsum_body")
+                        lbl_end = self.new_label("fsum_end")
+                        self.emit_label(lbl_cond, is_in_func)
+                        rk = self.new_reg()
+                        self.emit(rk + " = load i64, i64* %loc_" + k_loc, is_in_func)
+                        rcmp = self.new_reg()
+                        self.emit(rcmp + " = icmp slt i64 " + rk + ", " + r_stop, is_in_func)
+                        self.emit_cond_br(rcmp, lbl_body, lbl_end, is_in_func)
+                        self.emit_label(lbl_body, is_in_func)
+                        if lhs_row_items != "" and lhs_e.children[1].type == "NAME" and lhs_e.children[1].value == k_var:
+                            lep = self.new_reg()
+                            self.emit(lep + " = getelementptr inbounds i64, i64* " + lhs_row_items + ", i64 " + rk, is_in_func)
+                            lv_tv = self.new_reg()
+                            self.emit(lv_tv + " = load i64, i64* " + lep, is_in_func)
+                        else:
+                            lv_tv = self.gen_expr(lhs_e, is_in_func)
+                        if rhs_outer_items != "" and rhs_e.children[1].type == "NAME" and rhs_e.children[1].value in self.range_loop_vars:
+                            r_krow_p = self.new_reg()
+                            self.emit(r_krow_p + " = getelementptr inbounds i64, i64* " + rhs_outer_items + ", i64 " + rk, is_in_func)
+                            r_krow_tv = self.new_reg()
+                            self.emit(r_krow_tv + " = load i64, i64* " + r_krow_p, is_in_func)
+                            j_loc = self.range_loop_vars[rhs_e.children[1].value]
+                            rj = self.new_reg()
+                            self.emit(rj + " = load i64, i64* %loc_" + j_loc, is_in_func)
+                            rv_tv = self._emit_fast_list_getitem(r_krow_tv, rj, is_in_func)
+                        else:
+                            rv_tv = self.gen_expr(rhs_e, is_in_func)
+                        lv_d = self.new_reg()
+                        self.emit(lv_d + " = bitcast i64 " + lv_tv + " to double", is_in_func)
+                        rv_d = self.new_reg()
+                        self.emit(rv_d + " = bitcast i64 " + rv_tv + " to double", is_in_func)
+                        prod_d = self.new_reg()
+                        self.emit(prod_d + " = fmul double " + lv_d + ", " + rv_d, is_in_func)
+                        cur_acc = self.new_reg()
+                        self.emit(cur_acc + " = load double, double* %loc_" + acc_loc, is_in_func)
+                        next_acc = self.new_reg()
+                        self.emit(next_acc + " = fadd double " + cur_acc + ", " + prod_d, is_in_func)
+                        self.emit("store double " + next_acc + ", double* %loc_" + acc_loc, is_in_func)
+                        rk2 = self.new_reg()
+                        self.emit(rk2 + " = load i64, i64* %loc_" + k_loc, is_in_func)
+                        rkn = self.new_reg()
+                        self.emit(rkn + " = add i64 " + rk2 + ", 1", is_in_func)
+                        self.emit("store i64 " + rkn + ", i64* %loc_" + k_loc, is_in_func)
+                        self.emit_br(lbl_cond, is_in_func)
+                        self.emit_label(lbl_end, is_in_func)
+                        if saved_k != None:
+                            self.range_loop_vars[k_var] = saved_k
+                        else:
+                            del self.range_loop_vars[k_var]
+                        fin_d = self.new_reg()
+                        self.emit(fin_d + " = load double, double* %loc_" + acc_loc, is_in_func)
+                        return self.emit_box_float(fin_d, is_in_func)
+                    else:
+                        self.ensure_alloca(acc_loc, is_in_func)
+                        self.emit("store i64 -2251799813685248, i64* %loc_" + acc_loc, is_in_func)
+                        self.emit("store i64 " + r_start + ", i64* %loc_" + k_loc, is_in_func)
+                        saved_k = None
+                        if k_var in self.range_loop_vars:
+                            saved_k = self.range_loop_vars[k_var]
+                        self.range_loop_vars[k_var] = k_loc
+                        lbl_cond = self.new_label("fsum_cond")
+                        lbl_body = self.new_label("fsum_body")
+                        lbl_end = self.new_label("fsum_end")
+                        self.emit_label(lbl_cond, is_in_func)
+                        rk = self.new_reg()
+                        self.emit(rk + " = load i64, i64* %loc_" + k_loc, is_in_func)
+                        rcmp = self.new_reg()
+                        self.emit(rcmp + " = icmp slt i64 " + rk + ", " + r_stop, is_in_func)
+                        self.emit_cond_br(rcmp, lbl_body, lbl_end, is_in_func)
+                        self.emit_label(lbl_body, is_in_func)
+                        rk_box = self.emit_box_int(rk, is_in_func)
+                        self.emit_store_var(k_var, rk_box, is_in_func)
+                        ev = self.gen_expr(elem_node, is_in_func)
+                        cur_acc = self.new_reg()
+                        self.emit(cur_acc + " = load i64, i64* %loc_" + acc_loc, is_in_func)
+                        next_acc = self.new_reg()
+                        self.emit(next_acc + " = call i64 @turbo_add(i64 " + cur_acc + ", i64 " + ev + ")", is_in_func)
+                        self.emit("store i64 " + next_acc + ", i64* %loc_" + acc_loc, is_in_func)
+                        rk2 = self.new_reg()
+                        self.emit(rk2 + " = load i64, i64* %loc_" + k_loc, is_in_func)
+                        rkn = self.new_reg()
+                        self.emit(rkn + " = add i64 " + rk2 + ", 1", is_in_func)
+                        self.emit("store i64 " + rkn + ", i64* %loc_" + k_loc, is_in_func)
+                        self.emit_br(lbl_cond, is_in_func)
+                        self.emit_label(lbl_end, is_in_func)
+                        if saved_k != None:
+                            self.range_loop_vars[k_var] = saved_k
+                        else:
+                            del self.range_loop_vars[k_var]
+                        fin_v = self.new_reg()
+                        self.emit(fin_v + " = load i64, i64* %loc_" + acc_loc, is_in_func)
+                        return fin_v
+        # General fallback: accumulate in-place without allocating a list
+        self.reg_counter = self.reg_counter + 1
+        acc_var = "_gsum_acc_" + str(self.reg_counter)
+        self.ensure_alloca(acc_var, is_in_func)
+        self.emit("store i64 -2251799813685248, i64* %loc_" + acc_var, is_in_func)
+        self._gen_comp_loops(gen_node, "%loc_" + acc_var, "SUM", elem_node, None, is_in_func)
+        r_res = self.new_reg()
+        self.emit(r_res + " = load i64, i64* %loc_" + acc_var, is_in_func)
+        return r_res
+
+    def _gen_comp_loops(self, gen_node, container_reg, comp_kind, elem_node, val_node, is_in_func):
+        if gen_node.type == "CONST_NONE":
+            if comp_kind == "LIST":
+                er = self.gen_expr(elem_node, is_in_func)
+                self.emit("call void @turbo_list_append(i64 " + container_reg + ", i64 " + er + ")", is_in_func)
+            elif comp_kind == "SUM":
+                er = self.gen_expr(elem_node, is_in_func)
+                cur_a = self.new_reg()
+                self.emit(cur_a + " = load i64, i64* " + container_reg, is_in_func)
+                nxt_a = self.new_reg()
+                self.emit(nxt_a + " = call i64 @turbo_add(i64 " + cur_a + ", i64 " + er + ")", is_in_func)
+                self.emit("store i64 " + nxt_a + ", i64* " + container_reg, is_in_func)
+            elif comp_kind == "SET":
+                er = self.gen_expr(elem_node, is_in_func)
+                self.emit("call void @turbo_set_add(i64 " + container_reg + ", i64 " + er + ")", is_in_func)
+            elif comp_kind == "DICT":
+                kr = self.gen_expr(elem_node, is_in_func)
+                vr = self.gen_expr(val_node, is_in_func)
+                self.emit("call void @turbo_setitem(i64 " + container_reg + ", i64 " + kr + ", i64 " + vr + ")", is_in_func)
+            return
+
+        targets = gen_node.value.split(',')
+        # Ensure target variables are in local_vars if in func, or global_vars if in main
+        t_i = 0
+        while t_i < len(targets):
+            tname = targets[t_i]
+            if is_in_func:
+                if not self.is_local(tname, True):
+                    self.local_vars.append(tname)
+                self.ensure_alloca(tname, True)
+            else:
+                self.add_global(tname)
+            t_i = t_i + 1
+
+        iter_node = gen_node.children[0]
+        if len(targets) == 1 and iter_node.type == "CALL" and iter_node.children[0].type == "NAME" and iter_node.children[0].value == "range":
+            rargs = iter_node.children[1].children
+            if len(rargs) >= 1 and len(rargs) <= 2:
+                r_start = "0"
+                r_stop = ""
+                if len(rargs) == 1:
+                    r_stop = self._gen_range_bound(rargs[0], is_in_func)
+                else:
+                    r_start = self._gen_range_bound(rargs[0], is_in_func)
+                    r_stop = self._gen_range_bound(rargs[1], is_in_func)
+                self.reg_counter = self.reg_counter + 1
+                ri_var = "_comp_rng_" + str(self.reg_counter)
+                self.ensure_typed_alloca(ri_var, "i64", is_in_func)
+                self.emit("store i64 " + r_start + ", i64* %loc_" + ri_var, is_in_func)
+                lbl_cond = self.new_label("crng_cond")
+                lbl_body = self.new_label("crng_body")
+                lbl_inc = self.new_label("crng_inc")
+                lbl_end = self.new_label("crng_end")
+                self.emit_label(lbl_cond, is_in_func)
+                r_ri = self.new_reg()
+                self.emit(r_ri + " = load i64, i64* %loc_" + ri_var, is_in_func)
+                r_cmp = self.new_reg()
+                self.emit(r_cmp + " = icmp slt i64 " + r_ri + ", " + r_stop, is_in_func)
+                self.emit_cond_br(r_cmp, lbl_body, lbl_end, is_in_func)
+                self.emit_label(lbl_body, is_in_func)
+                t_var = targets[0]
+                r_boxed = self.emit_box_int(r_ri, is_in_func)
+                self.emit_store_var(t_var, r_boxed, is_in_func)
+                saved_rlv = None
+                if t_var in self.range_loop_vars:
+                    saved_rlv = self.range_loop_vars[t_var]
+                self.range_loop_vars[t_var] = ri_var
+                if_cond = gen_node.children[1]
+                if if_cond.type != "CONST_NONE":
+                    cond_reg = self.gen_expr(if_cond, is_in_func)
+                    c_i1 = self.emit_truthy_i1(cond_reg, is_in_func)
+                    lbl_pass = self.new_label("comp_if_pass")
+                    self.emit_cond_br(c_i1, lbl_pass, lbl_inc, is_in_func)
+                    self.emit_label(lbl_pass, is_in_func)
+                next_gen = gen_node.children[2]
+                self._gen_comp_loops(next_gen, container_reg, comp_kind, elem_node, val_node, is_in_func)
+                if saved_rlv != None:
+                    self.range_loop_vars[t_var] = saved_rlv
+                elif t_var in self.range_loop_vars:
+                    del self.range_loop_vars[t_var]
+                self.emit_label(lbl_inc, is_in_func)
+                r_ri2 = self.new_reg()
+                self.emit(r_ri2 + " = load i64, i64* %loc_" + ri_var, is_in_func)
+                r_rinext = self.new_reg()
+                self.emit(r_rinext + " = add i64 " + r_ri2 + ", 1", is_in_func)
+                self.emit("store i64 " + r_rinext + ", i64* %loc_" + ri_var, is_in_func)
+                self.emit_br(lbl_cond, is_in_func)
+                self.emit_label(lbl_end, is_in_func)
+                return
+
+        iter_reg = self.gen_expr(iter_node, is_in_func)
+        iter_state = self._emit_iter_header(iter_reg, is_in_func)
+        r_elem = iter_state[0]
+        lbl_inc = iter_state[3]
+
+        if len(targets) == 1:
+            self.emit_store_var(targets[0], r_elem, is_in_func)
+        else:
+            u_i = 0
+            while u_i < len(targets):
+                idx_const = str(-2251799813685248 + u_i)
+                r_sub = self.new_reg()
+                self.emit(r_sub + " = call i64 @turbo_getitem(i64 " + r_elem + ", i64 " + idx_const + ")", is_in_func)
+                self.emit_store_var(targets[u_i], r_sub, is_in_func)
+                u_i = u_i + 1
+
+        if_cond = gen_node.children[1]
+        if if_cond.type != "CONST_NONE":
+            cond_reg = self.gen_expr(if_cond, is_in_func)
+            c_i1 = self.emit_truthy_i1(cond_reg, is_in_func)
+            lbl_pass = self.new_label("comp_if_pass")
+            self.emit_cond_br(c_i1, lbl_pass, lbl_inc, is_in_func)
+            self.emit_label(lbl_pass, is_in_func)
+
+        next_gen = gen_node.children[2]
+        self._gen_comp_loops(next_gen, container_reg, comp_kind, elem_node, val_node, is_in_func)
+        self._emit_iter_footer(iter_state, is_in_func)
+
+    def _is_raw_int_expr(self, node, param_names, func_name):
+        if node.type == "CONST_INT":
+            return True
+        if node.type == "NAME":
+            i = 0
+            while i < len(param_names):
+                if param_names[i] == node.value:
+                    return True
+                i = i + 1
+            return False
+        if node.type == "UNARY" and node.value == "-":
+            return self._is_raw_int_expr(node.children[0], param_names, func_name)
+        if node.type == "BINOP":
+            if not (node.value in ("+", "-", "*", "//", "%")):
+                return False
+            return self._is_raw_int_expr(node.children[0], param_names, func_name) and self._is_raw_int_expr(node.children[1], param_names, func_name)
+        if node.type == "COMP":
+            if not (node.value in ("<", "<=", ">", ">=", "==", "!=")):
+                return False
+            return self._is_raw_int_expr(node.children[0], param_names, func_name) and self._is_raw_int_expr(node.children[1], param_names, func_name)
+        if node.type == "CALL":
+            fn = node.children[0]
+            args = node.children[1].children
+            if fn.type == "NAME" and fn.value == func_name and len(args) == len(param_names):
+                i = 0
+                while i < len(args):
+                    if not self._is_raw_int_expr(args[i], param_names, func_name):
+                        return False
+                    i = i + 1
+                return True
+        return False
+
+    def _is_raw_int_block(self, block_node, param_names, func_name):
+        i = 0
+        while i < len(block_node.children):
+            stmt = block_node.children[i]
+            if stmt.type == "RETURN":
+                if not self._is_raw_int_expr(stmt.children[0], param_names, func_name):
+                    return False
+            elif stmt.type == "IF":
+                if not self._is_raw_int_expr(stmt.children[0], param_names, func_name):
+                    return False
+                if not self._is_raw_int_block(stmt.children[1], param_names, func_name):
+                    return False
+                if len(stmt.children) >= 3:
+                    else_n = stmt.children[2]
+                    if else_n.type == "IF":
+                        if not self._is_raw_int_block(ASTNode("BLOCK", "", [else_n]), param_names, func_name):
+                            return False
+                    else:
+                        if not self._is_raw_int_block(else_n, param_names, func_name):
+                            return False
+            else:
+                return False
+            i = i + 1
+        return True
+
+    def _emit_raw_int_expr(self, node, param_map, func_name, raw_sym):
+        if node.type == "CONST_INT":
+            return str(int(node.value))
+        if node.type == "NAME":
+            return param_map[node.value]
+        if node.type == "UNARY" and node.value == "-":
+            v = self._emit_raw_int_expr(node.children[0], param_map, func_name, raw_sym)
+            r = self.new_reg()
+            self.emit(r + " = sub i64 0, " + v, True)
+            return r
+        if node.type == "BINOP":
+            lv = self._emit_raw_int_expr(node.children[0], param_map, func_name, raw_sym)
+            rv = self._emit_raw_int_expr(node.children[1], param_map, func_name, raw_sym)
+            op = node.value
+            iop = "add"
+            if op == "-":
+                iop = "sub"
+            elif op == "*":
+                iop = "mul"
+            elif op == "//":
+                iop = "sdiv"
+            elif op == "%":
+                iop = "srem"
+            r = self.new_reg()
+            self.emit(r + " = " + iop + " i64 " + lv + ", " + rv, True)
+            return r
+        if node.type == "CALL":
+            args = node.children[1].children
+            cargs = []
+            i = 0
+            while i < len(args):
+                av = self._emit_raw_int_expr(args[i], param_map, func_name, raw_sym)
+                cargs.append("i64 " + av)
+                i = i + 1
+            r = self.new_reg()
+            self.emit(r + " = call i64 @" + raw_sym + "(" + ", ".join(cargs) + ")", True)
+            return r
+        return "0"
+
+    def _emit_raw_int_cond(self, node, param_map, func_name, raw_sym):
+        if node.type == "COMP":
+            lv = self._emit_raw_int_expr(node.children[0], param_map, func_name, raw_sym)
+            rv = self._emit_raw_int_expr(node.children[1], param_map, func_name, raw_sym)
+            op = node.value
+            cop = "eq"
+            if op == "<":
+                cop = "slt"
+            elif op == "<=":
+                cop = "sle"
+            elif op == ">":
+                cop = "sgt"
+            elif op == ">=":
+                cop = "sge"
+            elif op == "!=":
+                cop = "ne"
+            r = self.new_reg()
+            self.emit(r + " = icmp " + cop + " i64 " + lv + ", " + rv, True)
+            return r
+        v = self._emit_raw_int_expr(node, param_map, func_name, raw_sym)
+        r = self.new_reg()
+        self.emit(r + " = icmp ne i64 " + v + ", 0", True)
+        return r
+
+    def _emit_raw_int_block(self, block_node, param_map, func_name, raw_sym):
+        i = 0
+        while i < len(block_node.children):
+            stmt = block_node.children[i]
+            if stmt.type == "RETURN":
+                rv = self._emit_raw_int_expr(stmt.children[0], param_map, func_name, raw_sym)
+                self.emit_ret(rv, True)
+            elif stmt.type == "IF":
+                c_i1 = self._emit_raw_int_cond(stmt.children[0], param_map, func_name, raw_sym)
+                lbl_then = self.new_label("raw_then")
+                lbl_else = self.new_label("raw_else")
+                lbl_end = self.new_label("raw_end")
+                if len(stmt.children) >= 3:
+                    self.emit_cond_br(c_i1, lbl_then, lbl_else, True)
+                    self.emit_label(lbl_then, True)
+                    self._emit_raw_int_block(stmt.children[1], param_map, func_name, raw_sym)
+                    self.emit_br(lbl_end, True)
+                    self.emit_label(lbl_else, True)
+                    else_n = stmt.children[2]
+                    if else_n.type == "IF":
+                        self._emit_raw_int_block(ASTNode("BLOCK", "", [else_n]), param_map, func_name, raw_sym)
+                    else:
+                        self._emit_raw_int_block(else_n, param_map, func_name, raw_sym)
+                    self.emit_br(lbl_end, True)
+                    self.emit_label(lbl_end, True)
+                else:
+                    self.emit_cond_br(c_i1, lbl_then, lbl_end, True)
+                    self.emit_label(lbl_then, True)
+                    self._emit_raw_int_block(stmt.children[1], param_map, func_name, raw_sym)
+                    self.emit_br(lbl_end, True)
+                    self.emit_label(lbl_end, True)
+            i = i + 1
 
     def gen_func_def(self, node, class_name, mod_prefix, is_nested):
         func_name = node.value
-        # For nested functions, use a unique impl name but keep var_name simple
         if class_name != "":
             impl_name = "t_impl_" + class_name + "_" + func_name
+            ssa_name = "t_ssa_" + class_name + "_" + func_name
         else:
             impl_name = "t_impl_" + mod_prefix + func_name
-        var_name = func_name  # name used for the module-level variable t_<name>
-        
+            ssa_name = "t_ssa_" + mod_prefix + func_name
+        var_name = func_name
+
         params_node = node.children[0]
         body_node = node.children[1]
-        
-        old_locals = self.local_vars
+        num_params = len(params_node.children)
+
+        # Register for direct SSA call if top-level or nested without decorators
+        has_decorators = False
+        d_chk = 2
+        while d_chk < len(node.children):
+            if node.children[d_chk].type == "DECORATOR":
+                has_decorators = True
+            d_chk = d_chk + 1
+        if class_name == "" and not has_decorators:
+            self.direct_funcs[mod_prefix + func_name] = [ssa_name, num_params]
+
+        saved_cur_lines = self.cur_lines
+        saved_locals = self.local_vars
+        saved_allocas = self.local_allocas
+        saved_sized = self.sized_allocas
+        saved_typed = self.typed_allocas
+        saved_term = self.block_terminated
+        saved_try = self.try_depth
+        saved_loop = self.loop_stack
+        saved_gen = self.is_generator
+        saved_pnv = self.pending_native_vars
+        saved_vt = self._var_types
+        saved_mp = self.mod_prefix
+        saved_ldf = self.local_direct_funcs
+        saved_rlv = self.range_loop_vars
+
+        self.cur_lines = []
         self.local_vars = []
+        self.local_allocas = []
+        self.sized_allocas = []
+        self.typed_allocas = []
+        self.block_terminated = False
+        self.try_depth = 0
+        self.loop_stack = []
+        self.pending_native_vars = None
+        self.local_direct_funcs = {}
+        self.range_loop_vars = {}
+        if class_name == "" and is_nested and not has_decorators:
+            self.local_direct_funcs[func_name] = mod_prefix + func_name
+        if mod_prefix != "" and class_name == "" and not is_nested:
+            self.mod_prefix = mod_prefix
+
         p_idx = 0
-        while p_idx < len(params_node.children):
+        while p_idx < num_params:
             self.local_vars.append(params_node.children[p_idx].value)
             p_idx = p_idx + 1
         collect_locals(body_node, self.local_vars)
 
         global_names = scan_global_nonlocal_names(body_node)
-
         if len(global_names) > 0:
             new_locals = []
             l_idx = 0
@@ -1952,102 +3080,216 @@ class CodeGen:
                     n_idx = n_idx + 1
                 if not is_global:
                     new_locals.append(l_name)
+                else:
+                    self.add_global(l_name)
                 l_idx = l_idx + 1
             self.local_vars = new_locals
-        
-        generator_func = has_yield(body_node)
-        old_generator = self.is_generator
-        self.is_generator = generator_func
 
-        self.write_header("TurboObject* " + impl_name + "(int argc, TurboObject** args);\n")
-        
-        self.funcs = self.funcs + "TurboObject* " + impl_name + "(int argc, TurboObject** args) {\n"
-        
-        p_idx = 0
-        while p_idx < len(params_node.children):
-            p_name = params_node.children[p_idx].value
-            self.funcs = self.funcs + "    TurboObject* t_" + p_name + " = (argc > " + str(p_idx) + ") ? args[" + str(p_idx) + "] : turbo_none;\n"
-            p_idx = p_idx + 1
-            
         l_idx = 0
         while l_idx < len(self.local_vars):
-            l_name = self.local_vars[l_idx]
-            is_param = False
-            p_idx = 0
-            while p_idx < len(params_node.children):
-                if params_node.children[p_idx].value == l_name:
-                    is_param = True
-                    break
-                p_idx = p_idx + 1
-            if not is_param:
-                self.funcs = self.funcs + "    TurboObject* t_" + l_name + " = turbo_none;\n"
+            self.ensure_alloca(self.local_vars[l_idx], True)
             l_idx = l_idx + 1
-        
-        if generator_func:
-            self.funcs = self.funcs + "    TurboObject* __yield_values = make_list();\n"
-            
-        self.indent_level = 1
 
-        # Extract nested function defs and generate them at module scope
+        generator_func = has_yield(body_node)
+        self.is_generator = generator_func
+        if generator_func:
+            self.ensure_alloca("__yield_values", True)
+            r_yl = self.new_reg()
+            self.emit(r_yl + " = call i64 @make_list()", True)
+            self.emit("store i64 " + r_yl + ", i64* %loc___yield_values", True)
+
+        # Extract nested function defs
         nested_funcs = []
         remaining_stmts = []
-        for stmt in body_node.children:
+        s_i = 0
+        while s_i < len(body_node.children):
+            stmt = body_node.children[s_i]
             if stmt.type == "DEF" or stmt.type == "ASYNC_DEF":
                 nested_funcs.append(stmt)
             else:
                 remaining_stmts.append(stmt)
-        # Generate nested functions at module scope
-        # Buffer their implementations so they appear AFTER the parent function
-        nested_func_buf = ""
-        for nf in nested_funcs:
+            s_i = s_i + 1
+
+        nf_i = 0
+        while nf_i < len(nested_funcs):
+            nf = nested_funcs[nf_i]
             nested_mod_prefix = mod_prefix + func_name + "_nested_"
-            saved_funcs = self.funcs
-            self.funcs = ""
             self.gen_func_def(nf, "", nested_mod_prefix, True)
-            nested_func_buf = nested_func_buf + self.funcs
-            self.funcs = saved_funcs
-            # Initialize module-level variable inside parent function body
-            self.funcs = self.funcs + "    t_" + nf.value + " = make_func(t_impl_" + nested_mod_prefix + nf.value + ', "' + nf.value + '");\n'
+            self.local_direct_funcs[nf.value] = nested_mod_prefix + nf.value
+            self.add_global(nf.value)
+            sp_nf = self.get_str_ptr(nf.value, True)
+            r_nf = self.new_reg()
+            self.emit(r_nf + " = call i64 @make_func(i64 (i32, i64*)* @t_impl_" + nested_mod_prefix + nf.value + ", i8* " + sp_nf + ")", True)
+            self.emit("store i64 " + r_nf + ", i64* @t_" + nf.value, True)
+            nf_i = nf_i + 1
         body_node.children = remaining_stmts
 
-        self._var_types = {}
-        self._infer_func_types(body_node, self._var_types)
+        # Check if function is a pure raw-int recursive/numeric function
+        param_names = []
+        p_idx = 0
+        while p_idx < num_params:
+            param_names.append(params_node.children[p_idx].value)
+            p_idx = p_idx + 1
+        is_raw_int = False
+        raw_name = "t_raw_" + mod_prefix + func_name
+        if class_name == "" and not has_decorators and not generator_func and len(nested_funcs) == 0 and num_params > 0 and len(body_node.children) > 0:
+            if self._is_raw_int_block(body_node, param_names, func_name):
+                is_raw_int = True
+                self.raw_int_funcs[mod_prefix + func_name] = [raw_name, num_params]
 
-        self.gen_block_stmts(body_node, True)
-        
-        if generator_func:
-            self.funcs = self.funcs + "    return __yield_values;\n"
+        if is_raw_int:
+            raw_cur_lines = self.cur_lines
+            raw_term = self.block_terminated
+            self.cur_lines = []
+            self.block_terminated = False
+            raw_param_map = {}
+            raw_sig_parts = []
+            p_idx = 0
+            while p_idx < num_params:
+                raw_param_map[param_names[p_idx]] = "%rarg_" + str(p_idx)
+                raw_sig_parts.append("i64 %rarg_" + str(p_idx))
+                p_idx = p_idx + 1
+            self._emit_raw_int_block(body_node, raw_param_map, func_name, raw_name)
+            if not self.block_terminated:
+                self.emit_ret("0", True)
+            raw_lines = ["define i64 @" + raw_name + "(" + ", ".join(raw_sig_parts) + ") {", "entry:"]
+            c_i = 0
+            while c_i < len(self.cur_lines):
+                raw_lines.append(self.cur_lines[c_i])
+                c_i = c_i + 1
+            raw_lines.append("}")
+            self.funcs_list.append("\n".join(raw_lines))
+
+            self.cur_lines = raw_cur_lines
+            self.block_terminated = raw_term
+            unboxed_args = []
+            p_idx = 0
+            while p_idx < num_params:
+                u_reg = self.emit_unbox_int("%arg_" + str(p_idx), True)
+                unboxed_args.append("i64 " + u_reg)
+                p_idx = p_idx + 1
+            r_raw_res = self.new_reg()
+            self.emit(r_raw_res + " = call i64 @" + raw_name + "(" + ", ".join(unboxed_args) + ")", True)
+            r_box_res = self.emit_box_int(r_raw_res, True)
+            self.emit_ret(r_box_res, True)
         else:
-            self.funcs = self.funcs + "    return turbo_none;\n"
-        self.funcs = self.funcs + "}\n"
-        self.funcs = self.funcs + nested_func_buf
-        self.funcs = self.funcs + "\n"
-        
-        self.is_generator = old_generator
-        
-        self.local_vars = old_locals
-        
+            self._var_types = {}
+            self._infer_func_types(body_node, self._var_types)
+
+            self.gen_block_stmts(body_node, True)
+
+            if not self.block_terminated:
+                if generator_func:
+                    r_yv = self.new_reg()
+                    self.emit(r_yv + " = load i64, i64* %loc___yield_values", True)
+                    self.emit_ret(r_yv, True)
+                else:
+                    self.emit_ret("-1688849860263936", True)
+
+        # Build SSA function definition
+        param_sig_parts = []
+        p_idx = 0
+        while p_idx < num_params:
+            param_sig_parts.append("i64 %arg_" + str(p_idx))
+            p_idx = p_idx + 1
+        fn_lines = ["define i64 @" + ssa_name + "(" + ", ".join(param_sig_parts) + ") {", "entry:"]
+        a_i = 0
+        while a_i < len(self.local_allocas):
+            aname = self.local_allocas[a_i]
+            fn_lines.append("  %loc_" + aname + " = alloca i64")
+            fn_lines.append("  store i64 -1688849860263936, i64* %loc_" + aname)
+            a_i = a_i + 1
+        a_i = 0
+        while a_i < len(self.typed_allocas):
+            tinfo = self.typed_allocas[a_i]
+            fn_lines.append("  %loc_" + tinfo[0] + " = alloca " + tinfo[1])
+            a_i = a_i + 1
+        a_i = 0
+        while a_i < len(self.sized_allocas):
+            sinfo = self.sized_allocas[a_i]
+            fn_lines.append("  %loc_" + sinfo[0] + " = alloca [" + str(sinfo[1]) + " x i64]")
+            a_i = a_i + 1
+        p_idx = 0
+        while p_idx < num_params:
+            p_name = params_node.children[p_idx].value
+            fn_lines.append("  store i64 %arg_" + str(p_idx) + ", i64* %loc_" + p_name)
+            p_idx = p_idx + 1
+        c_i = 0
+        while c_i < len(self.cur_lines):
+            fn_lines.append(self.cur_lines[c_i])
+            c_i = c_i + 1
+        fn_lines.append("}")
+        self.funcs_list.append("\n".join(fn_lines))
+
+        # Build dynamic dispatch wrapper thunk @impl_name(i32 %argc, i64* %args) -> calls @ssa_name
+        w_lines = ["define i64 @" + impl_name + "(i32 %argc, i64* %args) {", "entry:"]
+        w_call_args = []
+        p_idx = 0
+        while p_idx < num_params:
+            w_lines.append("  %w_slot_" + str(p_idx) + " = alloca i64")
+            w_lines.append("  store i64 -1688849860263936, i64* %w_slot_" + str(p_idx))
+            w_lines.append("  %w_has_" + str(p_idx) + " = icmp sgt i32 %argc, " + str(p_idx))
+            w_lines.append("  br i1 %w_has_" + str(p_idx) + ", label %w_ld_" + str(p_idx) + ", label %w_nx_" + str(p_idx))
+            w_lines.append("w_ld_" + str(p_idx) + ":")
+            w_lines.append("  %w_ptr_" + str(p_idx) + " = getelementptr inbounds i64, i64* %args, i64 " + str(p_idx))
+            w_lines.append("  %w_val_" + str(p_idx) + " = load i64, i64* %w_ptr_" + str(p_idx))
+            w_lines.append("  store i64 %w_val_" + str(p_idx) + ", i64* %w_slot_" + str(p_idx))
+            w_lines.append("  br label %w_nx_" + str(p_idx))
+            w_lines.append("w_nx_" + str(p_idx) + ":")
+            w_lines.append("  %w_arg_" + str(p_idx) + " = load i64, i64* %w_slot_" + str(p_idx))
+            w_call_args.append("i64 %w_arg_" + str(p_idx))
+            p_idx = p_idx + 1
+        w_lines.append("  %w_ret = call i64 @" + ssa_name + "(" + ", ".join(w_call_args) + ")")
+        w_lines.append("  ret i64 %w_ret")
+        w_lines.append("}")
+        self.funcs_list.append("\n".join(w_lines))
+
+        self.cur_lines = saved_cur_lines
+        self.local_vars = saved_locals
+        self.local_allocas = saved_allocas
+        self.sized_allocas = saved_sized
+        self.typed_allocas = saved_typed
+        self.block_terminated = saved_term
+        self.try_depth = saved_try
+        self.loop_stack = saved_loop
+        self.is_generator = saved_gen
+        self.pending_native_vars = saved_pnv
+        self._var_types = saved_vt
+        self.mod_prefix = saved_mp
+        self.local_direct_funcs = saved_ldf
+        self.range_loop_vars = saved_rlv
+
         if class_name == "":
-            self.write_header("TurboObject* t_" + var_name + " = NULL;\n")
-            if not is_nested:
-                self.write_main("t_" + func_name + " = make_func(t_impl_" + func_name + ', "' + func_name + '");')
+            self.add_global(mod_prefix + var_name)
+            if not is_nested and mod_prefix == "":
+                sp_fn = self.get_str_ptr(func_name, False)
+                r_fn = self.new_reg()
+                self.emit(r_fn + " = call i64 @make_func(i64 (i32, i64*)* @" + impl_name + ", i8* " + sp_fn + ")", False)
+                self.emit("store i64 " + r_fn + ", i64* @t_" + func_name, False)
                 d_idx = 2
                 while d_idx < len(node.children):
                     if node.children[d_idx].type == "DECORATOR":
-                        decorator_c = self.gen_expr(node.children[d_idx].children[0])
-                        self.write_main("t_" + func_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + func_name + "});")
+                        dec_reg = self.gen_expr(node.children[d_idx].children[0], False)
+                        cur_fn = self.new_reg()
+                        self.emit(cur_fn + " = load i64, i64* @t_" + func_name, False)
+                        p_arg = self.emit_args_array([cur_fn], False)
+                        new_fn = self.new_reg()
+                        self.emit(new_fn + " = call i64 @turbo_call(i64 " + dec_reg + ", i32 1, i64* " + p_arg + ")", False)
+                        self.emit("store i64 " + new_fn + ", i64* @t_" + func_name, False)
                     d_idx = d_idx + 1
 
     def gen_class_def(self, node, mod_prefix):
         class_name = node.value
         full_name = mod_prefix + class_name
-        self.write_header("TurboObject* t_" + full_name + " = NULL;\n")
+        self.add_global(full_name)
         if mod_prefix == "":
-            self.write_main("t_" + class_name + ' = make_class("' + class_name + '");')
-        
+            sp_cn = self.get_str_ptr(class_name, False)
+            r_cls = self.new_reg()
+            self.emit(r_cls + " = call i64 @make_class(i8* " + sp_cn + ")", False)
+            self.emit("store i64 " + r_cls + ", i64* @t_" + class_name, False)
+
         suite = node.children[0]
 
-        # Check for @dataclass
         is_dataclass = False
         dc_idx = 1
         while dc_idx < len(node.children):
@@ -2057,7 +3299,6 @@ class CodeGen:
                     is_dataclass = True
             dc_idx = dc_idx + 1
 
-        # Handle @dataclass: generate __init__ with field params
         if is_dataclass:
             init_fields = []
             dc_m_idx = 0
@@ -2066,46 +3307,108 @@ class CodeGen:
                 if s.type == "ANN_ASSIGN":
                     fname = s.value
                     fdefault = s.children[0] if s.children[1].type == "CONST_NONE" else s.children[1]
-                    init_fields.append((fname, fdefault))
+                    init_fields.append([fname, fdefault])
                 elif s.type == "ASSIGN":
                     target = s.children[0]
                     if target.type == "NAME":
                         fname = target.value
                         fdefault = s.children[1]
-                        init_fields.append((fname, fdefault))
+                        init_fields.append([fname, fdefault])
                 dc_m_idx = dc_m_idx + 1
             init_impl = "t_impl_" + full_name + "__init__"
-            self.write_header("TurboObject* " + init_impl + "(int argc, TurboObject** args);\n")
-            self.funcs = self.funcs + "TurboObject* " + init_impl + "(int argc, TurboObject** args) {\n"
-            self.funcs = self.funcs + "    TurboObject* t_self = args[0];\n"
+            saved_cur_lines = self.cur_lines
+            saved_locals = self.local_vars
+            saved_allocas = self.local_allocas
+            saved_sized = self.sized_allocas
+            saved_typed = self.typed_allocas
+            saved_term = self.block_terminated
+            self.cur_lines = []
+            self.local_vars = ["self"]
+            self.local_allocas = []
+            self.sized_allocas = []
+            self.typed_allocas = []
+            self.block_terminated = False
+
+            p_self = self.new_reg()
+            self.emit(p_self + " = getelementptr inbounds i64, i64* %args, i64 0", True)
+            v_self = self.new_reg()
+            self.emit(v_self + " = load i64, i64* " + p_self, True)
+
             init_i = 0
             while init_i < len(init_fields):
                 fname = init_fields[init_i][0]
                 fdefault = init_fields[init_i][1]
-                self.funcs = self.funcs + "    TurboObject* t_" + fname + " = (argc > " + str(init_i + 1) + ") ? args[" + str(init_i + 1) + "] : "
+                self.ensure_alloca(fname, True)
+                c_arg = self.new_reg()
+                self.emit(c_arg + " = icmp sgt i32 %argc, " + str(init_i + 1), True)
+                lbl_has = self.new_label("dc_has")
+                lbl_def = self.new_label("dc_def")
+                lbl_done = self.new_label("dc_done")
+                self.emit_cond_br(c_arg, lbl_has, lbl_def, True)
+                self.emit_label(lbl_has, True)
+                pa = self.new_reg()
+                self.emit(pa + " = getelementptr inbounds i64, i64* %args, i64 " + str(init_i + 1), True)
+                va = self.new_reg()
+                self.emit(va + " = load i64, i64* " + pa, True)
+                self.emit("store i64 " + va + ", i64* %loc_" + fname, True)
+                self.emit_br(lbl_done, True)
+                self.emit_label(lbl_def, True)
                 if fdefault.type == "CONST_NONE":
-                    self.funcs = self.funcs + "turbo_none"
+                    self.emit("store i64 -1688849860263936, i64* %loc_" + fname, True)
                 else:
-                    self.funcs = self.funcs + self.gen_expr(fdefault)
-                self.funcs = self.funcs + ";\n"
+                    vd = self.gen_expr(fdefault, True)
+                    self.emit("store i64 " + vd + ", i64* %loc_" + fname, True)
+                self.emit_br(lbl_done, True)
+                self.emit_label(lbl_done, True)
+                fv = self.new_reg()
+                self.emit(fv + " = load i64, i64* %loc_" + fname, True)
+                sp_f = self.get_str_ptr(fname, True)
+                self.emit("call void @turbo_setattr(i64 " + v_self + ", i8* " + sp_f + ", i64 " + fv + ")", True)
                 init_i = init_i + 1
-            init_i = 0
-            while init_i < len(init_fields):
-                fname = init_fields[init_i][0]
-                self.funcs = self.funcs + '    turbo_setattr(t_self, "' + fname + '", t_' + fname + ');\n'
-                init_i = init_i + 1
-            self.funcs = self.funcs + "    return turbo_none;\n"
-            self.funcs = self.funcs + "}\n\n"
-            if mod_prefix == "":
-                self.write_main("turbo_class_add_method(t_" + class_name + ', "__init__", ' + init_impl + ');')
 
-        # Generate methods and class-level assignments
+            self.emit_ret("-1688849860263936", True)
+            fn_lines = ["define i64 @" + init_impl + "(i32 %argc, i64* %args) {", "entry:"]
+            a_i = 0
+            while a_i < len(self.local_allocas):
+                aname = self.local_allocas[a_i]
+                fn_lines.append("  %loc_" + aname + " = alloca i64")
+                fn_lines.append("  store i64 -1688849860263936, i64* %loc_" + aname)
+                a_i = a_i + 1
+            a_i = 0
+            while a_i < len(self.typed_allocas):
+                tinfo = self.typed_allocas[a_i]
+                fn_lines.append("  %loc_" + tinfo[0] + " = alloca " + tinfo[1])
+                a_i = a_i + 1
+            a_i = 0
+            while a_i < len(self.sized_allocas):
+                sinfo = self.sized_allocas[a_i]
+                fn_lines.append("  %loc_" + sinfo[0] + " = alloca [" + str(sinfo[1]) + " x i64]")
+                a_i = a_i + 1
+            c_i = 0
+            while c_i < len(self.cur_lines):
+                fn_lines.append(self.cur_lines[c_i])
+                c_i = c_i + 1
+            fn_lines.append("}")
+            self.funcs_list.append("\n".join(fn_lines))
+
+            self.cur_lines = saved_cur_lines
+            self.local_vars = saved_locals
+            self.local_allocas = saved_allocas
+            self.sized_allocas = saved_sized
+            self.typed_allocas = saved_typed
+            self.block_terminated = saved_term
+
+            if mod_prefix == "":
+                r_c = self.new_reg()
+                self.emit(r_c + " = load i64, i64* @t_" + class_name, False)
+                sp_init = self.get_str_ptr("__init__", False)
+                self.emit("call void @turbo_class_add_method(i64 " + r_c + ", i8* " + sp_init + ", i64 (i32, i64*)* @" + init_impl + ")", False)
+
         m_idx = 0
         while m_idx < len(suite.children):
             m_node = suite.children[m_idx]
             if m_node.type == "DEF" or m_node.type == "ASYNC_DEF":
                 method_name = m_node.value
-                # Check method decorators for special handling
                 is_static = False
                 is_class = False
                 is_property = False
@@ -2122,84 +3425,65 @@ class CodeGen:
                                 is_property = True
                     md_idx = md_idx + 1
                 self.gen_func_def(m_node, full_name, "", False)
-                if is_static:
-                    if mod_prefix == "":
-                        self.write_main("turbo_class_set_attr(t_" + class_name + ', "' + method_name + '", make_staticmethod(t_impl_' + class_name + '_' + method_name + ', "' + method_name + '"));')
-                elif is_class:
-                    if mod_prefix == "":
-                        self.write_main("turbo_class_set_attr(t_" + class_name + ', "' + method_name + '", make_classmethod(t_impl_' + class_name + '_' + method_name + ', "' + method_name + '"));')
-                elif is_property:
-                    if mod_prefix == "":
-                        self.write_main("turbo_class_set_attr(t_" + class_name + ', "' + method_name + '", make_property(t_impl_' + class_name + '_' + method_name + ', NULL, "' + method_name + '"));')
-                else:
-                    if mod_prefix == "":
-                        self.write_main("turbo_class_add_method(t_" + class_name + ', "' + method_name + '", t_impl_' + class_name + '_' + method_name + ');')
+                if mod_prefix == "":
+                    r_c = self.new_reg()
+                    self.emit(r_c + " = load i64, i64* @t_" + class_name, False)
+                    sp_m = self.get_str_ptr(method_name, False)
+                    m_impl = "@t_impl_" + class_name + "_" + method_name
+                    if is_static:
+                        sp_m2 = self.get_str_ptr(method_name, False)
+                        r_sm = self.new_reg()
+                        self.emit(r_sm + " = call i64 @make_staticmethod(i64 (i32, i64*)* " + m_impl + ", i8* " + sp_m2 + ")", False)
+                        self.emit("call void @turbo_class_set_attr(i64 " + r_c + ", i8* " + sp_m + ", i64 " + r_sm + ")", False)
+                    elif is_class:
+                        sp_m2 = self.get_str_ptr(method_name, False)
+                        r_cm = self.new_reg()
+                        self.emit(r_cm + " = call i64 @make_classmethod(i64 (i32, i64*)* " + m_impl + ", i8* " + sp_m2 + ")", False)
+                        self.emit("call void @turbo_class_set_attr(i64 " + r_c + ", i8* " + sp_m + ", i64 " + r_cm + ")", False)
+                    elif is_property:
+                        sp_m2 = self.get_str_ptr(method_name, False)
+                        r_pm = self.new_reg()
+                        self.emit(r_pm + " = call i64 @make_property(i64 (i32, i64*)* " + m_impl + ", i64 (i32, i64*)* null, i8* " + sp_m2 + ")", False)
+                        self.emit("call void @turbo_class_set_attr(i64 " + r_c + ", i8* " + sp_m + ", i64 " + r_pm + ")", False)
+                    else:
+                        self.emit("call void @turbo_class_add_method(i64 " + r_c + ", i8* " + sp_m + ", i64 (i32, i64*)* " + m_impl + ")", False)
             elif m_node.type == "ASSIGN":
                 target = m_node.children[0]
                 if target.type == "NAME":
                     attr_name = target.value
-                    val_c = self.gen_expr(m_node.children[1])
                     if mod_prefix == "":
-                        self.write_main('turbo_class_set_attr(t_' + class_name + ', "' + attr_name + '", ' + val_c + ');')
+                        val_reg = self.gen_expr(m_node.children[1], False)
+                        r_c = self.new_reg()
+                        self.emit(r_c + " = load i64, i64* @t_" + class_name, False)
+                        sp_a = self.get_str_ptr(attr_name, False)
+                        self.emit("call void @turbo_class_set_attr(i64 " + r_c + ", i8* " + sp_a + ", i64 " + val_reg + ")", False)
             elif m_node.type == "ANN_ASSIGN":
                 attr_name = m_node.value
-                if len(m_node.children) > 1:
-                    val_c = self.gen_expr(m_node.children[1])
+                if len(m_node.children) > 1 and m_node.children[1].type != "CONST_NONE":
                     if mod_prefix == "":
-                        self.write_main('turbo_class_set_attr(t_' + class_name + ', "' + attr_name + '", ' + val_c + ');')
+                        val_reg = self.gen_expr(m_node.children[1], False)
+                        r_c = self.new_reg()
+                        self.emit(r_c + " = load i64, i64* @t_" + class_name, False)
+                        sp_a = self.get_str_ptr(attr_name, False)
+                        self.emit("call void @turbo_class_set_attr(i64 " + r_c + ", i8* " + sp_a + ", i64 " + val_reg + ")", False)
             m_idx = m_idx + 1
 
-        # Handle class-level decorators (not dataclass)
         d_idx = 1
         while d_idx < len(node.children):
             if node.children[d_idx].type == "DECORATOR":
                 dec_c = node.children[d_idx].children[0]
                 is_special = False
-                if dec_c.type == "NAME":
-                    if dec_c.value == "dataclass":
-                        is_special = True
-                if not is_special:
-                    decorator_c = self.gen_expr(dec_c)
-                    if mod_prefix == "":
-                        self.write_main("t_" + class_name + " = turbo_call(" + decorator_c + ", 1, (TurboObject*[]){t_" + class_name + "});")
+                if dec_c.type == "NAME" and dec_c.value == "dataclass":
+                    is_special = True
+                if not is_special and mod_prefix == "":
+                    dec_reg = self.gen_expr(dec_c, False)
+                    r_c = self.new_reg()
+                    self.emit(r_c + " = load i64, i64* @t_" + class_name, False)
+                    p_arg = self.emit_args_array([r_c], False)
+                    r_newc = self.new_reg()
+                    self.emit(r_newc + " = call i64 @turbo_call(i64 " + dec_reg + ", i32 1, i64* " + p_arg + ")", False)
+                    self.emit("store i64 " + r_newc + ", i64* @t_" + class_name, False)
             d_idx = d_idx + 1
-
-    def _gen_comp_loops(self, gen_node, container, append_code):
-        if gen_node.type == "CONST_NONE":
-            return append_code + "; "
-        targets = gen_node.value.split(',')
-        iter_c = self.gen_expr(gen_node.children[0])
-        if_cond = gen_node.children[1]
-        if_c = ""
-        if if_cond.type != "CONST_NONE":
-            if_c = "if (turbo_is_truthy(" + self.gen_expr(if_cond) + ")) "
-        next_gen = gen_node.children[2]
-        inner = ""
-        if next_gen.type != "CONST_NONE":
-            inner = self._gen_comp_loops(next_gen, container, append_code)
-        else:
-            inner = append_code + "; "
-        if len(targets) == 1:
-            sv = "TurboObject* t_" + gen_node.value + " = _lci->list_val.items[_lci_i];"
-            svt = "TurboObject* t_" + gen_node.value + " = _lci->tuple_val.items[_lci_i];"
-            svs = "char _lci_tmp[2] = {_lci->str_val.chars[_lci_i], '\\0'}; TurboObject* t_" + gen_node.value + " = make_str(_lci_tmp);"
-        else:
-            sv = "TurboObject* _lc_tmp = _lci->list_val.items[_lci_i]; "
-            svt = "TurboObject* _lc_tmp = _lci->tuple_val.items[_lci_i]; "
-            svs = ""
-            i = 0
-            while i < len(targets):
-                t = targets[i]
-                sv += "TurboObject* t_" + t + " = turbo_getitem(_lc_tmp, make_int_from_ll(" + str(i) + ")); "
-                svt += "TurboObject* t_" + t + " = turbo_getitem(_lc_tmp, make_int_from_ll(" + str(i) + ")); "
-                i = i + 1
-        code = "{ TurboObject* _lci = " + iter_c + "; "
-        code = code + "if (_lci->type == TYPE_LIST) { for (int _lci_i = 0; _lci_i < _lci->list_val.length; _lci_i++) { " + sv + if_c + "{ " + inner + " } } } "
-        code = code + "else if (_lci->type == TYPE_TUPLE) { for (int _lci_i = 0; _lci_i < _lci->tuple_val.length; _lci_i++) { " + svt + if_c + "{ " + inner + " } } } "
-        if len(targets) == 1:
-            code = code + "else if (_lci->type == TYPE_STR) { for (int _lci_i = 0; _lci_i < _lci->str_val.length; _lci_i++) { " + svs + if_c + "{ " + inner + " } } } "
-        code = code + "} "
-        return code
 
     def _load_module(self, module_name):
         if is_stdlib_module(module_name.split('.')[0]):
@@ -2226,65 +3510,28 @@ class CodeGen:
         if alias_node.type == "NAME":
             local_name = alias_node.value
         if is_stdlib_module(module_name.split('.')[0]):
-            self.write_code("/* import " + module_name + " (stdlib) */;", is_in_func)
             return
-        if module_name in self.processed_modules:
-            self.write_code("t_" + local_name + " = t_init_module_" + module_name.replace('.', '_') + "();", is_in_func)
-            return
-        module_ast = self._load_module(module_name)
-        if module_ast == None:
-            self.write_code("/* import " + module_name + " (not found) */;", is_in_func)
-            return
-        self.processed_modules.append(module_name)
-        prefix = module_name.replace('.', '_') + '_'
         init_func_name = "t_init_module_" + module_name.replace('.', '_')
-        mod_var_name = "t_module_" + module_name.replace('.', '_')
-        mod_globals = []
-        collect_globals(module_ast, mod_globals)
-        g_idx = 0
-        while g_idx < len(mod_globals):
-            g_name = mod_globals[g_idx]
-            is_builtin = False
-            b_idx = 0
-            while b_idx < len(self.builtins_list):
-                if self.builtins_list[b_idx] == g_name:
-                    is_builtin = True
-                    break
-                b_idx = b_idx + 1
-            if not is_builtin:
-                self.write_header("TurboObject* t_" + prefix + g_name + " = NULL;\n")
-            g_idx = g_idx + 1
-        self.gen_module_init(module_name, module_ast)
-        self.write_code("t_" + local_name + " = " + init_func_name + "();", is_in_func)
+        if not (module_name in self.processed_modules):
+            module_ast = self._load_module(module_name)
+            if module_ast == None:
+                return
+            self.processed_modules.append(module_name)
+            self.gen_module_init(module_name, module_ast)
+        r_mod = self.new_reg()
+        self.emit(r_mod + " = call i64 @" + init_func_name + "()", is_in_func)
+        self.emit_store_var(local_name, r_mod, is_in_func)
 
     def _gen_from_import(self, node, is_in_func):
         module_name = node.value
         imported = node.children
         if is_stdlib_module(module_name.split('.')[0]):
-            self.write_code("/* from " + module_name + " import ... (stdlib) */;", is_in_func)
             return
         if not (module_name in self.processed_modules):
             module_ast = self._load_module(module_name)
             if module_ast == None:
-                self.write_code("/* from " + module_name + " import ... (not found) */;", is_in_func)
                 return
             self.processed_modules.append(module_name)
-            prefix = module_name.replace('.', '_') + '_'
-            mod_globals = []
-            collect_globals(module_ast, mod_globals)
-            g_idx = 0
-            while g_idx < len(mod_globals):
-                g_name = mod_globals[g_idx]
-                is_builtin = False
-                b_idx = 0
-                while b_idx < len(self.builtins_list):
-                    if self.builtins_list[b_idx] == g_name:
-                        is_builtin = True
-                        break
-                    b_idx = b_idx + 1
-                if not is_builtin:
-                    self.write_header("TurboObject* t_" + prefix + g_name + " = NULL;\n")
-                g_idx = g_idx + 1
             self.gen_module_init(module_name, module_ast)
         init_func_name = "t_init_module_" + module_name.replace('.', '_')
         i_idx = 0
@@ -2292,16 +3539,42 @@ class CodeGen:
             item = imported[i_idx]
             if item.type == "NAME":
                 orig_name = item.value
-                self.write_code("t_" + orig_name + " = turbo_module_get(" + init_func_name + "(), \"" + orig_name + "\");", is_in_func)
+                r_mod = self.new_reg()
+                self.emit(r_mod + " = call i64 @" + init_func_name + "()", is_in_func)
+                sp_n = self.get_str_ptr(orig_name, is_in_func)
+                r_val = self.new_reg()
+                self.emit(r_val + " = call i64 @turbo_module_get(i64 " + r_mod + ", i8* " + sp_n + ")", is_in_func)
+                self.emit_store_var(orig_name, r_val, is_in_func)
             elif item.type == "IMPORT_AS":
                 orig_name = item.children[0].value
                 alias_name = item.children[1].value
-                self.write_code("t_" + alias_name + " = turbo_module_get(" + init_func_name + "(), \"" + orig_name + "\");", is_in_func)
+                r_mod = self.new_reg()
+                self.emit(r_mod + " = call i64 @" + init_func_name + "()", is_in_func)
+                sp_n = self.get_str_ptr(orig_name, is_in_func)
+                r_val = self.new_reg()
+                self.emit(r_val + " = call i64 @turbo_module_get(i64 " + r_mod + ", i8* " + sp_n + ")", is_in_func)
+                self.emit_store_var(alias_name, r_val, is_in_func)
             i_idx = i_idx + 1
 
     def gen_module_init(self, module_name, module_ast):
-        prefix = module_name.replace('.', '_') + '_'
-        init_func_name = "t_init_module_" + module_name.replace('.', '_')
+        mod_slug = module_name.replace('.', '_')
+        prefix = mod_slug + '_'
+        init_func_name = "t_init_module_" + mod_slug
+
+        mod_globals = []
+        collect_globals(module_ast, mod_globals)
+        g_idx = 0
+        while g_idx < len(mod_globals):
+            g_name = mod_globals[g_idx]
+            if not self.is_builtin_name(g_name):
+                self.add_global(prefix + g_name)
+            g_idx = g_idx + 1
+
+        saved_mp = self.mod_prefix
+        saved_mlg = self.mod_local_globals
+        self.mod_prefix = prefix
+        self.mod_local_globals = mod_globals
+
         stmts = module_ast.children
         s_idx = 0
         while s_idx < len(stmts):
@@ -2315,61 +3588,135 @@ class CodeGen:
                 self.gen_class_def(stmt, prefix)
                 self.is_generator = old_is_gen
             s_idx = s_idx + 1
-        self.write_header("TurboObject* " + init_func_name + "(void);\n")
-        self.funcs = self.funcs + "TurboObject* " + init_func_name + "(void) {\n"
-        self.funcs = self.funcs + "    static int _init_done = 0;\n"
-        self.funcs = self.funcs + "    static TurboObject* _mod_obj = NULL;\n"
-        self.funcs = self.funcs + "    if (_init_done) return _mod_obj;\n"
-        self.funcs = self.funcs + "    _init_done = 1;\n"
-        self.funcs = self.funcs + "    TurboObject* mod = make_module();\n"
+
+        done_g = "@" + init_func_name + "_done"
+        obj_g = "@" + init_func_name + "_obj"
+        self.raw_globals.append(done_g + " = global i32 0")
+        self.raw_globals.append(obj_g + " = global i64 -1688849860263936")
+
+        saved_cur_lines = self.cur_lines
+        saved_locals = self.local_vars
+        saved_allocas = self.local_allocas
+        saved_sized = self.sized_allocas
+        saved_typed = self.typed_allocas
+        saved_term = self.block_terminated
+
+        self.cur_lines = []
+        self.local_vars = []
+        self.local_allocas = []
+        self.sized_allocas = []
+        self.typed_allocas = []
+        self.block_terminated = False
+
+        r_done = self.new_reg()
+        self.emit(r_done + " = load i32, i32* " + done_g, True)
+        r_is_done = self.new_reg()
+        self.emit(r_is_done + " = icmp ne i32 " + r_done + ", 0", True)
+        lbl_cached = self.new_label("mod_cached")
+        lbl_init = self.new_label("mod_init")
+        self.emit_cond_br(r_is_done, lbl_cached, lbl_init, True)
+
+        self.emit_label(lbl_cached, True)
+        r_cmod = self.new_reg()
+        self.emit(r_cmod + " = load i64, i64* " + obj_g, True)
+        self.emit_ret(r_cmod, True)
+
+        self.emit_label(lbl_init, True)
+        self.emit("store i32 1, i32* " + done_g, True)
+        r_mod = self.new_reg()
+        self.emit(r_mod + " = call i64 @make_module()", True)
+
         s_idx = 0
         while s_idx < len(stmts):
             stmt = stmts[s_idx]
             if stmt.type == "DEF" or stmt.type == "ASYNC_DEF":
                 func_name = stmt.value
-                self.funcs = self.funcs + "    " + "turbo_module_set(mod, \"" + func_name + "\", make_func(t_impl_" + prefix + func_name + ", \"" + func_name + "\"));\n"
+                sp_f = self.get_str_ptr(func_name, True)
+                r_fn = self.new_reg()
+                self.emit(r_fn + " = call i64 @make_func(i64 (i32, i64*)* @t_impl_" + prefix + func_name + ", i8* " + sp_f + ")", True)
+                self.emit("store i64 " + r_fn + ", i64* @t_" + prefix + func_name, True)
+                sp_f2 = self.get_str_ptr(func_name, True)
+                self.emit("call void @turbo_module_set(i64 " + r_mod + ", i8* " + sp_f2 + ", i64 " + r_fn + ")", True)
             elif stmt.type == "CLASS":
                 class_name = stmt.value
-                self.funcs = self.funcs + "    " + "t_" + prefix + class_name + " = make_class(\"" + class_name + "\");\n"
+                sp_c = self.get_str_ptr(class_name, True)
+                r_cls = self.new_reg()
+                self.emit(r_cls + " = call i64 @make_class(i8* " + sp_c + ")", True)
+                self.emit("store i64 " + r_cls + ", i64* @t_" + prefix + class_name, True)
                 suite = stmt.children[0]
                 m_idx = 0
                 while m_idx < len(suite.children):
                     m_node = suite.children[m_idx]
                     if m_node.type == "DEF" or m_node.type == "ASYNC_DEF":
                         method_name = m_node.value
-                        self.funcs = self.funcs + "    " + "turbo_class_add_method(t_" + prefix + class_name + ", \"" + method_name + "\", t_impl_" + prefix + class_name + "_" + method_name + ");\n"
+                        sp_m = self.get_str_ptr(method_name, True)
+                        self.emit("call void @turbo_class_add_method(i64 " + r_cls + ", i8* " + sp_m + ", i64 (i32, i64*)* @t_impl_" + prefix + class_name + "_" + method_name + ")", True)
                     m_idx = m_idx + 1
-                self.funcs = self.funcs + "    " + "turbo_module_set(mod, \"" + class_name + "\", t_" + prefix + class_name + ");\n"
+                sp_c2 = self.get_str_ptr(class_name, True)
+                self.emit("call void @turbo_module_set(i64 " + r_mod + ", i8* " + sp_c2 + ", i64 " + r_cls + ")", True)
             elif stmt.type == "ASSIGN":
                 target = stmt.children[0]
                 val_node = stmt.children[1]
                 if target.type == "NAME":
                     var_name = target.value
-                    val_c = self.gen_expr(val_node)
-                    self.funcs = self.funcs + "    " + "t_" + prefix + var_name + " = " + val_c + ";\n"
-                    self.funcs = self.funcs + "    " + "turbo_module_set(mod, \"" + var_name + "\", t_" + prefix + var_name + ");\n"
+                    val_reg = self.gen_expr(val_node, True)
+                    self.emit("store i64 " + val_reg + ", i64* @t_" + prefix + var_name, True)
+                    sp_v = self.get_str_ptr(var_name, True)
+                    self.emit("call void @turbo_module_set(i64 " + r_mod + ", i8* " + sp_v + ", i64 " + val_reg + ")", True)
             elif stmt.type == "AUGASSIGN":
                 target = stmt.children[0]
                 val_node = stmt.children[1]
                 op = stmt.value
-                if target.type == "NAME":
+                if target.type == "NAME" and op == '+=':
                     var_name = target.value
-                    if op == '+=':
-                        self.funcs = self.funcs + "    t_" + prefix + var_name + " = turbo_add(t_" + prefix + var_name + ", " + self.gen_expr(val_node) + ");\n"
-                        self.funcs = self.funcs + "    turbo_module_set(mod, \"" + var_name + "\", t_" + prefix + var_name + ");\n"
+                    v_old = self.new_reg()
+                    self.emit(v_old + " = load i64, i64* @t_" + prefix + var_name, True)
+                    v_rhs = self.gen_expr(val_node, True)
+                    v_new = self.new_reg()
+                    self.emit(v_new + " = call i64 @turbo_add(i64 " + v_old + ", i64 " + v_rhs + ")", True)
+                    self.emit("store i64 " + v_new + ", i64* @t_" + prefix + var_name, True)
+                    sp_v = self.get_str_ptr(var_name, True)
+                    self.emit("call void @turbo_module_set(i64 " + r_mod + ", i8* " + sp_v + ", i64 " + v_new + ")", True)
             elif stmt.type == "EXPR":
-                expr_c = self.gen_expr(stmt.children[0])
-                self.funcs = self.funcs + "    " + "(void)(" + expr_c + ");\n"
-            elif stmt.type == "IMPORT" or stmt.type == "IMPORT_LIST" or stmt.type == "FROM_IMPORT":
-                pass
-            else:
-                pass
+                self.gen_expr(stmt.children[0], True)
             s_idx = s_idx + 1
-        self.funcs = self.funcs + "    _mod_obj = mod;\n"
-        self.funcs = self.funcs + "    return mod;\n"
-        self.funcs = self.funcs + "}\n\n"
 
-    # Native type constants
+        self.emit("store i64 " + r_mod + ", i64* " + obj_g, True)
+        self.emit_ret(r_mod, True)
+
+        fn_lines = ["define i64 @" + init_func_name + "() {", "entry:"]
+        a_i = 0
+        while a_i < len(self.local_allocas):
+            aname = self.local_allocas[a_i]
+            fn_lines.append("  %loc_" + aname + " = alloca i64")
+            fn_lines.append("  store i64 -1688849860263936, i64* %loc_" + aname)
+            a_i = a_i + 1
+        a_i = 0
+        while a_i < len(self.typed_allocas):
+            tinfo = self.typed_allocas[a_i]
+            fn_lines.append("  %loc_" + tinfo[0] + " = alloca " + tinfo[1])
+            a_i = a_i + 1
+        a_i = 0
+        while a_i < len(self.sized_allocas):
+            sinfo = self.sized_allocas[a_i]
+            fn_lines.append("  %loc_" + sinfo[0] + " = alloca [" + str(sinfo[1]) + " x i64]")
+            a_i = a_i + 1
+        c_i = 0
+        while c_i < len(self.cur_lines):
+            fn_lines.append(self.cur_lines[c_i])
+            c_i = c_i + 1
+        fn_lines.append("}")
+        self.funcs_list.append("\n".join(fn_lines))
+
+        self.cur_lines = saved_cur_lines
+        self.local_vars = saved_locals
+        self.local_allocas = saved_allocas
+        self.sized_allocas = saved_sized
+        self.typed_allocas = saved_typed
+        self.block_terminated = saved_term
+        self.mod_prefix = saved_mp
+        self.mod_local_globals = saved_mlg
+
     NATIVE_FLOAT = "float"
     NATIVE_INT = "int"
 
@@ -2402,52 +3749,246 @@ class CodeGen:
             return None
         return None
 
-    def _gen_native_expr(self, node, var_types, loop_var):
+    def _can_emit_native_expr(self, node, var_types, loop_var):
         if node.type == "CONST_INT":
-            return (node.value + "LL", CodeGen.NATIVE_INT)
+            return CodeGen.NATIVE_INT
         if node.type == "CONST_FLOAT":
-            return (node.value, CodeGen.NATIVE_FLOAT)
+            return CodeGen.NATIVE_FLOAT
         if node.type == "NAME":
             if node.value == loop_var:
-                return ("_r_i", CodeGen.NATIVE_INT)
+                return CodeGen.NATIVE_INT
+            return var_types.get(node.value, None)
+        if node.type == "UNARY" and node.value == "-":
+            return self._can_emit_native_expr(node.children[0], var_types, loop_var)
+        if node.type == "BINOP":
+            lt = self._can_emit_native_expr(node.children[0], var_types, loop_var)
+            rt = self._can_emit_native_expr(node.children[1], var_types, loop_var)
+            if lt == None or rt == None:
+                return None
+            op = node.value
+            if lt == CodeGen.NATIVE_FLOAT or rt == CodeGen.NATIVE_FLOAT:
+                if op in ('+', '-', '*', '/'):
+                    return CodeGen.NATIVE_FLOAT
+                return None
+            if lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT:
+                if op == '/':
+                    return CodeGen.NATIVE_FLOAT
+                if op in ('+', '-', '*', '//', '%'):
+                    return CodeGen.NATIVE_INT
+                return None
+        return None
+
+    def _can_emit_native_stmt(self, stmt, var_types, loop_var):
+        if stmt.type == "ASSIGN":
+            target = stmt.children[0]
+            if target.type == "NAME":
+                et = self._can_emit_native_expr(stmt.children[1], var_types, loop_var)
+                if et == None:
+                    return False
+                return var_types.get(target.value, None) != None
+            elif target.type == "TUPLE":
+                val = stmt.children[1]
+                if val.type == "TUPLE":
+                    if len(target.children) != len(val.children):
+                        return False
+                    i = 0
+                    while i < len(target.children):
+                        if target.children[i].type != "NAME":
+                            return False
+                        et = self._can_emit_native_expr(val.children[i], var_types, loop_var)
+                        if et == None:
+                            return False
+                        if var_types.get(target.children[i].value, None) == None:
+                            return False
+                        i = i + 1
+                    return True
+            return False
+        if stmt.type == "AUGASSIGN":
+            target = stmt.children[0]
+            if target.type == "NAME":
+                if not (stmt.value in ('+=', '-=', '*=', '/=')):
+                    return False
+                et = self._can_emit_native_expr(stmt.children[1], var_types, loop_var)
+                if et == None:
+                    return False
+                return var_types.get(target.value, None) != None
+        return False
+
+    def _emit_native_expr(self, node, var_types, loop_var, is_in_func):
+        if node.type == "CONST_INT":
+            return [str(int(node.value)), CodeGen.NATIVE_INT]
+        if node.type == "CONST_FLOAT":
+            return [format_llvm_float(node.value), CodeGen.NATIVE_FLOAT]
+        if node.type == "NAME":
+            if node.value == loop_var:
+                r = self.new_reg()
+                self.emit(r + " = load i64, i64* %loc__r_i", is_in_func)
+                return [r, CodeGen.NATIVE_INT]
             t = var_types.get(node.value, None)
             if t == CodeGen.NATIVE_FLOAT:
-                return ("_d_" + node.value, CodeGen.NATIVE_FLOAT)
+                r = self.new_reg()
+                self.emit(r + " = load double, double* %loc__d_" + node.value, is_in_func)
+                return [r, CodeGen.NATIVE_FLOAT]
             if t == CodeGen.NATIVE_INT:
-                return ("_i_" + node.value, CodeGen.NATIVE_INT)
-            pass
-        if node.type == "UNARY" and node.value == "-":
-            tmp0 = self._gen_native_expr(node.children[0], var_types, loop_var)
-            if tmp0 == None:
-                return None
-            inner = tmp0[0]
-            t = tmp0[1]
-            return ("(-(" + inner + "))", t)
-        if node.type == "BINOP":
-            tmp0 = self._gen_native_expr(node.children[0], var_types, loop_var)
-            if tmp0 == None:
-                return None
-            left = tmp0[0]
-            lt = tmp0[1]
-            tmp1 = self._gen_native_expr(node.children[1], var_types, loop_var)
-            if tmp1 == None:
-                return None
-            right = tmp1[0]
-            rt = tmp1[1]
-            op = node.value
-            same_int = lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT
-            if lt == CodeGen.NATIVE_FLOAT or rt == CodeGen.NATIVE_FLOAT:
-                if lt == CodeGen.NATIVE_INT:
-                    left = "(double)(" + left + ")"
-                if rt == CodeGen.NATIVE_INT:
-                    right = "(double)(" + right + ")"
-                return ("((" + left + ") " + op + " (" + right + "))", CodeGen.NATIVE_FLOAT)
-            if same_int and op == '/':
-                return ("((double)(" + left + ") / (double)(" + right + "))", CodeGen.NATIVE_FLOAT)
-            if same_int and op in ('+', '-', '*', '//', '%'):
-                return ("((" + left + ") " + op + " (" + right + "))", CodeGen.NATIVE_INT)
+                r = self.new_reg()
+                self.emit(r + " = load i64, i64* %loc__i_" + node.value, is_in_func)
+                return [r, CodeGen.NATIVE_INT]
             return None
+        if node.type == "UNARY" and node.value == "-":
+            inner = self._emit_native_expr(node.children[0], var_types, loop_var, is_in_func)
+            if inner == None:
+                return None
+            r = self.new_reg()
+            if inner[1] == CodeGen.NATIVE_FLOAT:
+                self.emit(r + " = fneg double " + inner[0], is_in_func)
+                return [r, CodeGen.NATIVE_FLOAT]
+            else:
+                self.emit(r + " = sub i64 0, " + inner[0], is_in_func)
+                return [r, CodeGen.NATIVE_INT]
+        if node.type == "BINOP":
+            l_res = self._emit_native_expr(node.children[0], var_types, loop_var, is_in_func)
+            if l_res == None:
+                return None
+            r_res = self._emit_native_expr(node.children[1], var_types, loop_var, is_in_func)
+            if r_res == None:
+                return None
+            lv = l_res[0]
+            lt = l_res[1]
+            rv = r_res[0]
+            rt = r_res[1]
+            op = node.value
+            if lt == CodeGen.NATIVE_FLOAT or rt == CodeGen.NATIVE_FLOAT or op == '/':
+                if lt == CodeGen.NATIVE_INT:
+                    r_conv = self.new_reg()
+                    self.emit(r_conv + " = sitofp i64 " + lv + " to double", is_in_func)
+                    lv = r_conv
+                if rt == CodeGen.NATIVE_INT:
+                    r_conv = self.new_reg()
+                    self.emit(r_conv + " = sitofp i64 " + rv + " to double", is_in_func)
+                    rv = r_conv
+                f_op = "fadd"
+                if op == '-':
+                    f_op = "fsub"
+                elif op == '*':
+                    f_op = "fmul"
+                elif op == '/':
+                    f_op = "fdiv"
+                r = self.new_reg()
+                self.emit(r + " = " + f_op + " double " + lv + ", " + rv, is_in_func)
+                return [r, CodeGen.NATIVE_FLOAT]
+            if lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT:
+                i_op = "add"
+                if op == '-':
+                    i_op = "sub"
+                elif op == '*':
+                    i_op = "mul"
+                elif op == '//':
+                    i_op = "sdiv"
+                elif op == '%':
+                    i_op = "srem"
+                r = self.new_reg()
+                self.emit(r + " = " + i_op + " i64 " + lv + ", " + rv, is_in_func)
+                return [r, CodeGen.NATIVE_INT]
         return None
+
+    def _emit_native_stmt(self, stmt, var_types, loop_var, is_in_func):
+        if stmt.type == "ASSIGN":
+            target = stmt.children[0]
+            if target.type == "NAME":
+                res = self._emit_native_expr(stmt.children[1], var_types, loop_var, is_in_func)
+                if res == None:
+                    return False
+                val_r = res[0]
+                vt = res[1]
+                t = var_types.get(target.value, None)
+                if t == CodeGen.NATIVE_FLOAT:
+                    if vt == CodeGen.NATIVE_INT:
+                        rc = self.new_reg()
+                        self.emit(rc + " = sitofp i64 " + val_r + " to double", is_in_func)
+                        val_r = rc
+                    self.emit("store double " + val_r + ", double* %loc__d_" + target.value, is_in_func)
+                    return True
+                if t == CodeGen.NATIVE_INT:
+                    if vt == CodeGen.NATIVE_FLOAT:
+                        rc = self.new_reg()
+                        self.emit(rc + " = fptosi double " + val_r + " to i64", is_in_func)
+                        val_r = rc
+                    self.emit("store i64 " + val_r + ", i64* %loc__i_" + target.value, is_in_func)
+                    return True
+            elif target.type == "TUPLE":
+                val = stmt.children[1]
+                if val.type == "TUPLE":
+                    eval_regs = []
+                    i = 0
+                    while i < len(target.children):
+                        res = self._emit_native_expr(val.children[i], var_types, loop_var, is_in_func)
+                        if res == None:
+                            return False
+                        vr = res[0]
+                        vt = res[1]
+                        vname = target.children[i].value
+                        lhs_t = var_types.get(vname, None)
+                        if lhs_t == CodeGen.NATIVE_FLOAT and vt == CodeGen.NATIVE_INT:
+                            rc = self.new_reg()
+                            self.emit(rc + " = sitofp i64 " + vr + " to double", is_in_func)
+                            vr = rc
+                        elif lhs_t == CodeGen.NATIVE_INT and vt == CodeGen.NATIVE_FLOAT:
+                            rc = self.new_reg()
+                            self.emit(rc + " = fptosi double " + vr + " to i64", is_in_func)
+                            vr = rc
+                        eval_regs.append(vr)
+                        i = i + 1
+                    i = 0
+                    while i < len(target.children):
+                        vname = target.children[i].value
+                        lhs_t = var_types.get(vname, None)
+                        if lhs_t == CodeGen.NATIVE_FLOAT:
+                            self.emit("store double " + eval_regs[i] + ", double* %loc__d_" + vname, is_in_func)
+                        elif lhs_t == CodeGen.NATIVE_INT:
+                            self.emit("store i64 " + eval_regs[i] + ", i64* %loc__i_" + vname, is_in_func)
+                        i = i + 1
+                    return True
+        if stmt.type == "AUGASSIGN":
+            target = stmt.children[0]
+            if target.type == "NAME":
+                res = self._emit_native_expr(stmt.children[1], var_types, loop_var, is_in_func)
+                if res == None:
+                    return False
+                val_r = res[0]
+                vt = res[1]
+                t = var_types.get(target.value, None)
+                op = stmt.value[0]
+                if t == CodeGen.NATIVE_FLOAT:
+                    if vt == CodeGen.NATIVE_INT:
+                        rc = self.new_reg()
+                        self.emit(rc + " = sitofp i64 " + val_r + " to double", is_in_func)
+                        val_r = rc
+                    cur_r = self.new_reg()
+                    self.emit(cur_r + " = load double, double* %loc__d_" + target.value, is_in_func)
+                    f_op = "fadd"
+                    if op == '-':
+                        f_op = "fsub"
+                    elif op == '*':
+                        f_op = "fmul"
+                    elif op == '/':
+                        f_op = "fdiv"
+                    new_r = self.new_reg()
+                    self.emit(new_r + " = " + f_op + " double " + cur_r + ", " + val_r, is_in_func)
+                    self.emit("store double " + new_r + ", double* %loc__d_" + target.value, is_in_func)
+                    return True
+                if t == CodeGen.NATIVE_INT:
+                    cur_r = self.new_reg()
+                    self.emit(cur_r + " = load i64, i64* %loc__i_" + target.value, is_in_func)
+                    i_op = "add"
+                    if op == '-':
+                        i_op = "sub"
+                    elif op == '*':
+                        i_op = "mul"
+                    new_r = self.new_reg()
+                    self.emit(new_r + " = " + i_op + " i64 " + cur_r + ", " + val_r, is_in_func)
+                    self.emit("store i64 " + new_r + ", i64* %loc__i_" + target.value, is_in_func)
+                    return True
+        return False
 
     def _collect_names(self, node, names):
         if node.type == "NAME":
@@ -2613,17 +4154,14 @@ class CodeGen:
                         lhs_map[elem.value] = stmt
                         lhs_keys_list.append(elem.value)
                 else:
-                    # Can't native-optimize tuple/other targets
                     return False
             s_idx = s_idx + 1
-        # Check if all stmt types are ASSIGN or AUGASSIGN
         t_idx = 0
         while t_idx < len(stmt_types):
             if stmt_types[t_idx] != "ASSIGN" and stmt_types[t_idx] != "AUGASSIGN":
                 return False
             t_idx = t_idx + 1
         op_usage = self._collect_op_usage(body_node)
-        # Fixed-point iteration
         changed = True
         while changed:
             changed = False
@@ -2640,7 +4178,6 @@ class CodeGen:
                     var_types[v] = typ
                     changed = True
                 k_idx = k_idx + 1
-        # Assign types for remaining vars using usage heuristics
         k_idx = 0
         while k_idx < len(lhs_keys_list):
             v = lhs_keys_list[k_idx]
@@ -2675,7 +4212,6 @@ class CodeGen:
                     else:
                         return False
             k_idx = k_idx + 1
-        # Refine types
         changed = True
         while changed:
             changed = False
@@ -2692,86 +4228,19 @@ class CodeGen:
                     var_types[v] = t
                     changed = True
                 k_idx = k_idx + 1
-        # Verify all vars have types
         k_idx = 0
         while k_idx < len(lhs_keys_list):
             v = lhs_keys_list[k_idx]
             if not (v in var_types):
                 return False
             k_idx = k_idx + 1
+        # Verify every statement in body_node can be emitted natively
+        s_idx = 0
+        while s_idx < len(body_node.children):
+            if not self._can_emit_native_stmt(body_node.children[s_idx], var_types, loop_var):
+                return False
+            s_idx = s_idx + 1
         return lhs_keys_list
-
-    def _gen_native_stmt(self, stmt, var_types, loop_var):
-        if stmt.type == "ASSIGN":
-            target = stmt.children[0]
-            if target.type == "NAME":
-                tmp0 = self._gen_native_expr(stmt.children[1], var_types, loop_var)
-                if tmp0 == None:
-                    return None
-                val_c = tmp0[0]
-                t = var_types.get(target.value, None)
-                if t == CodeGen.NATIVE_FLOAT:
-                    return "_d_" + target.value + " = " + val_c + ";"
-                if t == CodeGen.NATIVE_INT:
-                    return "_i_" + target.value + " = " + val_c + ";"
-            elif target.type == "TUPLE":
-                val = stmt.children[1]
-                if val.type == "TUPLE":
-                    exprs = []
-                    for i in range(len(target.children)):
-                        if i >= len(val.children):
-                            return None
-                        expr = self._gen_native_expr(val.children[i], var_types, loop_var)
-                        if expr == None:
-                            return None
-                        lhs_t = var_types.get(target.children[i].value, None)
-                        if lhs_t == None:
-                            return None
-                        expr_c = expr[0]
-                        expr_t = expr[1]
-                        if lhs_t == CodeGen.NATIVE_FLOAT and expr_t == CodeGen.NATIVE_INT:
-                            expr_c = "(double)(" + expr_c + ")"
-                            expr_t = CodeGen.NATIVE_FLOAT
-                        elif lhs_t == CodeGen.NATIVE_INT and expr_t == CodeGen.NATIVE_FLOAT:
-                            expr_c = "(long long)(" + expr_c + ")"
-                            expr_t = CodeGen.NATIVE_INT
-                        if expr_t != lhs_t:
-                            return None
-                        exprs.append(expr_c)
-                    temp_id = str(self._native_temp_counter)
-                    self._native_temp_counter += 1
-                    parts = []
-                    for i in range(len(target.children)):
-                        vname = target.children[i].value
-                        t = var_types.get(vname, None)
-                        if t == CodeGen.NATIVE_FLOAT:
-                            parts.append("double _nt" + temp_id + "_" + str(i) + " = " + exprs[i])
-                        elif t == CodeGen.NATIVE_INT:
-                            parts.append("long long _nt" + temp_id + "_" + str(i) + " = " + exprs[i])
-                    for i in range(len(target.children)):
-                        vname = target.children[i].value
-                        t = var_types.get(vname, None)
-                        if t == CodeGen.NATIVE_FLOAT:
-                            parts.append("_d_" + vname + " = _nt" + temp_id + "_" + str(i))
-                        elif t == CodeGen.NATIVE_INT:
-                            parts.append("_i_" + vname + " = _nt" + temp_id + "_" + str(i))
-                    return "{ " + "; ".join(parts) + "; }"
-        if stmt.type == "AUGASSIGN":
-            target = stmt.children[0]
-            if target.type == "NAME":
-                tmp0 = self._gen_native_expr(stmt.children[1], var_types, loop_var)
-                val_c = tmp0[0]
-                vt = tmp0[1]
-                t = var_types.get(target.value, None)
-                op = stmt.value
-                c_op = op[0]  # += -> +
-                if t == CodeGen.NATIVE_FLOAT:
-                    if vt == CodeGen.NATIVE_INT:
-                        val_c = "(double)(" + val_c + ")"
-                    return "_d_" + target.value + " = _d_" + target.value + " " + c_op + " " + val_c + ";"
-                if t == CodeGen.NATIVE_INT:
-                    return "_i_" + target.value + " = _i_" + target.value + " " + c_op + " " + val_c + ";"
-        return None
 
     def gen_block_stmts(self, block_node, is_in_func):
         stmts = block_node.children
@@ -2786,21 +4255,21 @@ class CodeGen:
             pnv = self.pending_native_vars
             native_vars = pnv[0]
             native_int_vars = pnv[1]
-            var_types = pnv[2]
-            loop_var = pnv[3]
             self.pending_native_vars = None
             for v in native_vars:
-                self.write_code("t_" + v + " = make_float(_d_" + v + ");", is_in_func)
+                rd = self.new_reg()
+                self.emit(rd + " = load double, double* %loc__d_" + v, is_in_func)
+                rb = self.emit_box_float(rd, is_in_func)
+                self.emit_store_var(v, rb, is_in_func)
             for v in native_int_vars:
-                self.write_code("t_" + v + " = make_int_from_ll(_i_" + v + ");", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-
-
+                ri = self.new_reg()
+                self.emit(ri + " = load i64, i64* %loc__i_" + v, is_in_func)
+                rb = self.emit_box_int(ri, is_in_func)
+                self.emit_store_var(v, rb, is_in_func)
 
     def gen_stmt(self, node, is_in_func):
         if node.type == "PASS":
-            self.write_code("/* pass */;", is_in_func)
+            return
         elif node.type == "IMPORT":
             self._gen_import(node, is_in_func)
         elif node.type == "IMPORT_LIST":
@@ -2811,164 +4280,225 @@ class CodeGen:
         elif node.type == "FROM_IMPORT":
             self._gen_from_import(node, is_in_func)
         elif node.type == "BREAK":
-            if len(self.else_loop_stack) > 0:
-                self.write_code(self.else_loop_stack[-1] + " = 1; break;", is_in_func)
-            else:
-                self.write_code("break;", is_in_func)
+            self._flush_pending_native(is_in_func)
+            if len(self.loop_stack) > 0:
+                top_loop = self.loop_stack[len(self.loop_stack) - 1]
+                brk_lbl = top_loop[0]
+                flag_var = top_loop[2]
+                if flag_var != "":
+                    self.emit("store i32 1, i32* %loc_" + flag_var, is_in_func)
+                self.emit_br(brk_lbl, is_in_func)
         elif node.type == "CONTINUE":
-            self.write_code("continue;", is_in_func)
+            self._flush_pending_native(is_in_func)
+            if len(self.loop_stack) > 0:
+                top_loop = self.loop_stack[len(self.loop_stack) - 1]
+                cont_lbl = top_loop[1]
+                self.emit_br(cont_lbl, is_in_func)
         elif node.type == "ANN_ASSIGN":
+            self._flush_pending_native(is_in_func)
             target_name = node.value
             default_node = node.children[1]
             if default_node.type != "CONST_NONE":
-                val_c = self.gen_expr(default_node)
-                self.write_code("t_" + target_name + " = " + val_c + ";", is_in_func)
+                val_reg = self.gen_expr(default_node, is_in_func)
+                self.emit_store_var(target_name, val_reg, is_in_func)
         elif node.type == "EXPR":
             self._flush_pending_native(is_in_func)
-            expr_c = self.gen_expr(node.children[0])
-            self.write_code("(void)(" + expr_c + ");", is_in_func)
+            self.gen_expr(node.children[0], is_in_func)
         elif node.type == "ASSIGN":
+            self._flush_pending_native(is_in_func)
             target = node.children[0]
             val_node = node.children[1]
-            # Ignore sys_argv = sys.argv for bootstrap compatibility
             is_sys_argv_setup = False
             if target.type == "NAME" and target.value == "sys_argv":
                 if val_node.type == "ATTR" and val_node.value == "argv":
                     if val_node.children[0].type == "NAME" and val_node.children[0].value == "sys":
                         is_sys_argv_setup = True
-            
             if is_sys_argv_setup:
-                self.write_code("/* ignored sys_argv = sys.argv */;", is_in_func)
-            else:
-                val_c = self.gen_expr(val_node)
-                if target.type == "NAME":
-                    self.write_code("t_" + target.value + " = " + val_c + ";", is_in_func)
-                elif target.type == "ATTR":
-                    obj_c = self.gen_expr(target.children[0])
-                    self.write_code('turbo_setattr(' + obj_c + ', "' + target.value + '", ' + val_c + ');', is_in_func)
-                elif target.type == "SUBSCRIPT":
-                    obj_c = self.gen_expr(target.children[0])
-                    idx_c = self.gen_expr(target.children[1])
-                    self.write_code('turbo_setitem(' + obj_c + ', ' + idx_c + ', ' + val_c + ');', is_in_func)
-                elif target.type == "TUPLE":
-                    self.write_code("{", is_in_func)
-                    self.indent_level = self.indent_level + 1
-                    self.write_code("TurboObject* _tmp = " + val_c + ";", is_in_func)
-                    self.write_code("int _tup_len = _tmp->type == TYPE_LIST ? _tmp->list_val.length : _tmp->tuple_val.length;", is_in_func)
-                    e_idx = 0
-                    while e_idx < len(target.children):
-                        elem = target.children[e_idx]
-                        idx_c = "make_int_from_ll(" + str(e_idx) + "LL)"
-                        if elem.type == "NAME":
-                            self.write_code("t_" + elem.value + " = (_tup_len > " + str(e_idx) + ") ? turbo_getitem(_tmp, " + idx_c + ") : turbo_none;", is_in_func)
-                        elif elem.type == "ATTR":
-                            obj_c = self.gen_expr(elem.children[0])
-                            self.write_code('if (_tup_len > ' + str(e_idx) + ') { turbo_setattr(' + obj_c + ', "' + elem.value + '", turbo_getitem(_tmp, ' + idx_c + ')); }', is_in_func)
-                        elif elem.type == "SUBSCRIPT":
-                            obj_c = self.gen_expr(elem.children[0])
-                            idx2_c = self.gen_expr(elem.children[1])
-                            self.write_code('if (_tup_len > ' + str(e_idx) + ') { turbo_setitem(' + obj_c + ', ' + idx2_c + ', turbo_getitem(_tmp, ' + idx_c + ')); }', is_in_func)
-                        elif elem.type == "TUPLE":
-                            self.write_code("{", is_in_func)
-                            self.indent_level = self.indent_level + 1
-                            self.write_code("TurboObject* _sub = turbo_getitem(_tmp, " + idx_c + ");", is_in_func)
-                            sub_idx = 0
-                            while sub_idx < len(elem.children):
-                                sub_elem = elem.children[sub_idx]
-                                sub_idx_c = "make_int_from_ll(" + str(sub_idx) + "LL)"
-                                if sub_elem.type == "NAME":
-                                    self.write_code("t_" + sub_elem.value + " = turbo_getitem(_sub, " + sub_idx_c + ");", is_in_func)
-                                sub_idx = sub_idx + 1
-                            self.indent_level = self.indent_level - 1
-                            self.write_code("}", is_in_func)
-                        e_idx = e_idx + 1
-                    self.indent_level = self.indent_level - 1
-                    self.write_code("}", is_in_func)
+                return
+            val_reg = self.gen_expr(val_node, is_in_func)
+            if target.type == "NAME":
+                self.emit_store_var(target.value, val_reg, is_in_func)
+            elif target.type == "ATTR":
+                obj_reg = self.gen_expr(target.children[0], is_in_func)
+                sp_a = self.get_str_ptr(target.value, is_in_func)
+                self.emit("call void @turbo_setattr(i64 " + obj_reg + ", i8* " + sp_a + ", i64 " + val_reg + ")", is_in_func)
+            elif target.type == "SUBSCRIPT":
+                obj_reg = self.gen_expr(target.children[0], is_in_func)
+                idx_node = target.children[1]
+                if idx_node.type == "NAME" and idx_node.value in self.range_loop_vars:
+                    ri_loc = self.range_loop_vars[idx_node.value]
+                    r_idx_i64 = self.new_reg()
+                    self.emit(r_idx_i64 + " = load i64, i64* %loc_" + ri_loc, is_in_func)
+                    self._emit_fast_list_setitem(obj_reg, r_idx_i64, val_reg, is_in_func)
+                else:
+                    idx_reg = self.gen_expr(idx_node, is_in_func)
+                    self.emit("call void @turbo_setitem(i64 " + obj_reg + ", i64 " + idx_reg + ", i64 " + val_reg + ")", is_in_func)
+            elif target.type == "TUPLE":
+                r_len_tv = self.new_reg()
+                self.emit(r_len_tv + " = call i64 @turbo_len(i64 " + val_reg + ")", is_in_func)
+                r_len = self.emit_unbox_int(r_len_tv, is_in_func)
+                e_idx = 0
+                while e_idx < len(target.children):
+                    elem = target.children[e_idx]
+                    idx_const = str(-2251799813685248 + e_idx)
+                    if elem.type == "NAME":
+                        self.emit_store_var(elem.value, "-1688849860263936", is_in_func)
+                        c_has = self.new_reg()
+                        self.emit(c_has + " = icmp sgt i64 " + r_len + ", " + str(e_idx), is_in_func)
+                        lbl_has = self.new_label("tup_has")
+                        lbl_done = self.new_label("tup_done")
+                        self.emit_cond_br(c_has, lbl_has, lbl_done, is_in_func)
+                        self.emit_label(lbl_has, is_in_func)
+                        r_it = self.new_reg()
+                        self.emit(r_it + " = call i64 @turbo_getitem(i64 " + val_reg + ", i64 " + idx_const + ")", is_in_func)
+                        self.emit_store_var(elem.value, r_it, is_in_func)
+                        self.emit_br(lbl_done, is_in_func)
+                        self.emit_label(lbl_done, is_in_func)
+                    elif elem.type == "ATTR":
+                        c_has = self.new_reg()
+                        self.emit(c_has + " = icmp sgt i64 " + r_len + ", " + str(e_idx), is_in_func)
+                        lbl_has = self.new_label("tup_has")
+                        lbl_done = self.new_label("tup_done")
+                        self.emit_cond_br(c_has, lbl_has, lbl_done, is_in_func)
+                        self.emit_label(lbl_has, is_in_func)
+                        obj_reg = self.gen_expr(elem.children[0], is_in_func)
+                        r_it = self.new_reg()
+                        self.emit(r_it + " = call i64 @turbo_getitem(i64 " + val_reg + ", i64 " + idx_const + ")", is_in_func)
+                        sp_a = self.get_str_ptr(elem.value, is_in_func)
+                        self.emit("call void @turbo_setattr(i64 " + obj_reg + ", i8* " + sp_a + ", i64 " + r_it + ")", is_in_func)
+                        self.emit_br(lbl_done, is_in_func)
+                        self.emit_label(lbl_done, is_in_func)
+                    elif elem.type == "SUBSCRIPT":
+                        c_has = self.new_reg()
+                        self.emit(c_has + " = icmp sgt i64 " + r_len + ", " + str(e_idx), is_in_func)
+                        lbl_has = self.new_label("tup_has")
+                        lbl_done = self.new_label("tup_done")
+                        self.emit_cond_br(c_has, lbl_has, lbl_done, is_in_func)
+                        self.emit_label(lbl_has, is_in_func)
+                        obj_reg = self.gen_expr(elem.children[0], is_in_func)
+                        idx2_reg = self.gen_expr(elem.children[1], is_in_func)
+                        r_it = self.new_reg()
+                        self.emit(r_it + " = call i64 @turbo_getitem(i64 " + val_reg + ", i64 " + idx_const + ")", is_in_func)
+                        self.emit("call void @turbo_setitem(i64 " + obj_reg + ", i64 " + idx2_reg + ", i64 " + r_it + ")", is_in_func)
+                        self.emit_br(lbl_done, is_in_func)
+                        self.emit_label(lbl_done, is_in_func)
+                    elif elem.type == "TUPLE":
+                        r_sub = self.new_reg()
+                        self.emit(r_sub + " = call i64 @turbo_getitem(i64 " + val_reg + ", i64 " + idx_const + ")", is_in_func)
+                        sub_idx = 0
+                        while sub_idx < len(elem.children):
+                            sub_elem = elem.children[sub_idx]
+                            sub_idx_const = str(-2251799813685248 + sub_idx)
+                            if sub_elem.type == "NAME":
+                                r_sub_it = self.new_reg()
+                                self.emit(r_sub_it + " = call i64 @turbo_getitem(i64 " + r_sub + ", i64 " + sub_idx_const + ")", is_in_func)
+                                self.emit_store_var(sub_elem.value, r_sub_it, is_in_func)
+                            sub_idx = sub_idx + 1
+                    e_idx = e_idx + 1
         elif node.type == "AUGASSIGN":
             if self.pending_native_vars != None:
                 pnv = self.pending_native_vars
-                native_vars = pnv[0]
-                native_int_vars = pnv[1]
                 var_types = pnv[2]
                 loop_var = pnv[3]
-                ns = self._gen_native_stmt(node, var_types, loop_var)
-                if ns != None:
-                    self.write_code(ns, is_in_func)
+                if self._can_emit_native_stmt(node, var_types, loop_var):
+                    self._emit_native_stmt(node, var_types, loop_var, is_in_func)
                     return
             self._flush_pending_native(is_in_func)
             target = node.children[0]
-            val_c = self.gen_expr(node.children[1])
+            val_reg = self.gen_expr(node.children[1], is_in_func)
             op = node.value
             if target.type == "NAME":
+                old_reg = self.emit_load_var(target.value, is_in_func)
+                fn = "@turbo_add"
                 if op == '+=':
-                    self.write_code("t_" + target.value + " = turbo_add(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_add"
                 elif op == '-=':
-                    self.write_code("t_" + target.value + " = turbo_sub(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_sub"
                 elif op == '*=':
-                    self.write_code("t_" + target.value + " = turbo_mul(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_mul"
                 elif op == '/=':
-                    self.write_code("t_" + target.value + " = turbo_div(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_div"
                 elif op == '%=':
-                    self.write_code("t_" + target.value + " = turbo_mod(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_mod"
                 elif op == '**=':
-                    self.write_code("t_" + target.value + " = turbo_pow(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_pow"
                 elif op == '//=':
-                    self.write_code("t_" + target.value + " = turbo_floordiv(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_floordiv"
                 elif op == '&=':
-                    self.write_code("t_" + target.value + " = turbo_bitand(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_bitand"
                 elif op == '|=':
-                    self.write_code("t_" + target.value + " = turbo_bitor(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_bitor"
                 elif op == '^=':
-                    self.write_code("t_" + target.value + " = turbo_bitxor(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_bitxor"
                 elif op == '>>=':
-                    self.write_code("t_" + target.value + " = turbo_rshift(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_rshift"
                 elif op == '<<=':
-                    self.write_code("t_" + target.value + " = turbo_lshift(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_lshift"
                 elif op == '@=':
-                    self.write_code("t_" + target.value + " = turbo_matmul(t_" + target.value + ", " + val_c + ");", is_in_func)
+                    fn = "@turbo_matmul"
+                new_reg = self.new_reg()
+                self.emit(new_reg + " = call i64 " + fn + "(i64 " + old_reg + ", i64 " + val_reg + ")", is_in_func)
+                self.emit_store_var(target.value, new_reg, is_in_func)
         elif node.type == "RETURN":
             self._flush_pending_native(is_in_func)
             if self.is_generator and node.children[0].type != "CONST_NONE":
-                self.gen_expr(node.children[0])
+                self.gen_expr(node.children[0], is_in_func)
             if self.is_generator:
-                self.write_code("return __yield_values;", is_in_func)
+                r_yv = self.new_reg()
+                self.emit(r_yv + " = load i64, i64* %loc___yield_values", is_in_func)
+                self.emit_ret(r_yv, is_in_func)
             else:
-                val_c = self.gen_expr(node.children[0])
-                self.write_code("return " + val_c + ";", is_in_func)
+                val_reg = self.gen_expr(node.children[0], is_in_func)
+                self.emit_ret(val_reg, is_in_func)
         elif node.type == "WHILE":
             self._flush_pending_native(is_in_func)
-            cond_c = self.gen_expr(node.children[0])
-            if len(node.children) > 2:
-                flag_name = "_turbo_brk_" + str(self.else_loop_counter)
-                self.else_loop_counter = self.else_loop_counter + 1
-                self.else_loop_stack.append(flag_name)
-                self.write_code("{", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.write_code("int " + flag_name + " = 0;", is_in_func)
-                self.write_code("while (turbo_is_truthy(" + cond_c + ")) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.gen_block_stmts(node.children[1], is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                self.write_code("if (!" + flag_name + ") {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.gen_block_stmts(node.children[2], is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                self.else_loop_stack.pop()
+            do_else = len(node.children) > 2
+            lbl_cond = self.new_label("while_cond")
+            lbl_body = self.new_label("while_body")
+            lbl_after = self.new_label("while_after")
+            lbl_end = self.new_label("while_end")
+            flag_var = ""
+            if do_else:
+                self.reg_counter = self.reg_counter + 1
+                flag_var = "_w_brk_" + str(self.reg_counter)
+                self.ensure_typed_alloca(flag_var, "i32", is_in_func)
+                self.emit("store i32 0, i32* %loc_" + flag_var, is_in_func)
+                self.loop_stack.append([lbl_after, lbl_cond, flag_var])
             else:
-                self.write_code("while (turbo_is_truthy(" + cond_c + ")) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.gen_block_stmts(node.children[1], is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
+                self.loop_stack.append([lbl_end, lbl_cond, ""])
+
+            self.emit_label(lbl_cond, is_in_func)
+            cond_reg = self.gen_expr(node.children[0], is_in_func)
+            c_i1 = self.emit_truthy_i1(cond_reg, is_in_func)
+            if do_else:
+                self.emit_cond_br(c_i1, lbl_body, lbl_after, is_in_func)
+            else:
+                self.emit_cond_br(c_i1, lbl_body, lbl_end, is_in_func)
+
+            self.emit_label(lbl_body, is_in_func)
+            self.gen_block_stmts(node.children[1], is_in_func)
+            self.emit_br(lbl_cond, is_in_func)
+            self.loop_stack.pop()
+
+            if do_else:
+                self.emit_label(lbl_after, is_in_func)
+                r_flg = self.new_reg()
+                self.emit(r_flg + " = load i32, i32* %loc_" + flag_var, is_in_func)
+                r_no_brk = self.new_reg()
+                self.emit(r_no_brk + " = icmp eq i32 " + r_flg + ", 0", is_in_func)
+                lbl_else = self.new_label("while_else")
+                self.emit_cond_br(r_no_brk, lbl_else, lbl_end, is_in_func)
+                self.emit_label(lbl_else, is_in_func)
+                self.gen_block_stmts(node.children[2], is_in_func)
+                self.emit_br(lbl_end, is_in_func)
+
+            self.emit_label(lbl_end, is_in_func)
+
         elif node.type == "FOR":
+            self._flush_pending_native(is_in_func)
             var_name = node.value
             iter_node = node.children[0]
             do_else = len(node.children) > 2
-            # Detect for VAR in range(ARGS) for native loop
             is_range_loop = False
             range_start = "0"
             range_stop = ""
@@ -2977,11 +4507,11 @@ class CodeGen:
                 if len(rargs) >= 1 and len(rargs) <= 2 and not do_else:
                     if len(rargs) == 1:
                         is_range_loop = True
-                        range_stop = self._gen_range_bound(rargs[0])
+                        range_stop = self._gen_range_bound(rargs[0], is_in_func)
                     elif len(rargs) == 2:
                         is_range_loop = True
-                        range_start = self._gen_range_bound(rargs[0])
-                        range_stop = self._gen_range_bound(rargs[1])
+                        range_start = self._gen_range_bound(rargs[0], is_in_func)
+                        range_stop = self._gen_range_bound(rargs[1], is_in_func)
             if is_range_loop:
                 body_node = node.children[1]
                 var_types = {}
@@ -2993,18 +4523,23 @@ class CodeGen:
                         if not (_k in var_types):
                             var_types[_k] = self._var_types[_k]
                     _idx = _idx + 1
-                can_native = self._scan_body_vars(body_node, var_types, var_name)
                 lhs_keys_list = self._scan_body_vars(body_node, var_types, var_name)
                 if lhs_keys_list != False:
                     native_vars = []
                     native_int_vars = []
-                    # Collect var_types keys: lhs_keys_list + loop_var
                     all_keys = [var_name]
                     a_idx = 0
                     while a_idx < len(lhs_keys_list):
                         k = lhs_keys_list[a_idx]
                         if k != var_name:
-                            all_keys.append(k)
+                            Found_k = False
+                            fk_i = 0
+                            while fk_i < len(all_keys):
+                                if all_keys[fk_i] == k:
+                                    Found_k = True
+                                fk_i = fk_i + 1
+                            if not Found_k:
+                                all_keys.append(k)
                         a_idx = a_idx + 1
                     vk_idx = 0
                     while vk_idx < len(all_keys):
@@ -3015,185 +4550,249 @@ class CodeGen:
                         if k != var_name and v == CodeGen.NATIVE_INT:
                             native_int_vars.append(k)
                         vk_idx = vk_idx + 1
-                    self.write_code("{", is_in_func)
-                    self.indent_level = self.indent_level + 1
                     for v in native_vars:
-                        self.write_code("double _d_" + v + " = to_double(t_" + v + ");", is_in_func)
+                        self.ensure_typed_alloca("_d_" + v, "double", is_in_func)
+                        tv_r = self.emit_load_var(v, is_in_func)
+                        dbl_r = self.new_reg()
+                        self.emit(dbl_r + " = call double @to_double(i64 " + tv_r + ")", is_in_func)
+                        self.emit("store double " + dbl_r + ", double* %loc__d_" + v, is_in_func)
                     for v in native_int_vars:
-                        self.write_code("long long _i_" + v + " = int_to_ll(t_" + v + ");", is_in_func)
-                    self.write_code("long long _r_start = " + range_start + ";", is_in_func)
-                    self.write_code("long long _r_stop = " + range_stop + ";", is_in_func)
-                    self.write_code("for (long long _r_i = _r_start; _r_i < _r_stop; _r_i++) {", is_in_func)
-                    self.indent_level = self.indent_level + 1
+                        self.ensure_typed_alloca("_i_" + v, "i64", is_in_func)
+                        tv_r = self.emit_load_var(v, is_in_func)
+                        i_r = self.emit_unbox_int(tv_r, is_in_func)
+                        self.emit("store i64 " + i_r + ", i64* %loc__i_" + v, is_in_func)
+                    self.ensure_typed_alloca("_r_i", "i64", is_in_func)
+                    self.emit("store i64 " + range_start + ", i64* %loc__r_i", is_in_func)
+                    lbl_cond = self.new_label("nat_for_cond")
+                    lbl_body = self.new_label("nat_for_body")
+                    lbl_end = self.new_label("nat_for_end")
+                    self.emit_label(lbl_cond, is_in_func)
+                    r_ri = self.new_reg()
+                    self.emit(r_ri + " = load i64, i64* %loc__r_i", is_in_func)
+                    r_cmp = self.new_reg()
+                    self.emit(r_cmp + " = icmp slt i64 " + r_ri + ", " + range_stop, is_in_func)
+                    self.emit_cond_br(r_cmp, lbl_body, lbl_end, is_in_func)
+                    self.emit_label(lbl_body, is_in_func)
                     s_idx = 0
                     while s_idx < len(body_node.children):
-                        stmt_c = self._gen_native_stmt(body_node.children[s_idx], var_types, var_name)
-                        self.write_code(stmt_c, is_in_func)
+                        self._emit_native_stmt(body_node.children[s_idx], var_types, var_name, is_in_func)
                         s_idx = s_idx + 1
-                    self.indent_level = self.indent_level - 1
-                    self.write_code("}", is_in_func)
-                    # Defer boxing so following statements can use native vars
-                    self.pending_native_vars = (native_vars, native_int_vars, var_types, var_name)
+                    r_ri2 = self.new_reg()
+                    self.emit(r_ri2 + " = load i64, i64* %loc__r_i", is_in_func)
+                    r_rinext = self.new_reg()
+                    self.emit(r_rinext + " = add i64 " + r_ri2 + ", 1", is_in_func)
+                    self.emit("store i64 " + r_rinext + ", i64* %loc__r_i", is_in_func)
+                    self.emit_br(lbl_cond, is_in_func)
+                    self.emit_label(lbl_end, is_in_func)
+                    self.pending_native_vars = [native_vars, native_int_vars, var_types, var_name]
                 else:
-                    self.write_code("{", is_in_func)
-                    self.indent_level = self.indent_level + 1
-                    self.write_code("long long _r_start = " + range_start + ";", is_in_func)
-                    self.write_code("long long _r_stop = " + range_stop + ";", is_in_func)
-                    self.write_code("for (long long _r_i = _r_start; _r_i < _r_stop; _r_i++) {", is_in_func)
-                    self.indent_level = self.indent_level + 1
-                    self.write_code("t_" + var_name + " = make_int_from_ll(_r_i);", is_in_func)
+                    self.reg_counter = self.reg_counter + 1
+                    ri_var = "_rng_i_" + str(self.reg_counter)
+                    self.ensure_typed_alloca(ri_var, "i64", is_in_func)
+                    self.emit("store i64 " + range_start + ", i64* %loc_" + ri_var, is_in_func)
+                    lbl_cond = self.new_label("rng_cond")
+                    lbl_body = self.new_label("rng_body")
+                    lbl_inc = self.new_label("rng_inc")
+                    lbl_end = self.new_label("rng_end")
+                    self.loop_stack.append([lbl_end, lbl_inc, ""])
+                    self.emit_label(lbl_cond, is_in_func)
+                    r_ri = self.new_reg()
+                    self.emit(r_ri + " = load i64, i64* %loc_" + ri_var, is_in_func)
+                    r_cmp = self.new_reg()
+                    self.emit(r_cmp + " = icmp slt i64 " + r_ri + ", " + range_stop, is_in_func)
+                    self.emit_cond_br(r_cmp, lbl_body, lbl_end, is_in_func)
+                    self.emit_label(lbl_body, is_in_func)
+                    r_boxed = self.emit_box_int(r_ri, is_in_func)
+                    self.emit_store_var(var_name, r_boxed, is_in_func)
+                    saved_rlv = None
+                    if var_name in self.range_loop_vars:
+                        saved_rlv = self.range_loop_vars[var_name]
+                    self.range_loop_vars[var_name] = ri_var
                     self.gen_block_stmts(body_node, is_in_func)
-                    self.indent_level = self.indent_level - 1
-                    self.write_code("}", is_in_func)
-                    self.indent_level = self.indent_level - 1
-                    self.write_code("}", is_in_func)
+                    if saved_rlv != None:
+                        self.range_loop_vars[var_name] = saved_rlv
+                    elif var_name in self.range_loop_vars:
+                        del self.range_loop_vars[var_name]
+                    self.emit_label(lbl_inc, is_in_func)
+                    r_ri2 = self.new_reg()
+                    self.emit(r_ri2 + " = load i64, i64* %loc_" + ri_var, is_in_func)
+                    r_rinext = self.new_reg()
+                    self.emit(r_rinext + " = add i64 " + r_ri2 + ", 1", is_in_func)
+                    self.emit("store i64 " + r_rinext + ", i64* %loc_" + ri_var, is_in_func)
+                    self.emit_br(lbl_cond, is_in_func)
+                    self.loop_stack.pop()
+                    self.emit_label(lbl_end, is_in_func)
             else:
-                iter_c = self.gen_expr(iter_node)
+                iter_reg = self.gen_expr(iter_node, is_in_func)
+                flag_var = ""
                 if do_else:
-                    flag_name = "_turbo_brk_" + str(self.else_loop_counter)
-                    self.else_loop_counter = self.else_loop_counter + 1
-                    self.else_loop_stack.append(flag_name)
-                self.write_code("{", is_in_func)
-                self.indent_level = self.indent_level + 1
+                    self.reg_counter = self.reg_counter + 1
+                    flag_var = "_f_brk_" + str(self.reg_counter)
+                    self.ensure_typed_alloca(flag_var, "i32", is_in_func)
+                    self.emit("store i32 0, i32* %loc_" + flag_var, is_in_func)
+                iter_state = self._emit_iter_header(iter_reg, is_in_func)
+                r_elem = iter_state[0]
+                lbl_inc = iter_state[3]
+                lbl_end = iter_state[4]
+                self.loop_stack.append([lbl_end, lbl_inc, flag_var])
+                self.emit_store_var(var_name, r_elem, is_in_func)
+                self.gen_block_stmts(node.children[1], is_in_func)
+                self.loop_stack.pop()
+                self._emit_iter_footer(iter_state, is_in_func)
                 if do_else:
-                    self.write_code("int " + flag_name + " = 0;", is_in_func)
-                self.write_code("TurboObject* _iter = " + iter_c + ";", is_in_func)
-                self.write_code("if (_iter->type == TYPE_LIST) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.write_code("for (int _i = 0; _i < _iter->list_val.length; _i++) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.write_code("t_" + var_name + " = _iter->list_val.items[_i];", is_in_func)
-                self.gen_block_stmts(node.children[1], is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("} else if (_iter->type == TYPE_TUPLE) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.write_code("for (int _i = 0; _i < _iter->tuple_val.length; _i++) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.write_code("t_" + var_name + " = _iter->tuple_val.items[_i];", is_in_func)
-                self.gen_block_stmts(node.children[1], is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("} else if (_iter->type == TYPE_STR) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.write_code("for (int _i = 0; _i < _iter->str_val.length; _i++) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.write_code("char _tmp[2] = {_iter->str_val.chars[_i], '\\0'};", is_in_func)
-                self.write_code("t_" + var_name + " = make_str(_tmp);", is_in_func)
-                self.gen_block_stmts(node.children[1], is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                if do_else:
-                    self.write_code("if (!" + flag_name + ") {", is_in_func)
-                    self.indent_level = self.indent_level + 1
+                    r_flg = self.new_reg()
+                    self.emit(r_flg + " = load i32, i32* %loc_" + flag_var, is_in_func)
+                    r_no_brk = self.new_reg()
+                    self.emit(r_no_brk + " = icmp eq i32 " + r_flg + ", 0", is_in_func)
+                    lbl_else = self.new_label("for_else")
+                    lbl_done = self.new_label("for_done")
+                    self.emit_cond_br(r_no_brk, lbl_else, lbl_done, is_in_func)
+                    self.emit_label(lbl_else, is_in_func)
                     self.gen_block_stmts(node.children[2], is_in_func)
-                    self.indent_level = self.indent_level - 1
-                    self.write_code("}", is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                if do_else:
-                    self.else_loop_stack.pop()
+                    self.emit_br(lbl_done, is_in_func)
+                    self.emit_label(lbl_done, is_in_func)
         elif node.type == "ASYNC_FOR":
             self.gen_stmt(ASTNode("FOR", node.value, node.children), is_in_func)
         elif node.type == "IF":
             self._flush_pending_native(is_in_func)
-            cond_c = self.gen_expr(node.children[0])
-            self.write_code("if (turbo_is_truthy(" + cond_c + ")) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.gen_block_stmts(node.children[1], is_in_func)
-            self.indent_level = self.indent_level - 1
+            cond_reg = self.gen_expr(node.children[0], is_in_func)
+            c_i1 = self.emit_truthy_i1(cond_reg, is_in_func)
+            lbl_then = self.new_label("if_then")
+            lbl_else = self.new_label("if_else")
+            lbl_end = self.new_label("if_end")
             if len(node.children) >= 3:
+                self.emit_cond_br(c_i1, lbl_then, lbl_else, is_in_func)
+                self.emit_label(lbl_then, is_in_func)
+                self.gen_block_stmts(node.children[1], is_in_func)
+                self.emit_br(lbl_end, is_in_func)
+                self.emit_label(lbl_else, is_in_func)
                 else_node = node.children[2]
                 if else_node.type == "IF":
-                    self.write_code("} else {", is_in_func)
-                    self.indent_level = self.indent_level + 1
                     self.gen_stmt(else_node, is_in_func)
-                    self.indent_level = self.indent_level - 1
                 else:
-                    self.write_code("} else {", is_in_func)
-                    self.indent_level = self.indent_level + 1
                     self.gen_block_stmts(else_node, is_in_func)
-                    self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
+                self.emit_br(lbl_end, is_in_func)
+                self.emit_label(lbl_end, is_in_func)
+            else:
+                self.emit_cond_br(c_i1, lbl_then, lbl_end, is_in_func)
+                self.emit_label(lbl_then, is_in_func)
+                self.gen_block_stmts(node.children[1], is_in_func)
+                self.emit_br(lbl_end, is_in_func)
+                self.emit_label(lbl_end, is_in_func)
         elif node.type == "RAISE":
             self._flush_pending_native(is_in_func)
-            val_c = self.gen_expr(node.children[0])
-            self.write_code("turbo_raise(" + val_c + ");", is_in_func)
+            val_reg = self.gen_expr(node.children[0], is_in_func)
+            self.emit("call void @turbo_raise(i64 " + val_reg + ")", is_in_func)
         elif node.type == "ASSERT":
             self._flush_pending_native(is_in_func)
-            test_c = self.gen_expr(node.children[0])
+            test_reg = self.gen_expr(node.children[0], is_in_func)
+            c_i1 = self.emit_truthy_i1(test_reg, is_in_func)
+            lbl_ok = self.new_label("assert_ok")
+            lbl_fail = self.new_label("assert_fail")
+            self.emit_cond_br(c_i1, lbl_ok, lbl_fail, is_in_func)
+            self.emit_label(lbl_fail, is_in_func)
             if node.children[1].type == "CONST_NONE":
-                self.write_code("if (!turbo_is_truthy(" + test_c + ")) { fprintf(stderr, \"AssertionError\\n\"); exit(1); }", is_in_func)
+                self.emit("call void @turbo_assert_fail(i64 -1688849860263936)", is_in_func)
             else:
-                msg_c = self.gen_expr(node.children[1])
-                self.write_code("if (!turbo_is_truthy(" + test_c + ")) { TurboObject* _amsg = turbo_str(" + msg_c + "); fprintf(stderr, \"AssertionError: %s\\n\", _amsg->str_val.chars); exit(1); }", is_in_func)
+                msg_reg = self.gen_expr(node.children[1], is_in_func)
+                self.emit("call void @turbo_assert_fail(i64 " + msg_reg + ")", is_in_func)
+            self.emit_br(lbl_ok, is_in_func)
+            self.emit_label(lbl_ok, is_in_func)
         elif node.type == "DEL":
             self._flush_pending_native(is_in_func)
             target = node.children[0]
             if target.type == "SUBSCRIPT":
-                obj_c = self.gen_expr(target.children[0])
-                idx_c = self.gen_expr(target.children[1])
-                self.write_code("turbo_delitem(" + obj_c + ", " + idx_c + ");", is_in_func)
+                obj_reg = self.gen_expr(target.children[0], is_in_func)
+                idx_reg = self.gen_expr(target.children[1], is_in_func)
+                self.emit("call void @turbo_delitem(i64 " + obj_reg + ", i64 " + idx_reg + ")", is_in_func)
             elif target.type == "NAME":
-                self.write_code("t_" + target.value + " = turbo_none;", is_in_func)
-            else:
-                self.write_code("/* del */", is_in_func)
-        elif node.type == "GLOBAL":
-            if is_in_func:
-                self.write_code("/* global: names resolved to module scope */", is_in_func)
-        elif node.type == "NONLOCAL":
-            if is_in_func:
-                self.write_code("/* nonlocal: names resolved to enclosing function scope */", is_in_func)
+                self.emit_store_var(target.value, "-1688849860263936", is_in_func)
+        elif node.type == "GLOBAL" or node.type == "NONLOCAL":
+            return
         elif node.type == "WITH":
             self._flush_pending_native(is_in_func)
-            expr_c = self.gen_expr(node.children[0])
+            cm_reg = self.gen_expr(node.children[0], is_in_func)
             alias_node = node.children[1]
             body = node.children[2]
-            self.write_code("{", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("TurboObject* _cm = " + expr_c + ";", is_in_func)
+            self.reg_counter = self.reg_counter + 1
+            uid = str(self.reg_counter)
+            cm_var = "_with_cm_" + uid
+            had_var = "_with_had_" + uid
+            exc_var = "_with_exc_" + uid
+            self.ensure_alloca(cm_var, is_in_func)
+            self.ensure_typed_alloca(had_var, "i32", is_in_func)
+            self.ensure_alloca(exc_var, is_in_func)
+            self.emit("store i64 " + cm_reg + ", i64* %loc_" + cm_var, is_in_func)
+            self.emit("store i32 0, i32* %loc_" + had_var, is_in_func)
+            self.emit("store i64 -1688849860263936, i64* %loc_" + exc_var, is_in_func)
+
+            sp_enter = self.get_str_ptr("__enter__", is_in_func)
+            r_enter = self.new_reg()
+            self.emit(r_enter + " = call i64 @turbo_call_method(i64 " + cm_reg + ", i8* " + sp_enter + ", i32 0, i64* null)", is_in_func)
             if alias_node.type == "NAME":
-                self.write_code("t_" + alias_node.value + " = turbo_call_method(_cm, \"__enter__\", 0, NULL);", is_in_func)
-            else:
-                self.write_code("turbo_call_method(_cm, \"__enter__\", 0, NULL);", is_in_func)
-            self.write_code("int _exc_had = 0;", is_in_func)
-            self.write_code("TurboObject* _exc_val = turbo_none;", is_in_func)
-            self.write_code("jmp_buf* _saved_jmp = turbo_exception_jmp;", is_in_func)
-            self.write_code("jmp_buf _try_jmp;", is_in_func)
-            self.write_code("turbo_exception_jmp = &_try_jmp;", is_in_func)
-            self.write_code("turbo_exception_value = turbo_none;", is_in_func)
-            self.write_code("if (setjmp(_try_jmp) == 0) {", is_in_func)
-            self.indent_level = self.indent_level + 1
+                self.emit_store_var(alias_node.value, r_enter, is_in_func)
+
+            r_jb = self.new_reg()
+            self.emit(r_jb + " = call i8* @turbo_try_push()", is_in_func)
+            r_sj = self.new_reg()
+            self.emit(r_sj + " = call i32 @setjmp(i8* " + r_jb + ")", is_in_func)
+            r_is_exc = self.new_reg()
+            self.emit(r_is_exc + " = icmp ne i32 " + r_sj + ", 0", is_in_func)
+            lbl_try = self.new_label("with_try")
+            lbl_catch = self.new_label("with_catch")
+            lbl_after = self.new_label("with_after")
+            self.emit_cond_br(r_is_exc, lbl_catch, lbl_try, is_in_func)
+
+            self.emit_label(lbl_try, is_in_func)
+            self.try_depth = self.try_depth + 1
             self.gen_block_stmts(body, is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("} else {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("_exc_had = 1;", is_in_func)
-            self.write_code("_exc_val = turbo_exception_value;", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            self.write_code("turbo_exception_jmp = _saved_jmp;", is_in_func)
-            self.write_code("if (_exc_had) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("TurboObject* _exc_type = _exc_val;", is_in_func)
-            self.write_code("if (_exc_val->type == TYPE_INSTANCE) _exc_type = _exc_val->inst_val.class_obj;", is_in_func)
-            self.write_code("if (!turbo_is_truthy(turbo_call_method(_cm, \"__exit__\", 3, (TurboObject*[]){_exc_type, _exc_val, turbo_none}))) {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("turbo_raise(_exc_val);", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("} else {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("turbo_call_method(_cm, \"__exit__\", 3, (TurboObject*[]){turbo_none, turbo_none, turbo_none});", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
+            self.try_depth = self.try_depth - 1
+            self.emit("call void @turbo_try_pop()", is_in_func)
+            self.emit_br(lbl_after, is_in_func)
+
+            self.emit_label(lbl_catch, is_in_func)
+            self.emit("call void @turbo_try_pop()", is_in_func)
+            self.emit("store i32 1, i32* %loc_" + had_var, is_in_func)
+            r_ge = self.new_reg()
+            self.emit(r_ge + " = call i64 @turbo_get_exception()", is_in_func)
+            self.emit("store i64 " + r_ge + ", i64* %loc_" + exc_var, is_in_func)
+            self.emit_br(lbl_after, is_in_func)
+
+            self.emit_label(lbl_after, is_in_func)
+            r_had = self.new_reg()
+            self.emit(r_had + " = load i32, i32* %loc_" + had_var, is_in_func)
+            r_had_cmp = self.new_reg()
+            self.emit(r_had_cmp + " = icmp ne i32 " + r_had + ", 0", is_in_func)
+            lbl_whad = self.new_label("with_exc")
+            lbl_wnorm = self.new_label("with_norm")
+            lbl_wend = self.new_label("with_end")
+            self.emit_cond_br(r_had_cmp, lbl_whad, lbl_wnorm, is_in_func)
+
+            self.emit_label(lbl_whad, is_in_func)
+            r_cm2 = self.new_reg()
+            self.emit(r_cm2 + " = load i64, i64* %loc_" + cm_var, is_in_func)
+            r_ev = self.new_reg()
+            self.emit(r_ev + " = load i64, i64* %loc_" + exc_var, is_in_func)
+            p_eargs = self.emit_args_array([r_ev, r_ev, "-1688849860263936"], is_in_func)
+            sp_exit1 = self.get_str_ptr("__exit__", is_in_func)
+            r_exres = self.new_reg()
+            self.emit(r_exres + " = call i64 @turbo_call_method(i64 " + r_cm2 + ", i8* " + sp_exit1 + ", i32 3, i64* " + p_eargs + ")", is_in_func)
+            c_supp = self.emit_truthy_i1(r_exres, is_in_func)
+            lbl_reraise = self.new_label("with_reraise")
+            self.emit_cond_br(c_supp, lbl_wend, lbl_reraise, is_in_func)
+            self.emit_label(lbl_reraise, is_in_func)
+            self.emit("call void @turbo_raise(i64 " + r_ev + ")", is_in_func)
+            self.emit_br(lbl_wend, is_in_func)
+
+            self.emit_label(lbl_wnorm, is_in_func)
+            r_cm3 = self.new_reg()
+            self.emit(r_cm3 + " = load i64, i64* %loc_" + cm_var, is_in_func)
+            p_nargs = self.emit_args_array(["-1688849860263936", "-1688849860263936", "-1688849860263936"], is_in_func)
+            sp_exit2 = self.get_str_ptr("__exit__", is_in_func)
+            self.emit("call i64 @turbo_call_method(i64 " + r_cm3 + ", i8* " + sp_exit2 + ", i32 3, i64* " + p_nargs + ")", is_in_func)
+            self.emit_br(lbl_wend, is_in_func)
+
+            self.emit_label(lbl_wend, is_in_func)
         elif node.type == "ASYNC_WITH":
             self.gen_stmt(ASTNode("WITH", "", node.children), is_in_func)
         elif node.type == "TRY":
@@ -3202,141 +4801,354 @@ class CodeGen:
             handlers_node = node.children[1]
             else_body = node.children[2]
             finally_body = node.children[3]
-            self.write_code("{", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("int _exc_had = 0;", is_in_func)
-            self.write_code("int _exc_handled = 0;", is_in_func)
-            self.write_code("TurboObject* _exc_val = turbo_none;", is_in_func)
-            self.write_code("jmp_buf* _saved_jmp = turbo_exception_jmp;", is_in_func)
-            self.write_code("jmp_buf _try_jmp;", is_in_func)
-            self.write_code("turbo_exception_jmp = &_try_jmp;", is_in_func)
-            self.write_code("turbo_exception_value = turbo_none;", is_in_func)
-            self.write_code("if (setjmp(_try_jmp) == 0) {", is_in_func)
-            self.indent_level = self.indent_level + 1
+
+            self.reg_counter = self.reg_counter + 1
+            uid = str(self.reg_counter)
+            had_var = "_try_had_" + uid
+            hnd_var = "_try_hnd_" + uid
+            exc_var = "_try_exc_" + uid
+            self.ensure_typed_alloca(had_var, "i32", is_in_func)
+            self.ensure_typed_alloca(hnd_var, "i32", is_in_func)
+            self.ensure_alloca(exc_var, is_in_func)
+            self.emit("store i32 0, i32* %loc_" + had_var, is_in_func)
+            self.emit("store i32 0, i32* %loc_" + hnd_var, is_in_func)
+            self.emit("store i64 -1688849860263936, i64* %loc_" + exc_var, is_in_func)
+
+            r_jb = self.new_reg()
+            self.emit(r_jb + " = call i8* @turbo_try_push()", is_in_func)
+            r_sj = self.new_reg()
+            self.emit(r_sj + " = call i32 @setjmp(i8* " + r_jb + ")", is_in_func)
+            r_is_exc = self.new_reg()
+            self.emit(r_is_exc + " = icmp ne i32 " + r_sj + ", 0", is_in_func)
+            lbl_try = self.new_label("try_body")
+            lbl_catch = self.new_label("try_catch")
+            lbl_after = self.new_label("try_after")
+            self.emit_cond_br(r_is_exc, lbl_catch, lbl_try, is_in_func)
+
+            self.emit_label(lbl_try, is_in_func)
+            self.try_depth = self.try_depth + 1
             self.gen_block_stmts(body, is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("} else {", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("_exc_had = 1;", is_in_func)
-            self.write_code("_exc_val = turbo_exception_value;", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
-            self.write_code("turbo_exception_jmp = _saved_jmp;", is_in_func)
+            self.try_depth = self.try_depth - 1
+            self.emit("call void @turbo_try_pop()", is_in_func)
+            self.emit_br(lbl_after, is_in_func)
+
+            self.emit_label(lbl_catch, is_in_func)
+            self.emit("call void @turbo_try_pop()", is_in_func)
+            self.emit("store i32 1, i32* %loc_" + had_var, is_in_func)
+            r_ge = self.new_reg()
+            self.emit(r_ge + " = call i64 @turbo_get_exception()", is_in_func)
+            self.emit("store i64 " + r_ge + ", i64* %loc_" + exc_var, is_in_func)
+            self.emit_br(lbl_after, is_in_func)
+
+            self.emit_label(lbl_after, is_in_func)
             if len(handlers_node.children) > 0:
-                self.write_code("if (_exc_had) {", is_in_func)
-                self.indent_level = self.indent_level + 1
+                r_had = self.new_reg()
+                self.emit(r_had + " = load i32, i32* %loc_" + had_var, is_in_func)
+                r_had_cmp = self.new_reg()
+                self.emit(r_had_cmp + " = icmp ne i32 " + r_had + ", 0", is_in_func)
+                lbl_dispatch = self.new_label("try_dispatch")
+                lbl_post_h = self.new_label("try_post_h")
+                self.emit_cond_br(r_had_cmp, lbl_dispatch, lbl_post_h, is_in_func)
+
+                self.emit_label(lbl_dispatch, is_in_func)
                 h_idx = 0
                 while h_idx < len(handlers_node.children):
                     handler = handlers_node.children[h_idx]
                     exc_type = handler.children[0]
-                    exc_var = handler.value
+                    e_var_name = handler.value
                     handler_body = handler.children[1]
+                    lbl_h_chk = self.new_label("try_h_chk")
+                    lbl_h_run = self.new_label("try_h_run")
+                    lbl_h_next = self.new_label("try_h_next")
+
+                    r_hnd = self.new_reg()
+                    self.emit(r_hnd + " = load i32, i32* %loc_" + hnd_var, is_in_func)
+                    r_not_hnd = self.new_reg()
+                    self.emit(r_not_hnd + " = icmp eq i32 " + r_hnd + ", 0", is_in_func)
+                    self.emit_cond_br(r_not_hnd, lbl_h_chk, lbl_h_next, is_in_func)
+
+                    self.emit_label(lbl_h_chk, is_in_func)
                     if exc_type.type == "CONST_NONE":
-                        self.write_code("if (!_exc_handled) {", is_in_func)
+                        self.emit_br(lbl_h_run, is_in_func)
                     else:
-                        exc_type_c = self.gen_expr(exc_type)
-                        self.write_code("if (!_exc_handled && turbo_exception_matches(_exc_val, " + exc_type_c + ")) {", is_in_func)
-                    self.indent_level = self.indent_level + 1
-                    self.write_code("_exc_handled = 1;", is_in_func)
-                    if exc_var != "":
-                        self.write_code("t_" + exc_var + " = _exc_val;", is_in_func)
+                        et_reg = self.gen_expr(exc_type, is_in_func)
+                        r_ev = self.new_reg()
+                        self.emit(r_ev + " = load i64, i64* %loc_" + exc_var, is_in_func)
+                        r_m = self.new_reg()
+                        self.emit(r_m + " = call i32 @turbo_exception_matches(i64 " + r_ev + ", i64 " + et_reg + ")", is_in_func)
+                        r_mcmp = self.new_reg()
+                        self.emit(r_mcmp + " = icmp ne i32 " + r_m + ", 0", is_in_func)
+                        self.emit_cond_br(r_mcmp, lbl_h_run, lbl_h_next, is_in_func)
+
+                    self.emit_label(lbl_h_run, is_in_func)
+                    self.emit("store i32 1, i32* %loc_" + hnd_var, is_in_func)
+                    if e_var_name != "":
+                        r_ev2 = self.new_reg()
+                        self.emit(r_ev2 + " = load i64, i64* %loc_" + exc_var, is_in_func)
+                        self.emit_store_var(e_var_name, r_ev2, is_in_func)
                     self.gen_block_stmts(handler_body, is_in_func)
-                    self.indent_level = self.indent_level - 1
-                    self.write_code("}", is_in_func)
+                    self.emit_br(lbl_h_next, is_in_func)
+
+                    self.emit_label(lbl_h_next, is_in_func)
                     h_idx = h_idx + 1
-                self.write_code("if (!_exc_handled) {", is_in_func)
-                self.indent_level = self.indent_level + 1
-                self.write_code("turbo_raise(_exc_val);", is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
+
+                r_hnd_fin = self.new_reg()
+                self.emit(r_hnd_fin + " = load i32, i32* %loc_" + hnd_var, is_in_func)
+                r_unh = self.new_reg()
+                self.emit(r_unh + " = icmp eq i32 " + r_hnd_fin + ", 0", is_in_func)
+                lbl_unh = self.new_label("try_unhandled")
+                self.emit_cond_br(r_unh, lbl_unh, lbl_post_h, is_in_func)
+                self.emit_label(lbl_unh, is_in_func)
+                r_ev_unh = self.new_reg()
+                self.emit(r_ev_unh + " = load i64, i64* %loc_" + exc_var, is_in_func)
+                self.emit("call void @turbo_raise(i64 " + r_ev_unh + ")", is_in_func)
+                self.emit_br(lbl_post_h, is_in_func)
+                self.emit_label(lbl_post_h, is_in_func)
+
             if else_body.type != "CONST_NONE":
-                self.write_code("if (!_exc_had) {", is_in_func)
-                self.indent_level = self.indent_level + 1
+                r_had2 = self.new_reg()
+                self.emit(r_had2 + " = load i32, i32* %loc_" + had_var, is_in_func)
+                r_no_exc = self.new_reg()
+                self.emit(r_no_exc + " = icmp eq i32 " + r_had2 + ", 0", is_in_func)
+                lbl_else = self.new_label("try_else")
+                lbl_after_else = self.new_label("try_after_else")
+                self.emit_cond_br(r_no_exc, lbl_else, lbl_after_else, is_in_func)
+                self.emit_label(lbl_else, is_in_func)
                 self.gen_block_stmts(else_body, is_in_func)
-                self.indent_level = self.indent_level - 1
-                self.write_code("}", is_in_func)
+                self.emit_br(lbl_after_else, is_in_func)
+                self.emit_label(lbl_after_else, is_in_func)
+
             if finally_body.type != "CONST_NONE":
                 self.gen_block_stmts(finally_body, is_in_func)
+
             if len(handlers_node.children) == 0:
-                self.write_code("if (_exc_had) { turbo_raise(_exc_val); }", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
+                r_had3 = self.new_reg()
+                self.emit(r_had3 + " = load i32, i32* %loc_" + had_var, is_in_func)
+                r_re = self.new_reg()
+                self.emit(r_re + " = icmp ne i32 " + r_had3 + ", 0", is_in_func)
+                lbl_re = self.new_label("try_fin_re")
+                lbl_fin_end = self.new_label("try_fin_end")
+                self.emit_cond_br(r_re, lbl_re, lbl_fin_end, is_in_func)
+                self.emit_label(lbl_re, is_in_func)
+                r_ev3 = self.new_reg()
+                self.emit(r_ev3 + " = load i64, i64* %loc_" + exc_var, is_in_func)
+                self.emit("call void @turbo_raise(i64 " + r_ev3 + ")", is_in_func)
+                self.emit_br(lbl_fin_end, is_in_func)
+                self.emit_label(lbl_fin_end, is_in_func)
         elif node.type == "MATCH":
             self._flush_pending_native(is_in_func)
-            subject_expr = self.gen_expr(node.children[0])
-            self.write_code("{", is_in_func)
-            self.indent_level = self.indent_level + 1
-            self.write_code("TurboObject *__match_subject = " + subject_expr + ";", is_in_func)
+            subj_reg = self.gen_expr(node.children[0], is_in_func)
+            lbl_end = self.new_label("match_end")
             n = len(node.children)
             i = 1
             while i < n:
                 case_node = node.children[i]
                 pattern_node = case_node.children[0]
                 body_node = case_node.children[1]
-                is_first = (i == 1)
+                lbl_body = self.new_label("case_body")
+                lbl_next = self.new_label("case_next")
                 if pattern_node.type == "PATTERN_LIT":
-                    lit_expr = self.gen_expr(pattern_node.children[0])
-                    cond = "turbo_is_truthy(turbo_eq(__match_subject, " + lit_expr + "))"
-                    if is_first:
-                        self.write_code("if (" + cond + ") {", is_in_func)
-                    else:
-                        self.write_code("} else if (" + cond + ") {", is_in_func)
-                elif pattern_node.type == "PATTERN_CAP":
-                    if is_first:
-                        self.write_code("if (1) {", is_in_func)
-                    else:
-                        self.write_code("} else {", is_in_func)
-                elif pattern_node.type == "PATTERN_WC":
-                    if is_first:
-                        self.write_code("if (1) {", is_in_func)
-                    else:
-                        self.write_code("} else {", is_in_func)
-                self.indent_level = self.indent_level + 1
+                    lit_reg = self.gen_expr(pattern_node.children[0], is_in_func)
+                    r_eq = self.new_reg()
+                    self.emit(r_eq + " = call i64 @turbo_eq(i64 " + subj_reg + ", i64 " + lit_reg + ")", is_in_func)
+                    c_i1 = self.emit_truthy_i1(r_eq, is_in_func)
+                    self.emit_cond_br(c_i1, lbl_body, lbl_next, is_in_func)
+                else:
+                    self.emit_br(lbl_body, is_in_func)
+                self.emit_label(lbl_body, is_in_func)
                 if pattern_node.type == "PATTERN_CAP":
-                    self.write_code("t_" + pattern_node.value + " = __match_subject;", is_in_func)
+                    self.emit_store_var(pattern_node.value, subj_reg, is_in_func)
                 self.gen_block_stmts(body_node, is_in_func)
-                self.indent_level = self.indent_level - 1
+                self.emit_br(lbl_end, is_in_func)
+                self.emit_label(lbl_next, is_in_func)
                 i = i + 1
-            self.write_code("}", is_in_func)
-            self.indent_level = self.indent_level - 1
-            self.write_code("}", is_in_func)
+            self.emit_label(lbl_end, is_in_func)
         elif node.type == "DEF" or node.type == "ASYNC_DEF":
+            self._flush_pending_native(is_in_func)
             self.gen_func_def(node, "", "", False)
         elif node.type == "CLASS":
+            self._flush_pending_native(is_in_func)
             self.gen_class_def(node, "")
+
+    def build_llvm_ir(self):
+        out = []
+        # Compact LLVM Struct Types for heap objects
+        out.append("%String = type { i32, i32, i8* }")
+        out.append("%List = type { i32, i32, i32, i32, i64* }")
+        out.append("%Dict = type { i32, i32, i32, i32, i64*, i64* }")
+        out.append("%Instance = type { i32, i32, i64, %Dict* }")
+        out.append("")
+
+        # External runtime declarations
+        out.append("declare void @turbo_init_args(i32, i8**)")
+        out.append("declare i64 @make_int_from_ll(i64)")
+        out.append("declare i64 @make_int(i8*)")
+        out.append("declare i64 @make_float(double)")
+        out.append("declare i64 @make_complex(double, double)")
+        out.append("declare i64 @make_bytes_from_str(i8*)")
+        out.append("declare i64 @make_str(i8*)")
+        out.append("declare i64 @make_bool(i32)")
+        out.append("declare i64 @make_list()")
+        out.append("declare i64 @make_tuple()")
+        out.append("declare i64 @make_set()")
+        out.append("declare i64 @make_dict()")
+        out.append("declare i64 @make_func(i64 (i32, i64*)*, i8*)")
+        out.append("declare i64 @make_staticmethod(i64 (i32, i64*)*, i8*)")
+        out.append("declare i64 @make_classmethod(i64 (i32, i64*)*, i8*)")
+        out.append("declare i64 @make_property(i64 (i32, i64*)*, i64 (i32, i64*)*, i8*)")
+        out.append("declare i64 @make_class(i8*)")
+        out.append("declare i64 @make_module()")
+        out.append("declare void @turbo_module_set(i64, i8*, i64)")
+        out.append("declare i64 @turbo_module_get(i64, i8*)")
+        out.append("declare void @turbo_class_add_method(i64, i8*, i64 (i32, i64*)*)")
+        out.append("declare void @turbo_class_set_attr(i64, i8*, i64)")
+        out.append("declare void @turbo_list_append(i64, i64)")
+        out.append("declare void @turbo_tuple_append(i64, i64)")
+        out.append("declare void @turbo_set_add(i64, i64)")
+        out.append("declare i64 @turbo_add(i64, i64)")
+        out.append("declare i64 @turbo_sub(i64, i64)")
+        out.append("declare i64 @turbo_mul(i64, i64)")
+        out.append("declare i64 @turbo_div(i64, i64)")
+        out.append("declare i64 @turbo_floordiv(i64, i64)")
+        out.append("declare i64 @turbo_mod(i64, i64)")
+        out.append("declare i64 @turbo_pow(i64, i64)")
+        out.append("declare i64 @turbo_matmul(i64, i64)")
+        out.append("declare i64 @turbo_bitand(i64, i64)")
+        out.append("declare i64 @turbo_bitor(i64, i64)")
+        out.append("declare i64 @turbo_bitxor(i64, i64)")
+        out.append("declare i64 @turbo_bitnot(i64)")
+        out.append("declare i64 @turbo_lshift(i64, i64)")
+        out.append("declare i64 @turbo_rshift(i64, i64)")
+        out.append("declare i64 @turbo_eq(i64, i64)")
+        out.append("declare i64 @turbo_ne(i64, i64)")
+        out.append("declare i64 @turbo_lt(i64, i64)")
+        out.append("declare i64 @turbo_gt(i64, i64)")
+        out.append("declare i64 @turbo_lte(i64, i64)")
+        out.append("declare i64 @turbo_gte(i64, i64)")
+        out.append("declare i32 @turbo_in(i64, i64)")
+        out.append("declare i32 @turbo_is_truthy(i64)")
+        out.append("declare i64 @turbo_not(i64)")
+        out.append("declare i64 @turbo_call(i64, i32, i64*)")
+        out.append("declare i64 @turbo_call_method(i64, i8*, i32, i64*)")
+        out.append("declare i64 @turbo_getattr(i64, i8*)")
+        out.append("declare void @turbo_setattr(i64, i8*, i64)")
+        out.append("declare i64 @turbo_getitem(i64, i64)")
+        out.append("declare void @turbo_setitem(i64, i64, i64)")
+        out.append("declare void @turbo_delitem(i64, i64)")
+        out.append("declare i64 @turbo_slice(i64, i64, i64)")
+        out.append("declare i64 @turbo_len(i64)")
+        out.append("declare i64 @turbo_str(i64)")
+        out.append("declare i64 @turbo_list(i32, i64*)")
+        out.append("declare i64 @ int_to_ll(i64)".replace("@ ", "@"))
+        out.append("declare double @to_double(i64)")
+        out.append("declare void @turbo_raise(i64)")
+        out.append("declare void @turbo_assert_fail(i64)")
+        out.append("declare i32 @turbo_exception_matches(i64, i64)")
+        out.append("declare i8* @turbo_try_push()")
+        out.append("declare void @turbo_try_pop()")
+        out.append("declare i64 @turbo_get_exception()")
+        out.append("declare i32 @setjmp(i8*) returns_twice")
+        out.append("")
+
+        out.append("@_cached_str_empty = external global i64")
+        b_i = 0
+        while b_i < len(self.builtins_list):
+            bname = self.builtins_list[b_i]
+            out.append("@t_" + bname + " = external global i64")
+            b_i = b_i + 1
+        out.append("")
+
+        s_i = 0
+        while s_i < len(self.str_defs):
+            out.append(self.str_defs[s_i])
+            s_i = s_i + 1
+        if len(self.str_defs) > 0:
+            out.append("")
+
+        r_i = 0
+        while r_i < len(self.raw_globals):
+            out.append(self.raw_globals[r_i])
+            r_i = r_i + 1
+
+        g_i = 0
+        while g_i < len(self.global_vars):
+            gname = self.global_vars[g_i]
+            if not self.is_builtin_name(gname):
+                out.append("@t_" + gname + " = global i64 -1688849860263936")
+            g_i = g_i + 1
+        out.append("")
+
+        f_i = 0
+        while f_i < len(self.funcs_list):
+            out.append(self.funcs_list[f_i])
+            out.append("")
+            f_i = f_i + 1
+
+        out.append("define void @turbo_main() {")
+        out.append("entry:")
+        a_i = 0
+        while a_i < len(self.main_allocas):
+            aname = self.main_allocas[a_i]
+            out.append("  %loc_" + aname + " = alloca i64")
+            out.append("  store i64 -1688849860263936, i64* %loc_" + aname)
+            a_i = a_i + 1
+        a_i = 0
+        while a_i < len(self.main_typed_allocas):
+            tinfo = self.main_typed_allocas[a_i]
+            out.append("  %loc_" + tinfo[0] + " = alloca " + tinfo[1])
+            a_i = a_i + 1
+        a_i = 0
+        while a_i < len(self.main_sized_allocas):
+            sinfo = self.main_sized_allocas[a_i]
+            out.append("  %loc_" + sinfo[0] + " = alloca [" + str(sinfo[1]) + " x i64]")
+            a_i = a_i + 1
+        m_i = 0
+        while m_i < len(self.main_lines):
+            out.append(self.main_lines[m_i])
+            m_i = m_i + 1
+        out.append("  ret void")
+        out.append("}")
+        out.append("")
+
+        out.append("define i32 @main(i32 %argc, i8** %argv) {")
+        out.append("entry:")
+        out.append("  call void @turbo_init_args(i32 %argc, i8** %argv)")
+        out.append("  call void @turbo_main()")
+        out.append("  ret i32 0")
+        out.append("}")
+        out.append("")
+        return "\n".join(out)
 
 def main():
     if len(sys_argv) < 4:
         print("Usage: turbo <input_file> -o <output_file>")
         return
-    
+
     input_file = sys_argv[1]
     output_file = ""
-    
+
     i = 2
     while i < len(sys_argv):
         if sys_argv[i] == "-o":
             if i + 1 < len(sys_argv):
-                output_file = sys_argv[i+1]
+                output_file = sys_argv[i + 1]
                 break
         i = i + 1
-        
+
     if output_file == "":
         print("Error: output file not specified with -o")
         return
-        
+
     f_in = open(input_file, "r")
     text = f_in.read()
     f_in.close()
-    
+
     lexer = Lexer(text)
     lexer.tokenize()
-    
+
     parser = Parser(lexer.tokens)
     module_ast = parser.parse_module()
-    
+
     input_dir = ""
     last_slash = -1
     s_idx = 0
@@ -3348,53 +5160,24 @@ def main():
         input_dir = input_file[0:last_slash]
     if input_dir == "":
         input_dir = "."
-    
+
     cg = CodeGen()
     cg.input_dir = input_dir
-    
+
     globals_list = []
     collect_globals(module_ast, globals_list)
-    
-    # Declare globals in C header
     g_idx = 0
-    builtins = cg.builtins_list
     while g_idx < len(globals_list):
         g_name = globals_list[g_idx]
-        is_builtin = False
-        b_idx = 0
-        while b_idx < len(builtins):
-            if builtins[b_idx] == g_name:
-                is_builtin = True
-                break
-            b_idx = b_idx + 1
-            
-        if not is_builtin:
-            cg.write_header("TurboObject* t_" + g_name + " = NULL;\n")
+        if not cg.is_builtin_name(g_name):
+            cg.add_global(g_name)
         g_idx = g_idx + 1
-        
-    # Generate C main body
-    cg.indent_level = 1
+
     cg.gen_block_stmts(module_ast, False)
-    
-    # Combine outputs
-    c_source = '#include "runtime.h"\n#include <stdlib.h>\n\n'
-    c_source = c_source + cg.header + "\n"
-    c_source = c_source + cg.funcs + "\n"
-    c_source = c_source + "void turbo_main(void) {\n"
-    c_source = c_source + cg.main_body
-    c_source = c_source + "}\n\n"
-    c_source = c_source + "int main(int argc, char** argv) {\n"
-    c_source = c_source + "    turbo_init();\n"
-    c_source = c_source + "    t_sys_argv = make_list();\n"
-    c_source = c_source + "    for (int i = 0; i < argc; i++) {\n"
-    c_source = c_source + "        turbo_list_append(t_sys_argv, make_str(argv[i]));\n"
-    c_source = c_source + "    }\n"
-    c_source = c_source + "    turbo_main();\n"
-    c_source = c_source + "    return 0;\n"
-    c_source = c_source + "}\n"
-    
+    llvm_source = cg.build_llvm_ir()
+
     f_out = open(output_file, "w")
-    f_out.write(c_source)
+    f_out.write(llvm_source)
     f_out.close()
 
 main()

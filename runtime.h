@@ -2,310 +2,375 @@
 #define RUNTIME_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <setjmp.h>
+#include <math.h>
 
+/*
+ * 64-bit NaN-Boxed / Tagged Value Representation (TurboVal = i64 in LLVM IR)
+ *
+ * Every value is passed in a single 64-bit register (i64 / int64_t):
+ * - Unboxed 48-bit signed int: 0xFFF8_0000_0000_0000 | (val & 0x0000_FFFF_FFFF_FFFF)
+ * - Heap struct pointer:       0xFFF9_0000_0000_0000 | (ptr & 0x0000_FFFF_FFFF_FFFF)
+ * - None singleton:            0xFFFA_0000_0000_0000 (-1688849860263936)
+ * - False singleton:           0xFFFA_0000_0000_0002 (-1688849860263934)
+ * - True singleton:            0xFFFA_0000_0000_0003 (-1688849860263933)
+ * - Unboxed IEEE-754 double:   any other 64-bit pattern
+ */
+
+typedef int64_t TurboVal;
+
+#define TV_TAG_MASK   0xFFFF000000000000ULL
+#define TV_PAY_MASK   0x0000FFFFFFFFFFFFULL
+
+#define TV_TAG_INT    0xFFF8000000000000ULL
+#define TV_TAG_PTR    0xFFF9000000000000ULL
+#define TV_TAG_SPEC   0xFFFA000000000000ULL
+
+#define TV_NONE       ((TurboVal)0xFFFA000000000000ULL)
+#define TV_FALSE      ((TurboVal)0xFFFA000000000002ULL)
+#define TV_TRUE       ((TurboVal)0xFFFA000000000003ULL)
+
+#define TV_MIN_INT48  (-140737488355328LL)
+#define TV_MAX_INT48  ( 140737488355327LL)
+
+/* Heap object tags (first i32 of every compact heap struct) */
 typedef enum {
-    TYPE_NONE,
-    TYPE_INT,
-    TYPE_BOOL,
-    TYPE_STR,
-    TYPE_LIST,
-    TYPE_DICT,
-    TYPE_FUNC,
-    TYPE_CLASS,
-    TYPE_INSTANCE,
-    TYPE_FILE,
-    TYPE_FLOAT,
-    TYPE_COMPLEX,
-    TYPE_BYTES,
-    TYPE_TUPLE,
-    TYPE_SET,
-    TYPE_MODULE,
-    TYPE_SUPER,
-    TYPE_STATICMETHOD,
-    TYPE_CLASSMETHOD,
-    TYPE_PROPERTY
-} TurboType;
+    HEAP_STR = 1,
+    HEAP_LIST = 2,
+    HEAP_DICT = 3,
+    HEAP_TUPLE = 4,
+    HEAP_SET = 5,
+    HEAP_BYTES = 6,
+    HEAP_COMPLEX = 7,
+    HEAP_BIGINT = 8,
+    HEAP_FUNC = 9,
+    HEAP_CLASS = 10,
+    HEAP_INSTANCE = 11,
+    HEAP_FILE = 12,
+    HEAP_MODULE = 13,
+    HEAP_SUPER = 14,
+    HEAP_STATICMETHOD = 15,
+    HEAP_CLASSMETHOD = 16,
+    HEAP_PROPERTY = 17
+} TurboHeapType;
 
-typedef struct TurboObject TurboObject;
+typedef TurboVal (*TurboCFunction)(int32_t argc, TurboVal* args);
 
-typedef TurboObject* (*TurboCFunction)(int argc, TurboObject** args);
+/* Compact Heap Structs matching LLVM IR %String, %List, %Dict, etc. */
 
-struct TurboObject {
-    TurboType type;
-    union {
-        struct {
-            char* digits;
-            int length;
-            int sign;
-            bool is_small;
-            long long small_val;
-        } int_val;
-        bool bool_val;
-        double float_val;
-        struct {
-            double real;
-            double imag;
-        } complex_val;
-        struct {
-            char* chars;
-            int length;
-        } str_val;
-        struct {
-            unsigned char* data;
-            int length;
-        } bytes_val;
-        struct {
-            TurboObject** items;
-            int length;
-            int capacity;
-        } list_val;
-        struct {
-            TurboObject** items;
-            int length;
-            int capacity;
-        } tuple_val;
-        struct {
-            TurboObject** items;
-            int length;
-            int capacity;
-        } set_val;
-        struct {
-            TurboObject** keys;
-            TurboObject** values;
-            int length;
-            int capacity;
-        } dict_val;
-        struct {
-            TurboCFunction func_ptr;
-            char* name;
-        } func_val;
-        struct {
-            char* name;
-            char** method_names;
-            TurboCFunction* method_funcs;
-            int method_count;
-            int method_capacity;
-            char** attr_names;
-            TurboObject** attr_values;
-            int attr_count;
-            int attr_capacity;
-        } class_val;
-        struct {
-            TurboObject* class_obj;
-            char** keys;
-            TurboObject** values;
-            int length;
-            int capacity;
-        } inst_val;
-        struct {
-            FILE* handle;
-        } file_val;
-        struct {
-            TurboObject* dict;
-        } module_val;
-        struct {
-            TurboObject* obj;
-        } super_val;
-        struct {
-            TurboCFunction func_ptr;
-            char* name;
-        } staticmethod_val;
-        struct {
-            TurboCFunction func_ptr;
-            char* name;
-        } classmethod_val;
-        struct {
-            TurboCFunction getter;
-            TurboCFunction setter;
-            char* name;
-        } property_val;
-    };
-};
+typedef struct {
+    int32_t tag;
+    int32_t length;
+} TurboHeapHeader;
 
-extern TurboObject* turbo_none;
-extern TurboObject* turbo_true;
-extern TurboObject* turbo_false;
+/* %String = type { i32, i32, i8* } */
+typedef struct {
+    int32_t tag;
+    int32_t length;
+    char* chars;
+} TurboStr;
 
-extern TurboObject* t_print;
-extern TurboObject* t_len;
-extern TurboObject* t_str;
-extern TurboObject* t_int;
-extern TurboObject* t_ord;
-extern TurboObject* t_chr;
-extern TurboObject* t_range;
-extern TurboObject* t_open;
-extern TurboObject* t_sys_argv;
-extern TurboObject* t_input;
-extern TurboObject* t_type;
-extern TurboObject* t_isinstance;
-extern TurboObject* t_hasattr;
-extern TurboObject* t_getattr;
-extern TurboObject* t_setattr;
-extern TurboObject* t_repr;
-extern TurboObject* t_abs;
-extern TurboObject* t_round;
-extern TurboObject* t_pow;
-extern TurboObject* t_hex;
-extern TurboObject* t_bin;
-extern TurboObject* t_oct;
-extern TurboObject* t_float;
-extern TurboObject* t_bool;
-extern TurboObject* t_list;
-extern TurboObject* t_dict;
-extern TurboObject* t_tuple;
-extern TurboObject* t_set;
-extern TurboObject* t_super;
-extern TurboObject* t_iter;
-extern TurboObject* t_next;
-extern TurboObject* t_all;
-extern TurboObject* t_any;
-extern TurboObject* t_sum;
-extern TurboObject* t_min;
-extern TurboObject* t_max;
-extern TurboObject* t_sorted;
-extern TurboObject* t_reversed;
-extern TurboObject* t_enumerate;
-extern TurboObject* t_zip;
-extern TurboObject* t_map;
-extern TurboObject* t_filter;
+/* %List = type { i32, i32, i32, i32, i64* } (also used for Tuple and Set) */
+typedef struct {
+    int32_t tag;
+    int32_t length;
+    int32_t capacity;
+    int32_t _pad;
+    TurboVal* items;
+} TurboList;
 
-// Cached small integer constants
-extern TurboObject* _cached_int_0;
-extern TurboObject* _cached_int_1;
-extern TurboObject* _cached_int_2;
-extern TurboObject* _cached_int_3;
-extern TurboObject* _cached_str_empty;
+/* %Dict = type { i32, i32, i32, i32, i64*, i64* } */
+typedef struct {
+    int32_t tag;
+    int32_t length;
+    int32_t capacity;
+    int32_t _pad;
+    TurboVal* keys;
+    TurboVal* values;
+} TurboDict;
 
-// Exception handling
+/* %Bytes = type { i32, i32, i8* } */
+typedef struct {
+    int32_t tag;
+    int32_t length;
+    unsigned char* data;
+} TurboBytes;
+
+/* %Complex = type { i32, i32, double, double } */
+typedef struct {
+    int32_t tag;
+    int32_t _pad;
+    double real;
+    double imag;
+} TurboComplex;
+
+/* %BigInt = type { i32, i32, i32, i32, i8* } */
+typedef struct {
+    int32_t tag;
+    int32_t length;
+    int32_t sign;
+    int32_t _pad;
+    char* digits;
+} TurboBigInt;
+
+/* %Func = type { i32, i32, i8*, i8* } (also used for staticmethod, classmethod) */
+typedef struct {
+    int32_t tag;
+    int32_t _pad;
+    TurboCFunction func_ptr;
+    char* name;
+} TurboFunc;
+
+/* %Property = type { i32, i32, i8*, i8*, i8* } */
+typedef struct {
+    int32_t tag;
+    int32_t _pad;
+    TurboCFunction getter;
+    TurboCFunction setter;
+    char* name;
+} TurboProperty;
+
+/* %Class */
+typedef struct {
+    int32_t tag;
+    int32_t method_count;
+    int32_t method_capacity;
+    int32_t attr_count;
+    int32_t attr_capacity;
+    int32_t _pad;
+    char* name;
+    char** method_names;
+    TurboCFunction* method_funcs;
+    char** attr_names;
+    TurboVal* attr_values;
+} TurboClass;
+
+/* %Instance = type { i32, i32, i32, i32, i64, i8**, i64* } */
+typedef struct {
+    int32_t tag;
+    int32_t length;
+    int32_t capacity;
+    int32_t _pad;
+    TurboVal class_obj;
+    char** keys;
+    TurboVal* values;
+} TurboInstance;
+
+/* %File = type { i32, i32, i8* } */
+typedef struct {
+    int32_t tag;
+    int32_t _pad;
+    FILE* handle;
+} TurboFile;
+
+/* %Module = type { i32, i32, i64 } */
+typedef struct {
+    int32_t tag;
+    int32_t _pad;
+    TurboVal dict;
+} TurboModule;
+
+/* %Super = type { i32, i32, i64 } */
+typedef struct {
+    int32_t tag;
+    int32_t _pad;
+    TurboVal obj;
+} TurboSuper;
+
+/* Global built-in variables */
+extern TurboVal turbo_none;
+extern TurboVal turbo_true;
+extern TurboVal turbo_false;
+
+extern TurboVal t_print;
+extern TurboVal t_len;
+extern TurboVal t_str;
+extern TurboVal t_int;
+extern TurboVal t_ord;
+extern TurboVal t_chr;
+extern TurboVal t_range;
+extern TurboVal t_open;
+extern TurboVal t_sys_argv;
+extern TurboVal t_input;
+extern TurboVal t_type;
+extern TurboVal t_isinstance;
+extern TurboVal t_hasattr;
+extern TurboVal t_getattr;
+extern TurboVal t_setattr;
+extern TurboVal t_repr;
+extern TurboVal t_abs;
+extern TurboVal t_round;
+extern TurboVal t_pow;
+extern TurboVal t_hex;
+extern TurboVal t_bin;
+extern TurboVal t_oct;
+extern TurboVal t_float;
+extern TurboVal t_bool;
+extern TurboVal t_list;
+extern TurboVal t_dict;
+extern TurboVal t_tuple;
+extern TurboVal t_set;
+extern TurboVal t_super;
+extern TurboVal t_iter;
+extern TurboVal t_next;
+extern TurboVal t_all;
+extern TurboVal t_any;
+extern TurboVal t_sum;
+extern TurboVal t_min;
+extern TurboVal t_max;
+extern TurboVal t_sorted;
+extern TurboVal t_reversed;
+extern TurboVal t_enumerate;
+extern TurboVal t_zip;
+extern TurboVal t_map;
+extern TurboVal t_filter;
+
+/* Exception handling */
 extern jmp_buf* turbo_exception_jmp;
-extern TurboObject* turbo_exception_value;
+extern TurboVal turbo_exception_value;
 
-void turbo_raise(TurboObject* exc);
-bool turbo_exception_matches(TurboObject* exc, TurboObject* exc_type);
+jmp_buf* turbo_try_push(void);
+void turbo_try_pop(void);
+TurboVal turbo_get_exception(void);
+void turbo_raise(TurboVal exc);
+int32_t turbo_exception_matches(TurboVal exc, TurboVal exc_type);
+void turbo_assert_fail(TurboVal msg);
 
 void turbo_init(void);
+void turbo_init_args(int32_t argc, char** argv);
 
-TurboObject* make_int(const char* str);
-TurboObject* make_int_from_ll(long long val);
-double to_double(TurboObject* obj);
-long long int_to_ll(TurboObject* obj);
-TurboObject* make_float(double val);
-TurboObject* make_complex(double real, double imag);
-TurboObject* make_str(const char* val);
-TurboObject* make_str_len(const char* val, int len);
-TurboObject* make_bool(bool val);
-TurboObject* make_bytes(const unsigned char* data, int length);
-TurboObject* make_bytes_from_str(const char* str);
-TurboObject* make_list(void);
-TurboObject* make_tuple(void);
-TurboObject* make_tuple_from_list(TurboObject* list);
-TurboObject* make_set(void);
-TurboObject* make_dict(void);
-TurboObject* make_func(TurboCFunction func, const char* name);
-TurboObject* make_staticmethod(TurboCFunction func, const char* name);
-TurboObject* make_classmethod(TurboCFunction func, const char* name);
-TurboObject* make_property(TurboCFunction getter, TurboCFunction setter, const char* name);
-TurboObject* make_class(const char* name);
-TurboObject* make_instance(TurboObject* class_obj);
-TurboObject* make_file(FILE* handle);
-TurboObject* make_module(void);
-TurboObject* turbo_module_get(TurboObject* mod, const char* name);
-void turbo_module_set(TurboObject* mod, const char* name, TurboObject* val);
-TurboObject* turbo_import_module(const char* name);
+/* Constructors and unboxing helpers */
+TurboVal make_int(const char* str);
+TurboVal make_int_from_ll(long long val);
+double to_double(TurboVal obj);
+long long int_to_ll(TurboVal obj);
+TurboVal make_float(double val);
+TurboVal make_complex(double real, double imag);
+TurboVal make_str(const char* val);
+TurboVal make_str_len(const char* val, int32_t len);
+TurboVal make_bool(int32_t val);
+TurboVal make_bytes(const unsigned char* data, int32_t length);
+TurboVal make_bytes_from_str(const char* str);
+TurboVal make_list(void);
+TurboVal make_tuple(void);
+TurboVal make_tuple_from_list(TurboVal list);
+TurboVal make_set(void);
+TurboVal make_dict(void);
+TurboVal make_func(TurboCFunction func, const char* name);
+TurboVal make_staticmethod(TurboCFunction func, const char* name);
+TurboVal make_classmethod(TurboCFunction func, const char* name);
+TurboVal make_property(TurboCFunction getter, TurboCFunction setter, const char* name);
+TurboVal make_class(const char* name);
+TurboVal make_instance(TurboVal class_obj);
+TurboVal make_file(FILE* handle);
+TurboVal make_module(void);
+TurboVal turbo_module_get(TurboVal mod, const char* name);
+void turbo_module_set(TurboVal mod, const char* name, TurboVal val);
+TurboVal turbo_import_module(const char* name);
 
-TurboObject* turbo_add(TurboObject* a, TurboObject* b);
-TurboObject* turbo_sub(TurboObject* a, TurboObject* b);
-TurboObject* turbo_mul(TurboObject* a, TurboObject* b);
-TurboObject* turbo_div(TurboObject* a, TurboObject* b);
-TurboObject* turbo_mod(TurboObject* a, TurboObject* b);
-TurboObject* turbo_pow(TurboObject* a, TurboObject* b);
-TurboObject* turbo_floordiv(TurboObject* a, TurboObject* b);
+/* Arithmetic and Bitwise Operations */
+TurboVal turbo_add(TurboVal a, TurboVal b);
+TurboVal turbo_sub(TurboVal a, TurboVal b);
+TurboVal turbo_mul(TurboVal a, TurboVal b);
+TurboVal turbo_div(TurboVal a, TurboVal b);
+TurboVal turbo_mod(TurboVal a, TurboVal b);
+TurboVal turbo_pow(TurboVal a, TurboVal b);
+TurboVal turbo_floordiv(TurboVal a, TurboVal b);
 
-TurboObject* turbo_bitand(TurboObject* a, TurboObject* b);
-TurboObject* turbo_bitor(TurboObject* a, TurboObject* b);
-TurboObject* turbo_bitxor(TurboObject* a, TurboObject* b);
-TurboObject* turbo_lshift(TurboObject* a, TurboObject* b);
-TurboObject* turbo_rshift(TurboObject* a, TurboObject* b);
-TurboObject* turbo_matmul(TurboObject* a, TurboObject* b);
-TurboObject* turbo_bitnot(TurboObject* a);
+TurboVal turbo_bitand(TurboVal a, TurboVal b);
+TurboVal turbo_bitor(TurboVal a, TurboVal b);
+TurboVal turbo_bitxor(TurboVal a, TurboVal b);
+TurboVal turbo_lshift(TurboVal a, TurboVal b);
+TurboVal turbo_rshift(TurboVal a, TurboVal b);
+TurboVal turbo_matmul(TurboVal a, TurboVal b);
+TurboVal turbo_bitnot(TurboVal a);
 
-TurboObject* turbo_eq(TurboObject* a, TurboObject* b);
-TurboObject* turbo_ne(TurboObject* a, TurboObject* b);
-TurboObject* turbo_lt(TurboObject* a, TurboObject* b);
-TurboObject* turbo_gt(TurboObject* a, TurboObject* b);
-TurboObject* turbo_lte(TurboObject* a, TurboObject* b);
-TurboObject* turbo_gte(TurboObject* a, TurboObject* b);
+/* Comparisons and Logic */
+TurboVal turbo_eq(TurboVal a, TurboVal b);
+TurboVal turbo_ne(TurboVal a, TurboVal b);
+TurboVal turbo_lt(TurboVal a, TurboVal b);
+TurboVal turbo_gt(TurboVal a, TurboVal b);
+TurboVal turbo_lte(TurboVal a, TurboVal b);
+TurboVal turbo_gte(TurboVal a, TurboVal b);
 
-TurboObject* turbo_not(TurboObject* val);
-TurboObject* turbo_and(TurboObject* a, TurboObject* b);
-TurboObject* turbo_or(TurboObject* a, TurboObject* b);
-bool turbo_is_truthy(TurboObject* val);
+TurboVal turbo_not(TurboVal val);
+TurboVal turbo_and(TurboVal a, TurboVal b);
+TurboVal turbo_or(TurboVal a, TurboVal b);
+int32_t turbo_is_truthy(TurboVal val);
 
-TurboObject* turbo_len(TurboObject* val);
-TurboObject* turbo_getitem(TurboObject* obj, TurboObject* key);
-void turbo_setitem(TurboObject* obj, TurboObject* key, TurboObject* val);
-void turbo_delitem(TurboObject* obj, TurboObject* key);
-TurboObject* turbo_slice(TurboObject* obj, TurboObject* start, TurboObject* end);
-TurboObject* turbo_getattr(TurboObject* obj, const char* name);
-void turbo_setattr(TurboObject* obj, const char* name, TurboObject* val);
-bool turbo_in(TurboObject* item, TurboObject* container);
+/* Subscript, Slice, Attribute */
+TurboVal turbo_len(TurboVal val);
+TurboVal turbo_getitem(TurboVal obj, TurboVal key);
+void turbo_setitem(TurboVal obj, TurboVal key, TurboVal val);
+void turbo_delitem(TurboVal obj, TurboVal key);
+TurboVal turbo_slice(TurboVal obj, TurboVal start, TurboVal end);
+TurboVal turbo_getattr(TurboVal obj, const char* name);
+void turbo_setattr(TurboVal obj, const char* name, TurboVal val);
+int32_t turbo_in(TurboVal item, TurboVal container);
 
-TurboObject* turbo_print(int argc, TurboObject** args);
-TurboObject* turbo_str(TurboObject* val);
-TurboObject* turbo_int(TurboObject* val);
-TurboObject* turbo_float(TurboObject* val);
-TurboObject* turbo_ord(TurboObject* val);
-TurboObject* turbo_chr(TurboObject* val);
-TurboObject* turbo_range(int argc, TurboObject** args);
-TurboObject* turbo_open(TurboObject* path, TurboObject* mode);
-TurboObject* turbo_repr(TurboObject* val);
+/* Built-in Functions */
+TurboVal turbo_print(int32_t argc, TurboVal* args);
+TurboVal turbo_str(TurboVal val);
+TurboVal turbo_int(TurboVal val);
+TurboVal turbo_float(TurboVal val);
+TurboVal turbo_ord(TurboVal val);
+TurboVal turbo_chr(TurboVal val);
+TurboVal turbo_range(int32_t argc, TurboVal* args);
+TurboVal turbo_open(TurboVal path, TurboVal mode);
+TurboVal turbo_repr(TurboVal val);
 
-TurboObject* turbo_file_read(TurboObject* file_obj);
-void turbo_file_write(TurboObject* file_obj, TurboObject* text_obj);
-void turbo_file_close(TurboObject* file_obj);
+/* File Operations */
+TurboVal turbo_file_read(TurboVal file_obj);
+void turbo_file_write(TurboVal file_obj, TurboVal text_obj);
+void turbo_file_close(TurboVal file_obj);
 
-void turbo_list_append(TurboObject* list_obj, TurboObject* item);
-TurboObject* turbo_list_copy(TurboObject* list_obj);
-void turbo_list_sort(TurboObject* list_obj);
-void turbo_list_reverse(TurboObject* list_obj);
-void turbo_tuple_append(TurboObject* tuple_obj, TurboObject* item);
-void turbo_set_add(TurboObject* set_obj, TurboObject* item);
-bool turbo_set_contains(TurboObject* set_obj, TurboObject* item);
-void turbo_set_remove(TurboObject* set_obj, TurboObject* item);
+/* Collection Operations */
+void turbo_list_append(TurboVal list_obj, TurboVal item);
+TurboVal turbo_list_copy(TurboVal list_obj);
+void turbo_list_sort(TurboVal list_obj);
+void turbo_list_reverse(TurboVal list_obj);
+void turbo_tuple_append(TurboVal tuple_obj, TurboVal item);
+void turbo_set_add(TurboVal set_obj, TurboVal item);
+int32_t turbo_set_contains(TurboVal set_obj, TurboVal item);
+void turbo_set_remove(TurboVal set_obj, TurboVal item);
 
-TurboObject* turbo_str_split(int argc, TurboObject** args);
-TurboObject* turbo_str_join(TurboObject* self, TurboObject* list_obj);
-TurboObject* turbo_str_upper(TurboObject* self);
-TurboObject* turbo_str_lower(TurboObject* self);
-TurboObject* turbo_str_replace(TurboObject* self, TurboObject* old, TurboObject* new);
-TurboObject* turbo_str_find(TurboObject* self, TurboObject* sub);
-TurboObject* turbo_str_strip(TurboObject* self);
-TurboObject* turbo_str_lstrip(TurboObject* self);
-TurboObject* turbo_str_rstrip(TurboObject* self);
-TurboObject* turbo_str_startswith(TurboObject* self, TurboObject* prefix);
-TurboObject* turbo_str_endswith(TurboObject* self, TurboObject* suffix);
-TurboObject* turbo_str_count(TurboObject* self, TurboObject* sub);
-TurboObject* turbo_str_format(TurboObject* self, int argc, TurboObject** args);
+/* String Methods */
+TurboVal turbo_str_split(int32_t argc, TurboVal* args);
+TurboVal turbo_str_join(TurboVal self, TurboVal list_obj);
+TurboVal turbo_str_upper(TurboVal self);
+TurboVal turbo_str_lower(TurboVal self);
+TurboVal turbo_str_replace(TurboVal self, TurboVal old_s, TurboVal new_s);
+TurboVal turbo_str_find(TurboVal self, TurboVal sub);
+TurboVal turbo_str_strip(TurboVal self);
+TurboVal turbo_str_lstrip(TurboVal self);
+TurboVal turbo_str_rstrip(TurboVal self);
+TurboVal turbo_str_startswith(TurboVal self, TurboVal prefix);
+TurboVal turbo_str_endswith(TurboVal self, TurboVal suffix);
+TurboVal turbo_str_count(TurboVal self, TurboVal sub);
+TurboVal turbo_str_format(TurboVal self, int32_t argc, TurboVal* args);
 
-// Dict methods
-TurboObject* turbo_dict_keys(TurboObject* self);
-TurboObject* turbo_dict_values(TurboObject* self);
-TurboObject* turbo_dict_items(TurboObject* self);
-TurboObject* turbo_dict_get(TurboObject* self, TurboObject* key, TurboObject* default_val);
-TurboObject* turbo_dict_pop(TurboObject* self, TurboObject* key);
-TurboObject* turbo_dict_popitem(TurboObject* self);
-void turbo_dict_update(TurboObject* self, TurboObject* other);
-void turbo_dict_clear(TurboObject* self);
-TurboObject* turbo_dict_copy(TurboObject* self);
-TurboObject* turbo_dict_setdefault(TurboObject* self, TurboObject* key, TurboObject* default_val);
+/* Dict Methods */
+TurboVal turbo_dict_keys(TurboVal self);
+TurboVal turbo_dict_values(TurboVal self);
+TurboVal turbo_dict_items(TurboVal self);
+TurboVal turbo_dict_get(TurboVal self, TurboVal key, TurboVal default_val);
+TurboVal turbo_dict_pop(TurboVal self, TurboVal key);
+TurboVal turbo_dict_popitem(TurboVal self);
+void turbo_dict_update(TurboVal self, TurboVal other);
+void turbo_dict_clear(TurboVal self);
+TurboVal turbo_dict_copy(TurboVal self);
+TurboVal turbo_dict_setdefault(TurboVal self, TurboVal key, TurboVal default_val);
 
-void turbo_class_add_method(TurboObject* class_obj, const char* name, TurboCFunction func);
-void turbo_class_set_attr(TurboObject* class_obj, const char* name, TurboObject* val);
-TurboObject* turbo_class_get_attr(TurboObject* class_obj, const char* name);
+/* Class & Method Dispatch */
+void turbo_class_add_method(TurboVal class_obj, const char* name, TurboCFunction func);
+void turbo_class_set_attr(TurboVal class_obj, const char* name, TurboVal val);
+TurboVal turbo_class_get_attr(TurboVal class_obj, const char* name);
 
-TurboObject* turbo_call(TurboObject* callable, int argc, TurboObject** args);
-TurboObject* turbo_call_method(TurboObject* obj, const char* method_name, int argc, TurboObject** args);
+TurboVal turbo_call(TurboVal callable, int32_t argc, TurboVal* args);
+TurboVal turbo_call_method(TurboVal obj, const char* method_name, int32_t argc, TurboVal* args);
 
 #endif
