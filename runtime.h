@@ -256,6 +256,7 @@ TurboVal make_bool(int32_t val);
 TurboVal make_bytes(const unsigned char* data, int32_t length);
 TurboVal make_bytes_from_str(const char* str);
 TurboVal make_list(void);
+TurboVal make_list_len(int64_t len);
 TurboVal make_tuple(void);
 TurboVal make_tuple_from_list(TurboVal list);
 TurboVal make_set(void);

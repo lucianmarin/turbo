@@ -63,15 +63,15 @@ gcc hello.c runtime.c -o hello
 
 Benchmark suite (`perf/`) comparing Python 3, Turbo (LLVM IR), and hand-written C (`clang -O2`).
 
-| Benchmark | Python 3 (ms) | Turbo LLVM IR (ms) | C `clang -O2` (ms) | Turbo vs Python |
+| Benchmark | Python 3 (ms) | Turbo LLVM IR (ms) | C `clang -O2` (ms) | Turbo vs Python & C |
 |---|---:|---:|---:|---:|
-| `fib_iterative` | 10,658.46 | **7.28** | 9.03 | **1,464.7x** |
-| `fib_recursive` | 10,188.20 | **323.49** | 327.84 | **31.5x** (1.00x C) |
-| `ackermann` | 3,513.94 | **10.38** | 10.39 | **338.7x** (1.00x C) |
-| `pi_wallis` | 531.06 | **8.67** | 9.28 | **61.2x** (1.00x C) |
-| `leibniz` | 81,281.36 | **1,131.65** | 1,103.76 | **71.8x** (1.02x C) |
-| `matmult` | 10,506.18 | **520.35** | 7.67* / 211.21 | **20.2x** |
-| `sieve` | 300.48 | **86.47** | 17.61 | **3.5x** |
-| `collatz` | 11,316.72 | **3,042.91** | 205.10 | **3.7x** |
+| `fib_iterative` | 5,559.25 | **5.25** | 4.19 | **1,058.9x** (0.80x C) |
+| `fib_recursive` | 5,184.40 | **166.78** | 166.82 | **31.1x** (1.00x C) |
+| `ackermann` | 1,509.81 | **3.46** | 4.39 | **436.4x** (1.27x C) |
+| `pi_wallis` | 278.52 | **3.54** | 3.28 | **78.7x** (0.93x C) |
+| `leibniz` | 41,411.30 | **569.28** | 537.28 | **72.7x** (0.94x C) |
+| `matmult` | 5,569.44 | **22.67** | 5.72* / 109.99 | **245.7x** (4.85x C) |
+| `sieve` | 148.00 | **10.60** | 11.82 | **14.0x** (1.12x C) |
+| `collatz` | 5,141.71 | **105.25** | 105.77 | **48.9x** (1.00x C) |
 
-*\*Note: `matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (7.67 ms); with a volatile sink, C 512×512 matmult takes ~211 ms vs Turbo's 520 ms.*
+*\*Note: `matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (5.72 ms); with a volatile sink, C 512×512 matmult takes 109.99 ms vs Turbo's 22.67 ms (4.85x faster due to loop-interchanged reduction).*

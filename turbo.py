@@ -1661,6 +1661,8 @@ class CodeGen:
         self.builtins_list = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "tuple", "set", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter"]
         self.pending_native_vars = None
         self._var_types = {}
+        self.func_ret_types = {}
+        self.global_var_types = {}
         self._native_temp_counter = 0
 
     def new_reg(self):
@@ -1939,6 +1941,24 @@ class CodeGen:
         elif node.type == "NAME":
             return self.emit_load_var(node.value, is_in_func)
         elif node.type == "BINOP":
+            if is_in_func and node.value != "**" and node.value != "@":
+                b_vt = {}
+                _idx = 0
+                while _idx < len(self.local_vars):
+                    _k = self.local_vars[_idx]
+                    if _k in self._var_types:
+                        b_vt[_k] = self._var_types[_k]
+                    _idx = _idx + 1
+                for rk_v in self.range_loop_vars:
+                    b_vt[rk_v] = CodeGen.NATIVE_INT
+                b_et = self._can_emit_native_expr(node, b_vt, "")
+                if b_et == CodeGen.NATIVE_INT or b_et == CodeGen.NATIVE_FLOAT:
+                    self._sync_read_scalars(node, b_vt, "", is_in_func)
+                    b_res = self._emit_native_expr(node, b_vt, "", is_in_func)
+                    if b_res[1] == CodeGen.NATIVE_FLOAT:
+                        return self.emit_box_float(b_res[0], is_in_func)
+                    else:
+                        return self.emit_box_int(b_res[0], is_in_func)
             left = self.gen_expr(node.children[0], is_in_func)
             right = self.gen_expr(node.children[1], is_in_func)
             op = node.value
@@ -2168,6 +2188,85 @@ class CodeGen:
                 a_idx = a_idx + 1
             return r_dict
         elif node.type == "LISTCOMP" or node.type == "GENCOMP":
+            gen_node = node.children[1]
+            elem_node = node.children[0]
+            if (gen_node.type == "GENERATOR" or gen_node.type == "COMP_FOR") and gen_node.children[1].type == "CONST_NONE" and gen_node.children[2].type == "CONST_NONE":
+                iter_node = gen_node.children[0]
+                targets = gen_node.value.split(',')
+                if len(targets) == 1 and iter_node.type == "CALL" and iter_node.children[0].type == "NAME" and iter_node.children[0].value == "range":
+                    rargs = iter_node.children[1].children
+                    if len(rargs) >= 1 and len(rargs) <= 2:
+                        t_var = targets[0]
+                        if is_in_func:
+                            if not self.is_local(t_var, True):
+                                self.local_vars.append(t_var)
+                            self.ensure_alloca(t_var, True)
+                        else:
+                            self.add_global(t_var)
+                        r_start = "0"
+                        r_stop = ""
+                        if len(rargs) == 1:
+                            r_stop = self._gen_range_bound(rargs[0], is_in_func)
+                        else:
+                            r_start = self._gen_range_bound(rargs[0], is_in_func)
+                            r_stop = self._gen_range_bound(rargs[1], is_in_func)
+                        r_len = r_stop
+                        if r_start != "0":
+                            r_diff = self.new_reg()
+                            self.emit(r_diff + " = sub i64 " + r_stop + ", " + r_start, is_in_func)
+                            r_len = r_diff
+                        r_lc = self.new_reg()
+                        self.emit(r_lc + " = call i64 @make_list_len(i64 " + r_len + ")", is_in_func)
+                        r_raw = self.new_reg()
+                        self.emit(r_raw + " = and i64 " + r_lc + ", 281474976710655", is_in_func)
+                        r_lptr = self.new_reg()
+                        self.emit(r_lptr + " = inttoptr i64 " + r_raw + " to %List*", is_in_func)
+                        r_itemsp = self.new_reg()
+                        self.emit(r_itemsp + " = getelementptr inbounds %List, %List* " + r_lptr + ", i32 0, i32 4", is_in_func)
+                        r_items = self.new_reg()
+                        self.emit(r_items + " = load i64*, i64** " + r_itemsp, is_in_func)
+                        self.reg_counter = self.reg_counter + 1
+                        ri_var = "_comp_rng_" + str(self.reg_counter)
+                        self.ensure_typed_alloca(ri_var, "i64", is_in_func)
+                        self.emit("store i64 " + r_start + ", i64* %loc_" + ri_var, is_in_func)
+                        lbl_cond = self.new_label("crng_cond")
+                        lbl_body = self.new_label("crng_body")
+                        lbl_end = self.new_label("crng_end")
+                        self.emit_label(lbl_cond, is_in_func)
+                        r_ri = self.new_reg()
+                        self.emit(r_ri + " = load i64, i64* %loc_" + ri_var, is_in_func)
+                        r_cmp = self.new_reg()
+                        self.emit(r_cmp + " = icmp slt i64 " + r_ri + ", " + r_stop, is_in_func)
+                        self.emit_cond_br(r_cmp, lbl_body, lbl_end, is_in_func)
+                        self.emit_label(lbl_body, is_in_func)
+                        if t_var != "_":
+                            r_boxed = self.emit_box_int(r_ri, is_in_func)
+                            self.emit_store_var(t_var, r_boxed, is_in_func)
+                        saved_rlv = None
+                        if t_var in self.range_loop_vars:
+                            saved_rlv = self.range_loop_vars[t_var]
+                        self.range_loop_vars[t_var] = ri_var
+                        er = self.gen_expr(elem_node, is_in_func)
+                        if saved_rlv != None:
+                            self.range_loop_vars[t_var] = saved_rlv
+                        elif t_var in self.range_loop_vars:
+                            del self.range_loop_vars[t_var]
+                        r_idx = r_ri
+                        if r_start != "0":
+                            r_idx_sub = self.new_reg()
+                            self.emit(r_idx_sub + " = sub i64 " + r_ri + ", " + r_start, is_in_func)
+                            r_idx = r_idx_sub
+                        r_ep = self.new_reg()
+                        self.emit(r_ep + " = getelementptr inbounds i64, i64* " + r_items + ", i64 " + r_idx, is_in_func)
+                        self.emit("store i64 " + er + ", i64* " + r_ep, is_in_func)
+                        r_ri2 = self.new_reg()
+                        self.emit(r_ri2 + " = load i64, i64* %loc_" + ri_var, is_in_func)
+                        r_rinext = self.new_reg()
+                        self.emit(r_rinext + " = add i64 " + r_ri2 + ", 1", is_in_func)
+                        self.emit("store i64 " + r_rinext + ", i64* %loc_" + ri_var, is_in_func)
+                        self.emit_br(lbl_cond, is_in_func)
+                        self.emit_label(lbl_end, is_in_func)
+                        return r_lc
             r_lc = self.new_reg()
             self.emit(r_lc + " = call i64 @make_list()", is_in_func)
             self._gen_comp_loops(node.children[1], r_lc, "LIST", node.children[0], None, is_in_func)
@@ -2559,6 +2658,260 @@ class CodeGen:
         self.emit(r_elemp + " = getelementptr inbounds i64, i64* " + r_items + ", i64 " + idx_i64_reg, is_in_func)
         self.emit("store i64 " + val_reg + ", i64* " + r_elemp, is_in_func)
 
+    def _expr_uses_var(self, node, vname):
+        if node.type == "NAME" and node.value == vname:
+            return True
+        if hasattr(node, 'children') and node.children:
+            i = 0
+            while i < len(node.children):
+                c = node.children[i]
+                if isinstance(c, ASTNode):
+                    if self._expr_uses_var(c, vname):
+                        return True
+                i = i + 1
+        return False
+
+    def _sync_read_scalars(self, node, vt, exclude_var, is_in_func):
+        read_vars = []
+        self._collect_read_scalar_vars(node, vt, exclude_var, read_vars)
+        rv_i = 0
+        while rv_i < len(read_vars):
+            rv = read_vars[rv_i]
+            rv_t = vt[rv]
+            if rv in self.range_loop_vars:
+                self.ensure_typed_alloca("_i_" + rv, "i64", is_in_func)
+                rl_r = self.new_reg()
+                self.emit(rl_r + " = load i64, i64* %loc_" + self.range_loop_vars[rv], is_in_func)
+                self.emit("store i64 " + rl_r + ", i64* %loc__i_" + rv, is_in_func)
+            elif rv_t == CodeGen.NATIVE_INT:
+                self.ensure_typed_alloca("_i_" + rv, "i64", is_in_func)
+                tv_r = self.emit_load_var(rv, is_in_func)
+                ir = self.emit_unbox_int(tv_r, is_in_func)
+                self.emit("store i64 " + ir + ", i64* %loc__i_" + rv, is_in_func)
+            elif rv_t == CodeGen.NATIVE_FLOAT:
+                self.ensure_typed_alloca("_d_" + rv, "double", is_in_func)
+                tv_r = self.emit_load_var(rv, is_in_func)
+                dr = self.new_reg()
+                self.emit(dr + " = call double @to_double(i64 " + tv_r + ")", is_in_func)
+                self.emit("store double " + dr + ", double* %loc__d_" + rv, is_in_func)
+            rv_i = rv_i + 1
+
+    def _try_emit_interchanged_sum_loop(self, j_var, j_start, j_stop, body_node, is_in_func):
+        if len(body_node.children) != 1:
+            return False
+        stmt = body_node.children[0]
+        if stmt.type != "ASSIGN":
+            return False
+        target = stmt.children[0]
+        val = stmt.children[1]
+        if target.type != "SUBSCRIPT":
+            return False
+        if target.children[1].type != "NAME" or target.children[1].value != j_var:
+            return False
+        if val.type != "CALL" or val.children[0].type != "NAME" or val.children[0].value != "sum":
+            return False
+        if len(val.children[1].children) != 1:
+            return False
+        comp_node = val.children[1].children[0]
+        if comp_node.type != "LISTCOMP" and comp_node.type != "GENCOMP":
+            return False
+        elem_node = comp_node.children[0]
+        gen_node = comp_node.children[1]
+        if (gen_node.type != "GENERATOR" and gen_node.type != "COMP_FOR") or gen_node.children[1].type != "CONST_NONE" or gen_node.children[2].type != "CONST_NONE":
+            return False
+        iter_node = gen_node.children[0]
+        targets = gen_node.value.split(',')
+        if len(targets) != 1 or iter_node.type != "CALL" or iter_node.children[0].type != "NAME" or iter_node.children[0].value != "range":
+            return False
+        rargs = iter_node.children[1].children
+        if len(rargs) < 1 or len(rargs) > 2:
+            return False
+        k_var = targets[0]
+        if elem_node.type != "BINOP" or elem_node.value != "*":
+            return False
+        lhs_e = elem_node.children[0]
+        rhs_e = elem_node.children[1]
+        if self._expr_uses_var(lhs_e, j_var) and not self._expr_uses_var(rhs_e, j_var):
+            tmp_e = lhs_e
+            lhs_e = rhs_e
+            rhs_e = tmp_e
+        if self._expr_uses_var(lhs_e, j_var):
+            return False
+        if self._expr_uses_var( target.children[0], j_var) or self._expr_uses_var(target.children[0], k_var):
+            return False
+        vt = {}
+        _idx = 0
+        while _idx < len(self.local_vars):
+            _k = self.local_vars[_idx]
+            if _k in self._var_types:
+                vt[_k] = self._var_types[_k]
+            _idx = _idx + 1
+        for rk_v in self.range_loop_vars:
+            vt[rk_v] = CodeGen.NATIVE_INT
+        vt[j_var] = CodeGen.NATIVE_INT
+        vt[k_var] = CodeGen.NATIVE_INT
+        target_ct = self._infer_type_heuristic(target.children[0], vt, "")
+        target_elem_t = self._elem_type_of_list(target_ct)
+        if not self._can_emit_native_list_items_ptr(target.children[0], vt, ""):
+            return False
+        lt = self._can_emit_native_expr(lhs_e, vt, "")
+        rt = self._can_emit_native_expr(rhs_e, vt, "")
+        if lt == None or rt == None or lt != rt:
+            return False
+        if lt != CodeGen.NATIVE_FLOAT and lt != CodeGen.NATIVE_INT:
+            return False
+        if target_elem_t != lt:
+            if not (target_elem_t == CodeGen.NATIVE_INT and lt == CodeGen.NATIVE_FLOAT):
+                return False
+        target_elem_t = lt
+        if is_in_func:
+            if not self.is_local(k_var, True):
+                self.local_vars.append(k_var)
+            self.ensure_alloca(k_var, True)
+        self._sync_read_scalars(target.children[0], vt, j_var, is_in_func)
+        self._sync_read_scalars(lhs_e, vt, k_var, is_in_func)
+        self._sync_read_scalars(rhs_e, vt, k_var, is_in_func)
+        self.ensure_typed_alloca("_i_" + j_var, "i64", is_in_func)
+        self.ensure_typed_alloca("_i_" + k_var, "i64", is_in_func)
+        k_start = "0"
+        k_stop = ""
+        if len(rargs) == 1:
+            k_stop = self._gen_range_bound(rargs[0], is_in_func)
+        else:
+            k_start = self._gen_range_bound(rargs[0], is_in_func)
+            k_stop = self._gen_range_bound(rargs[1], is_in_func)
+        t_items = self._emit_native_list_items_ptr(target.children[0], vt, "", is_in_func)
+        # Hoist k-invariant outer list pointers for lhs_e and rhs_e
+        lhs_outer_items = ""
+        if lhs_e.type == "SUBSCRIPT" and lhs_e.children[1].type == "NAME" and lhs_e.children[1].value == k_var and not self._expr_uses_var(lhs_e.children[0], k_var):
+            lhs_outer_items = self._emit_native_list_items_ptr(lhs_e.children[0], vt, "", is_in_func)
+        rhs_mat_items = ""
+        if rhs_e.type == "SUBSCRIPT" and rhs_e.children[1].type == "NAME" and rhs_e.children[1].value == j_var and rhs_e.children[0].type == "SUBSCRIPT" and rhs_e.children[0].children[1].type == "NAME" and rhs_e.children[0].children[1].value == k_var and not self._expr_uses_var(rhs_e.children[0].children[0], k_var) and not self._expr_uses_var(rhs_e.children[0].children[0], j_var):
+            rhs_mat_items = self._emit_native_list_items_ptr(rhs_e.children[0].children[0], vt, "", is_in_func)
+        # 1. Zero-initialize target[j_start .. j_stop-1]
+        self.emit("store i64 " + j_start + ", i64* %loc__i_" + j_var, is_in_func)
+        lbl_z_cond = self.new_label("ic_z_cond")
+        lbl_z_body = self.new_label("ic_z_body")
+        lbl_z_end = self.new_label("ic_z_end")
+        self.emit_label(lbl_z_cond, is_in_func)
+        rz_j = self.new_reg()
+        self.emit(rz_j + " = load i64, i64* %loc__i_" + j_var, is_in_func)
+        rz_cmp = self.new_reg()
+        self.emit(rz_cmp + " = icmp slt i64 " + rz_j + ", " + j_stop, is_in_func)
+        self.emit_cond_br(rz_cmp, lbl_z_body, lbl_z_end, is_in_func)
+        self.emit_label(lbl_z_body, is_in_func)
+        rz_ep = self.new_reg()
+        self.emit(rz_ep + " = getelementptr inbounds i64, i64* " + t_items + ", i64 " + rz_j, is_in_func)
+        if target_elem_t == CodeGen.NATIVE_FLOAT:
+            self.emit("store i64 0, i64* " + rz_ep, is_in_func)
+        else:
+            self.emit("store i64 -2251799813685248, i64* " + rz_ep, is_in_func)
+        rz_jn = self.new_reg()
+        self.emit(rz_jn + " = add i64 " + rz_j + ", 1", is_in_func)
+        self.emit("store i64 " + rz_jn + ", i64* %loc__i_" + j_var, is_in_func)
+        self.emit_br(lbl_z_cond, is_in_func)
+        self.emit_label(lbl_z_end, is_in_func)
+        # 2. Outer loop over k, inner loop over j
+        self.emit("store i64 " + k_start + ", i64* %loc__i_" + k_var, is_in_func)
+        lbl_k_cond = self.new_label("ic_k_cond")
+        lbl_k_body = self.new_label("ic_k_body")
+        lbl_k_end = self.new_label("ic_k_end")
+        self.emit_label(lbl_k_cond, is_in_func)
+        rk = self.new_reg()
+        self.emit(rk + " = load i64, i64* %loc__i_" + k_var, is_in_func)
+        rk_cmp = self.new_reg()
+        self.emit(rk_cmp + " = icmp slt i64 " + rk + ", " + k_stop, is_in_func)
+        self.emit_cond_br(rk_cmp, lbl_k_body, lbl_k_end, is_in_func)
+        self.emit_label(lbl_k_body, is_in_func)
+        if lhs_outer_items != "":
+            r_lp = self.new_reg()
+            self.emit(r_lp + " = getelementptr inbounds i64, i64* " + lhs_outer_items + ", i64 " + rk, is_in_func)
+            r_lraw = self.new_reg()
+            self.emit(r_lraw + " = load i64, i64* " + r_lp, is_in_func)
+            if target_elem_t == CodeGen.NATIVE_FLOAT:
+                lhs_val = self.new_reg()
+                self.emit(lhs_val + " = bitcast i64 " + r_lraw + " to double", is_in_func)
+            else:
+                lhs_val = self.emit_unbox_int(r_lraw, is_in_func)
+        else:
+            lhs_res = self._emit_native_expr(lhs_e, vt, "", is_in_func)
+            lhs_val = lhs_res[0]
+        rhs_row_items = ""
+        if rhs_mat_items != "":
+            r_rmp = self.new_reg()
+            self.emit(r_rmp + " = getelementptr inbounds i64, i64* " + rhs_mat_items + ", i64 " + rk, is_in_func)
+            r_row_tv = self.new_reg()
+            self.emit(r_row_tv + " = load i64, i64* " + r_rmp, is_in_func)
+            r_row_raw = self.new_reg()
+            self.emit(r_row_raw + " = and i64 " + r_row_tv + ", 281474976710655", is_in_func)
+            r_row_lptr = self.new_reg()
+            self.emit(r_row_lptr + " = inttoptr i64 " + r_row_raw + " to %List*", is_in_func)
+            r_row_ip = self.new_reg()
+            self.emit(r_row_ip + " = getelementptr inbounds %List, %List* " + r_row_lptr + ", i32 0, i32 4", is_in_func)
+            rhs_row_items = self.new_reg()
+            self.emit(rhs_row_items + " = load i64*, i64** " + r_row_ip, is_in_func)
+        elif rhs_e.type == "SUBSCRIPT" and rhs_e.children[1].type == "NAME" and rhs_e.children[1].value == j_var and not self._expr_uses_var(rhs_e.children[0], j_var):
+            rhs_row_items = self._emit_native_list_items_ptr(rhs_e.children[0], vt, "", is_in_func)
+        self.emit("store i64 " + j_start + ", i64* %loc__i_" + j_var, is_in_func)
+        lbl_j_cond = self.new_label("ic_j_cond")
+        lbl_j_body = self.new_label("ic_j_body")
+        lbl_j_end = self.new_label("ic_j_end")
+        self.emit_label(lbl_j_cond, is_in_func)
+        rj = self.new_reg()
+        self.emit(rj + " = load i64, i64* %loc__i_" + j_var, is_in_func)
+        rj_cmp = self.new_reg()
+        self.emit(rj_cmp + " = icmp slt i64 " + rj + ", " + j_stop, is_in_func)
+        self.emit_cond_br(rj_cmp, lbl_j_body, lbl_j_end, is_in_func)
+        self.emit_label(lbl_j_body, is_in_func)
+        if rhs_row_items != "":
+            r_rp = self.new_reg()
+            self.emit(r_rp + " = getelementptr inbounds i64, i64* " + rhs_row_items + ", i64 " + rj, is_in_func)
+            r_raw_v = self.new_reg()
+            self.emit(r_raw_v + " = load i64, i64* " + r_rp, is_in_func)
+            if target_elem_t == CodeGen.NATIVE_FLOAT:
+                rhs_val = self.new_reg()
+                self.emit(rhs_val + " = bitcast i64 " + r_raw_v + " to double", is_in_func)
+            else:
+                rhs_val = self.emit_unbox_int(r_raw_v, is_in_func)
+        else:
+            rhs_res = self._emit_native_expr(rhs_e, vt, "", is_in_func)
+            rhs_val = rhs_res[0]
+        r_tp = self.new_reg()
+        self.emit(r_tp + " = getelementptr inbounds i64, i64* " + t_items + ", i64 " + rj, is_in_func)
+        r_cur_raw = self.new_reg()
+        self.emit(r_cur_raw + " = load i64, i64* " + r_tp, is_in_func)
+        if target_elem_t == CodeGen.NATIVE_FLOAT:
+            r_cur_d = self.new_reg()
+            self.emit(r_cur_d + " = bitcast i64 " + r_cur_raw + " to double", is_in_func)
+            r_prod = self.new_reg()
+            self.emit(r_prod + " = fmul double " + lhs_val + ", " + rhs_val, is_in_func)
+            r_next_d = self.new_reg()
+            self.emit(r_next_d + " = fadd double " + r_cur_d + ", " + r_prod, is_in_func)
+            r_next_raw = self.new_reg()
+            self.emit(r_next_raw + " = bitcast double " + r_next_d + " to i64", is_in_func)
+            self.emit("store i64 " + r_next_raw + ", i64* " + r_tp, is_in_func)
+        else:
+            r_cur_i = self.emit_unbox_int(r_cur_raw, is_in_func)
+            r_prod = self.new_reg()
+            self.emit(r_prod + " = mul i64 " + lhs_val + ", " + rhs_val, is_in_func)
+            r_next_i = self.new_reg()
+            self.emit(r_next_i + " = add i64 " + r_cur_i + ", " + r_prod, is_in_func)
+            r_next_raw = self.emit_box_int(r_next_i, is_in_func)
+            self.emit("store i64 " + r_next_raw + ", i64* " + r_tp, is_in_func)
+        rjn = self.new_reg()
+        self.emit(rjn + " = add i64 " + rj + ", 1", is_in_func)
+        self.emit("store i64 " + rjn + ", i64* %loc__i_" + j_var, is_in_func)
+        self.emit_br(lbl_j_cond, is_in_func)
+        self.emit_label(lbl_j_end, is_in_func)
+        rk2 = self.new_reg()
+        self.emit(rk2 + " = load i64, i64* %loc__i_" + k_var, is_in_func)
+        rkn = self.new_reg()
+        self.emit(rkn + " = add i64 " + rk2 + ", 1", is_in_func)
+        self.emit("store i64 " + rkn + ", i64* %loc__i_" + k_var, is_in_func)
+        self.emit_br(lbl_k_cond, is_in_func)
+        self.emit_label(lbl_k_end, is_in_func)
+        return True
+
     def _emit_fused_sum_comp(self, comp_node, is_in_func):
         elem_node = comp_node.children[0]
         gen_node = comp_node.children[1]
@@ -2588,101 +2941,66 @@ class CodeGen:
                     k_loc = "_sum_k_" + uid
                     acc_loc = "_sum_acc_" + uid
                     self.ensure_typed_alloca(k_loc, "i64", is_in_func)
-                    # Check if elem_node is a product of two 2D subscripts (e.g. A[i][k] * B[k][j])
-                    is_2d_prod = False
-                    if elem_node.type == "BINOP" and elem_node.value == "*":
-                        lhs_e = elem_node.children[0]
-                        rhs_e = elem_node.children[1]
-                        if lhs_e.type == "SUBSCRIPT" and lhs_e.children[0].type == "SUBSCRIPT" and rhs_e.type == "SUBSCRIPT" and rhs_e.children[0].type == "SUBSCRIPT":
-                            is_2d_prod = True
-                    if is_2d_prod:
-                        self.ensure_typed_alloca(acc_loc, "double", is_in_func)
-                        self.emit("store double 0.0, double* %loc_" + acc_loc, is_in_func)
-                        self.emit("store i64 " + r_start + ", i64* %loc_" + k_loc, is_in_func)
-                        saved_k = None
-                        if k_var in self.range_loop_vars:
-                            saved_k = self.range_loop_vars[k_var]
-                        self.range_loop_vars[k_var] = k_loc
-                        lhs_e = elem_node.children[0]
-                        rhs_e = elem_node.children[1]
-                        # Hoist loop-invariant outer subscripts out of the k-loop
-                        lhs_outer_k = (lhs_e.children[0].children[1].type == "NAME" and lhs_e.children[0].children[1].value == k_var)
-                        rhs_outer_k = (rhs_e.children[0].children[1].type == "NAME" and rhs_e.children[0].children[1].value == k_var)
-                        lhs_row_items = ""
-                        rhs_outer_items = ""
-                        if not lhs_outer_k:
-                            lhs_row_tv = self.gen_expr(lhs_e.children[0], is_in_func)
-                            lr_raw = self.new_reg()
-                            self.emit(lr_raw + " = and i64 " + lhs_row_tv + ", 281474976710655", is_in_func)
-                            lr_ptr = self.new_reg()
-                            self.emit(lr_ptr + " = inttoptr i64 " + lr_raw + " to %List*", is_in_func)
-                            lr_ip = self.new_reg()
-                            self.emit(lr_ip + " = getelementptr inbounds %List, %List* " + lr_ptr + ", i32 0, i32 4", is_in_func)
-                            lhs_row_items = self.new_reg()
-                            self.emit(lhs_row_items + " = load i64*, i64** " + lr_ip, is_in_func)
-                        if rhs_outer_k:
-                            rhs_mat_tv = self.gen_expr(rhs_e.children[0].children[0], is_in_func)
-                            rm_raw = self.new_reg()
-                            self.emit(rm_raw + " = and i64 " + rhs_mat_tv + ", 281474976710655", is_in_func)
-                            rm_ptr = self.new_reg()
-                            self.emit(rm_ptr + " = inttoptr i64 " + rm_raw + " to %List*", is_in_func)
-                            rm_ip = self.new_reg()
-                            self.emit(rm_ip + " = getelementptr inbounds %List, %List* " + rm_ptr + ", i32 0, i32 4", is_in_func)
-                            rhs_outer_items = self.new_reg()
-                            self.emit(rhs_outer_items + " = load i64*, i64** " + rm_ip, is_in_func)
+                    vt = {}
+                    _idx = 0
+                    while _idx < len(self.local_vars):
+                        _k = self.local_vars[_idx]
+                        if _k in self._var_types:
+                            vt[_k] = self._var_types[_k]
+                        _idx = _idx + 1
+                    for rk_v in self.range_loop_vars:
+                        vt[rk_v] = CodeGen.NATIVE_INT
+                    vt[k_var] = CodeGen.NATIVE_INT
+                    et = self._can_emit_native_expr(elem_node, vt, "")
+                    if et == CodeGen.NATIVE_FLOAT or et == CodeGen.NATIVE_INT:
+                        self._sync_read_scalars(elem_node, vt, k_var, is_in_func)
+                        self.ensure_typed_alloca("_i_" + k_var, "i64", is_in_func)
+                        self.emit("store i64 " + r_start + ", i64* %loc__i_" + k_var, is_in_func)
+                        if et == CodeGen.NATIVE_FLOAT:
+                            self.ensure_typed_alloca(acc_loc, "double", is_in_func)
+                            self.emit("store double 0.0, double* %loc_" + acc_loc, is_in_func)
+                        else:
+                            self.ensure_typed_alloca(acc_loc, "i64", is_in_func)
+                            self.emit("store i64 0, i64* %loc_" + acc_loc, is_in_func)
                         lbl_cond = self.new_label("fsum_cond")
                         lbl_body = self.new_label("fsum_body")
                         lbl_end = self.new_label("fsum_end")
                         self.emit_label(lbl_cond, is_in_func)
                         rk = self.new_reg()
-                        self.emit(rk + " = load i64, i64* %loc_" + k_loc, is_in_func)
+                        self.emit(rk + " = load i64, i64* %loc__i_" + k_var, is_in_func)
                         rcmp = self.new_reg()
                         self.emit(rcmp + " = icmp slt i64 " + rk + ", " + r_stop, is_in_func)
                         self.emit_cond_br(rcmp, lbl_body, lbl_end, is_in_func)
                         self.emit_label(lbl_body, is_in_func)
-                        if lhs_row_items != "" and lhs_e.children[1].type == "NAME" and lhs_e.children[1].value == k_var:
-                            lep = self.new_reg()
-                            self.emit(lep + " = getelementptr inbounds i64, i64* " + lhs_row_items + ", i64 " + rk, is_in_func)
-                            lv_tv = self.new_reg()
-                            self.emit(lv_tv + " = load i64, i64* " + lep, is_in_func)
+                        eres = self._emit_native_expr(elem_node, vt, "", is_in_func)
+                        eval_r = eres[0]
+                        if et == CodeGen.NATIVE_FLOAT:
+                            cur_acc = self.new_reg()
+                            self.emit(cur_acc + " = load double, double* %loc_" + acc_loc, is_in_func)
+                            next_acc = self.new_reg()
+                            self.emit(next_acc + " = fadd double " + cur_acc + ", " + eval_r, is_in_func)
+                            self.emit("store double " + next_acc + ", double* %loc_" + acc_loc, is_in_func)
                         else:
-                            lv_tv = self.gen_expr(lhs_e, is_in_func)
-                        if rhs_outer_items != "" and rhs_e.children[1].type == "NAME" and rhs_e.children[1].value in self.range_loop_vars:
-                            r_krow_p = self.new_reg()
-                            self.emit(r_krow_p + " = getelementptr inbounds i64, i64* " + rhs_outer_items + ", i64 " + rk, is_in_func)
-                            r_krow_tv = self.new_reg()
-                            self.emit(r_krow_tv + " = load i64, i64* " + r_krow_p, is_in_func)
-                            j_loc = self.range_loop_vars[rhs_e.children[1].value]
-                            rj = self.new_reg()
-                            self.emit(rj + " = load i64, i64* %loc_" + j_loc, is_in_func)
-                            rv_tv = self._emit_fast_list_getitem(r_krow_tv, rj, is_in_func)
-                        else:
-                            rv_tv = self.gen_expr(rhs_e, is_in_func)
-                        lv_d = self.new_reg()
-                        self.emit(lv_d + " = bitcast i64 " + lv_tv + " to double", is_in_func)
-                        rv_d = self.new_reg()
-                        self.emit(rv_d + " = bitcast i64 " + rv_tv + " to double", is_in_func)
-                        prod_d = self.new_reg()
-                        self.emit(prod_d + " = fmul double " + lv_d + ", " + rv_d, is_in_func)
-                        cur_acc = self.new_reg()
-                        self.emit(cur_acc + " = load double, double* %loc_" + acc_loc, is_in_func)
-                        next_acc = self.new_reg()
-                        self.emit(next_acc + " = fadd double " + cur_acc + ", " + prod_d, is_in_func)
-                        self.emit("store double " + next_acc + ", double* %loc_" + acc_loc, is_in_func)
+                            cur_acc = self.new_reg()
+                            self.emit(cur_acc + " = load i64, i64* %loc_" + acc_loc, is_in_func)
+                            next_acc = self.new_reg()
+                            self.emit(next_acc + " = add i64 " + cur_acc + ", " + eval_r, is_in_func)
+                            self.emit("store i64 " + next_acc + ", i64* %loc_" + acc_loc, is_in_func)
                         rk2 = self.new_reg()
-                        self.emit(rk2 + " = load i64, i64* %loc_" + k_loc, is_in_func)
+                        self.emit(rk2 + " = load i64, i64* %loc__i_" + k_var, is_in_func)
                         rkn = self.new_reg()
                         self.emit(rkn + " = add i64 " + rk2 + ", 1", is_in_func)
-                        self.emit("store i64 " + rkn + ", i64* %loc_" + k_loc, is_in_func)
+                        self.emit("store i64 " + rkn + ", i64* %loc__i_" + k_var, is_in_func)
                         self.emit_br(lbl_cond, is_in_func)
                         self.emit_label(lbl_end, is_in_func)
-                        if saved_k != None:
-                            self.range_loop_vars[k_var] = saved_k
+                        if et == CodeGen.NATIVE_FLOAT:
+                            fin_d = self.new_reg()
+                            self.emit(fin_d + " = load double, double* %loc_" + acc_loc, is_in_func)
+                            return self.emit_box_float(fin_d, is_in_func)
                         else:
-                            del self.range_loop_vars[k_var]
-                        fin_d = self.new_reg()
-                        self.emit(fin_d + " = load double, double* %loc_" + acc_loc, is_in_func)
-                        return self.emit_box_float(fin_d, is_in_func)
+                            fin_i = self.new_reg()
+                            self.emit(fin_i + " = load i64, i64* %loc_" + acc_loc, is_in_func)
+                            return self.emit_box_int(fin_i, is_in_func)
                     else:
                         self.ensure_alloca(acc_loc, is_in_func)
                         self.emit("store i64 -2251799813685248, i64* %loc_" + acc_loc, is_in_func)
@@ -3175,6 +3493,10 @@ class CodeGen:
         else:
             self._var_types = {}
             self._infer_func_types(body_node, self._var_types)
+            self._infer_func_types(body_node, self._var_types)
+            fn_ret_t = self._infer_func_ret_type(body_node, self._var_types)
+            if fn_ret_t != None and class_name == "":
+                self.func_ret_types[mod_prefix + func_name] = fn_ret_t
 
             self.gen_block_stmts(body_node, True)
 
@@ -3720,17 +4042,52 @@ class CodeGen:
     NATIVE_FLOAT = "float"
     NATIVE_INT = "int"
 
+    def _is_safe_int_literal(self, s):
+        if len(s) > 14:
+            return False
+        return True
+
+    def _elem_type_of_list(self, t):
+        if t == None:
+            return None
+        if len(t) > 5 and t[0:5] == "list:":
+            return t[5:]
+        return None
+
+    def _lookup_var_type(self, name, var_types, loop_var):
+        if name == loop_var:
+            return CodeGen.NATIVE_INT
+        if name in var_types:
+            return var_types[name]
+        if name in self.global_var_types:
+            return self.global_var_types[name]
+        return None
+
     def _infer_native_type(self, node, var_types, loop_var):
         if node.type == "CONST_FLOAT":
             return CodeGen.NATIVE_FLOAT
         if node.type == "CONST_INT":
-            return CodeGen.NATIVE_INT
-        if node.type == "NAME":
-            if node.value == loop_var:
+            if self._is_safe_int_literal(node.value):
                 return CodeGen.NATIVE_INT
-            return var_types.get(node.value, None)
-        if node.type == "UNARY" and node.value == "-":
-            return self._infer_native_type(node.children[0], var_types, loop_var)
+            return None
+        if node.type == "NAME":
+            t = self._lookup_var_type(node.value, var_types, loop_var)
+            if t == CodeGen.NATIVE_INT or t == CodeGen.NATIVE_FLOAT:
+                return t
+            return None
+        if node.type == "UNARY" and (node.value == "-" or node.value == "~" or node.value == "+"):
+            ut = self._infer_native_type(node.children[0], var_types, loop_var)
+            if node.value == "~" and ut != CodeGen.NATIVE_INT:
+                return None
+            return ut
+        if node.type == "SUBSCRIPT":
+            ct = self._infer_type_heuristic(node.children[0], var_types, loop_var)
+            et = self._elem_type_of_list(ct)
+            if et == CodeGen.NATIVE_INT or et == CodeGen.NATIVE_FLOAT:
+                it = self._infer_native_type(node.children[1], var_types, loop_var)
+                if it == CodeGen.NATIVE_INT:
+                    return et
+            return None
         if node.type == "BINOP":
             lt = self._infer_native_type(node.children[0], var_types, loop_var)
             rt = self._infer_native_type(node.children[1], var_types, loop_var)
@@ -3741,7 +4098,7 @@ class CodeGen:
                     return CodeGen.NATIVE_FLOAT
                 return None
             if lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT:
-                if node.value in ('+', '-', '*', '//', '%'):
+                if node.value in ('+', '-', '*', '//', '%', '&', '|', '^', '<<', '>>'):
                     return CodeGen.NATIVE_INT
                 if node.value == '/':
                     return CodeGen.NATIVE_FLOAT
@@ -3749,17 +4106,153 @@ class CodeGen:
             return None
         return None
 
+    def _can_emit_native_list_items_ptr(self, node, var_types, loop_var):
+        if node.type == "NAME":
+            t = self._lookup_var_type(node.value, var_types, loop_var)
+            if self._elem_type_of_list(t) != None:
+                return True
+            return False
+        if node.type == "SUBSCRIPT":
+            ct = self._infer_type_heuristic(node.children[0], var_types, loop_var)
+            et = self._elem_type_of_list(ct)
+            if self._elem_type_of_list(et) != None:
+                if self._can_emit_native_list_items_ptr(node.children[0], var_types, loop_var):
+                    it = self._can_emit_native_expr(node.children[1], var_types, loop_var)
+                    if it == CodeGen.NATIVE_INT:
+                        return True
+            return False
+        return False
+
+    def _emit_native_list_items_ptr(self, node, var_types, loop_var, is_in_func):
+        if node.type == "NAME":
+            tv_r = self.emit_load_var(node.value, is_in_func)
+            r_raw = self.new_reg()
+            self.emit(r_raw + " = and i64 " + tv_r + ", 281474976710655", is_in_func)
+            r_lptr = self.new_reg()
+            self.emit(r_lptr + " = inttoptr i64 " + r_raw + " to %List*", is_in_func)
+            r_itemsp = self.new_reg()
+            self.emit(r_itemsp + " = getelementptr inbounds %List, %List* " + r_lptr + ", i32 0, i32 4", is_in_func)
+            r_items = self.new_reg()
+            self.emit(r_items + " = load i64*, i64** " + r_itemsp, is_in_func)
+            return r_items
+        if node.type == "SUBSCRIPT":
+            outer_items = self._emit_native_list_items_ptr(node.children[0], var_types, loop_var, is_in_func)
+            idx_res = self._emit_native_expr(node.children[1], var_types, loop_var, is_in_func)
+            r_ep = self.new_reg()
+            self.emit(r_ep + " = getelementptr inbounds i64, i64* " + outer_items + ", i64 " + idx_res[0], is_in_func)
+            r_row_tv = self.new_reg()
+            self.emit(r_row_tv + " = load i64, i64* " + r_ep, is_in_func)
+            r_raw = self.new_reg()
+            self.emit(r_raw + " = and i64 " + r_row_tv + ", 281474976710655", is_in_func)
+            r_lptr = self.new_reg()
+            self.emit(r_lptr + " = inttoptr i64 " + r_raw + " to %List*", is_in_func)
+            r_itemsp = self.new_reg()
+            self.emit(r_itemsp + " = getelementptr inbounds %List, %List* " + r_lptr + ", i32 0, i32 4", is_in_func)
+            r_items = self.new_reg()
+            self.emit(r_items + " = load i64*, i64** " + r_itemsp, is_in_func)
+            return r_items
+        return None
+
+    def _can_emit_native_cond(self, node, var_types, loop_var):
+        if node.type == "COMP":
+            op = node.value
+            if op in ('==', '!=', '<', '>', '<=', '>='):
+                lt = self._can_emit_native_expr(node.children[0], var_types, loop_var)
+                rt = self._can_emit_native_expr(node.children[1], var_types, loop_var)
+                if lt != None and rt != None:
+                    return True
+            return False
+        if node.type == "NOT":
+            return self._can_emit_native_cond(node.children[0], var_types, loop_var)
+        et = self._can_emit_native_expr(node, var_types, loop_var)
+        return et != None
+
+    def _emit_native_cond_i1(self, node, var_types, loop_var, is_in_func):
+        if node.type == "COMP":
+            op = node.value
+            l_res = self._emit_native_expr(node.children[0], var_types, loop_var, is_in_func)
+            r_res = self._emit_native_expr(node.children[1], var_types, loop_var, is_in_func)
+            lv = l_res[0]
+            lt = l_res[1]
+            rv = r_res[0]
+            rt = r_res[1]
+            if lt == CodeGen.NATIVE_FLOAT or rt == CodeGen.NATIVE_FLOAT:
+                if lt == CodeGen.NATIVE_INT:
+                    rc = self.new_reg()
+                    self.emit(rc + " = sitofp i64 " + lv + " to double", is_in_func)
+                    lv = rc
+                if rt == CodeGen.NATIVE_INT:
+                    rc = self.new_reg()
+                    self.emit(rc + " = sitofp i64 " + rv + " to double", is_in_func)
+                    rv = rc
+                f_pred = "oeq"
+                if op == '!=':
+                    f_pred = "une"
+                elif op == '<':
+                    f_pred = "olt"
+                elif op == '>':
+                    f_pred = "ogt"
+                elif op == '<=':
+                    f_pred = "ole"
+                elif op == '>=':
+                    f_pred = "oge"
+                r_cmp = self.new_reg()
+                self.emit(r_cmp + " = fcmp " + f_pred + " double " + lv + ", " + rv, is_in_func)
+                return r_cmp
+            else:
+                i_pred = "eq"
+                if op == '!=':
+                    i_pred = "ne"
+                elif op == '<':
+                    i_pred = "slt"
+                elif op == '>':
+                    i_pred = "sgt"
+                elif op == '<=':
+                    i_pred = "sle"
+                elif op == '>=':
+                    i_pred = "sge"
+                r_cmp = self.new_reg()
+                self.emit(r_cmp + " = icmp " + i_pred + " i64 " + lv + ", " + rv, is_in_func)
+                return r_cmp
+        if node.type == "NOT":
+            inner_i1 = self._emit_native_cond_i1(node.children[0], var_types, loop_var, is_in_func)
+            r_not = self.new_reg()
+            self.emit(r_not + " = xor i1 " + inner_i1 + ", true", is_in_func)
+            return r_not
+        res = self._emit_native_expr(node, var_types, loop_var, is_in_func)
+        r_cmp = self.new_reg()
+        if res[1] == CodeGen.NATIVE_FLOAT:
+            self.emit(r_cmp + " = fcmp une double " + res[0] + ", 0.0", is_in_func)
+        else:
+            self.emit(r_cmp + " = icmp ne i64 " + res[0] + ", 0", is_in_func)
+        return r_cmp
+
     def _can_emit_native_expr(self, node, var_types, loop_var):
         if node.type == "CONST_INT":
-            return CodeGen.NATIVE_INT
+            if self._is_safe_int_literal(node.value):
+                return CodeGen.NATIVE_INT
+            return None
         if node.type == "CONST_FLOAT":
             return CodeGen.NATIVE_FLOAT
         if node.type == "NAME":
-            if node.value == loop_var:
-                return CodeGen.NATIVE_INT
-            return var_types.get(node.value, None)
-        if node.type == "UNARY" and node.value == "-":
-            return self._can_emit_native_expr(node.children[0], var_types, loop_var)
+            t = self._lookup_var_type(node.value, var_types, loop_var)
+            if t == CodeGen.NATIVE_INT or t == CodeGen.NATIVE_FLOAT:
+                return t
+            return None
+        if node.type == "UNARY" and (node.value == "-" or node.value == "~" or node.value == "+"):
+            ut = self._can_emit_native_expr(node.children[0], var_types, loop_var)
+            if node.value == "~" and ut != CodeGen.NATIVE_INT:
+                return None
+            return ut
+        if node.type == "SUBSCRIPT":
+            ct = self._infer_type_heuristic(node.children[0], var_types, loop_var)
+            et = self._elem_type_of_list(ct)
+            if et == CodeGen.NATIVE_INT or et == CodeGen.NATIVE_FLOAT:
+                if self._can_emit_native_list_items_ptr(node.children[0], var_types, loop_var):
+                    it = self._can_emit_native_expr(node.children[1], var_types, loop_var)
+                    if it == CodeGen.NATIVE_INT:
+                        return et
+            return None
         if node.type == "BINOP":
             lt = self._can_emit_native_expr(node.children[0], var_types, loop_var)
             rt = self._can_emit_native_expr(node.children[1], var_types, loop_var)
@@ -3773,19 +4266,34 @@ class CodeGen:
             if lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT:
                 if op == '/':
                     return CodeGen.NATIVE_FLOAT
-                if op in ('+', '-', '*', '//', '%'):
+                if op in ('+', '-', '*', '//', '%', '&', '|', '^', '<<', '>>'):
                     return CodeGen.NATIVE_INT
                 return None
         return None
 
     def _can_emit_native_stmt(self, stmt, var_types, loop_var):
+        if stmt.type == "PASS":
+            return True
         if stmt.type == "ASSIGN":
             target = stmt.children[0]
             if target.type == "NAME":
                 et = self._can_emit_native_expr(stmt.children[1], var_types, loop_var)
                 if et == None:
                     return False
-                return var_types.get(target.value, None) != None
+                vt = var_types.get(target.value, None)
+                return vt == CodeGen.NATIVE_INT or vt == CodeGen.NATIVE_FLOAT
+            elif target.type == "SUBSCRIPT":
+                ct = self._infer_type_heuristic(target.children[0], var_types, loop_var)
+                elem_t = self._elem_type_of_list(ct)
+                if elem_t != CodeGen.NATIVE_INT and elem_t != CodeGen.NATIVE_FLOAT:
+                    return False
+                if not self._can_emit_native_list_items_ptr(target.children[0], var_types, loop_var):
+                    return False
+                it = self._can_emit_native_expr(target.children[1], var_types, loop_var)
+                if it != CodeGen.NATIVE_INT:
+                    return False
+                et = self._can_emit_native_expr(stmt.children[1], var_types, loop_var)
+                return et == elem_t
             elif target.type == "TUPLE":
                 val = stmt.children[1]
                 if val.type == "TUPLE":
@@ -3798,7 +4306,8 @@ class CodeGen:
                         et = self._can_emit_native_expr(val.children[i], var_types, loop_var)
                         if et == None:
                             return False
-                        if var_types.get(target.children[i].value, None) == None:
+                        vt = var_types.get(target.children[i].value, None)
+                        if vt != CodeGen.NATIVE_INT and vt != CodeGen.NATIVE_FLOAT:
                             return False
                         i = i + 1
                     return True
@@ -3806,12 +4315,81 @@ class CodeGen:
         if stmt.type == "AUGASSIGN":
             target = stmt.children[0]
             if target.type == "NAME":
-                if not (stmt.value in ('+=', '-=', '*=', '/=')):
+                if not (stmt.value in ('+=', '-=', '*=', '/=', '//=', '%=', '&=', '|=', '^=', '<<=', '>>=')):
                     return False
                 et = self._can_emit_native_expr(stmt.children[1], var_types, loop_var)
                 if et == None:
                     return False
-                return var_types.get(target.value, None) != None
+                vt = var_types.get(target.value, None)
+                return vt == CodeGen.NATIVE_INT or vt == CodeGen.NATIVE_FLOAT
+            elif target.type == "SUBSCRIPT":
+                if not (stmt.value in ('+=', '-=', '*=', '/=', '//=', '%=', '&=', '|=', '^=', '<<=', '>>=')):
+                    return False
+                ct = self._infer_type_heuristic(target.children[0], var_types, loop_var)
+                elem_t = self._elem_type_of_list(ct)
+                if elem_t != CodeGen.NATIVE_INT and elem_t != CodeGen.NATIVE_FLOAT:
+                    return False
+                if not self._can_emit_native_list_items_ptr(target.children[0], var_types, loop_var):
+                    return False
+                it = self._can_emit_native_expr(target.children[1], var_types, loop_var)
+                if it != CodeGen.NATIVE_INT:
+                    return False
+                et = self._can_emit_native_expr(stmt.children[1], var_types, loop_var)
+                return et != None
+            return False
+        if stmt.type == "IF":
+            if not self._can_emit_native_cond(stmt.children[0], var_types, loop_var):
+                return False
+            then_b = stmt.children[1]
+            i = 0
+            while i < len(then_b.children):
+                if not self._can_emit_native_stmt(then_b.children[i], var_types, loop_var):
+                    return False
+                i = i + 1
+            if len(stmt.children) >= 3:
+                else_n = stmt.children[2]
+                if else_n.type == "IF":
+                    return self._can_emit_native_stmt(else_n, var_types, loop_var)
+                i = 0
+                while i < len(else_n.children):
+                    if not self._can_emit_native_stmt(else_n.children[i], var_types, loop_var):
+                        return False
+                    i = i + 1
+            return True
+        if stmt.type == "WHILE":
+            if len(stmt.children) > 2:
+                return False
+            if not self._can_emit_native_cond(stmt.children[0], var_types, loop_var):
+                return False
+            wb = stmt.children[1]
+            i = 0
+            while i < len(wb.children):
+                if not self._can_emit_native_stmt(wb.children[i], var_types, loop_var):
+                    return False
+                i = i + 1
+            return True
+        if stmt.type == "FOR":
+            if len(stmt.children) > 2:
+                return False
+            iter_n = stmt.children[0]
+            if iter_n.type == "CALL" and iter_n.children[0].type == "NAME" and iter_n.children[0].value == "range":
+                rargs = iter_n.children[1].children
+                if len(rargs) >= 1 and len(rargs) <= 2:
+                    r_ok = True
+                    ri = 0
+                    while ri < len(rargs):
+                        if self._can_emit_native_expr(rargs[ri], var_types, loop_var) != CodeGen.NATIVE_INT:
+                            r_ok = False
+                        ri = ri + 1
+                    if r_ok and var_types.get(stmt.value, None) == CodeGen.NATIVE_INT:
+                        fb = stmt.children[1]
+                        i = 0
+                        while i < len(fb.children):
+                            if not self._can_emit_native_stmt(fb.children[i], var_types, loop_var):
+                                return False
+                            i = i + 1
+                        return True
+            return False
         return False
 
     def _emit_native_expr(self, node, var_types, loop_var, is_in_func):
@@ -3833,18 +4411,49 @@ class CodeGen:
                 r = self.new_reg()
                 self.emit(r + " = load i64, i64* %loc__i_" + node.value, is_in_func)
                 return [r, CodeGen.NATIVE_INT]
+            gt = self.global_var_types.get(node.value, None)
+            if gt == CodeGen.NATIVE_INT:
+                tv_r = self.emit_load_var(node.value, is_in_func)
+                ir = self.emit_unbox_int(tv_r, is_in_func)
+                return [ir, CodeGen.NATIVE_INT]
+            if gt == CodeGen.NATIVE_FLOAT:
+                tv_r = self.emit_load_var(node.value, is_in_func)
+                dr = self.new_reg()
+                self.emit(dr + " = bitcast i64 " + tv_r + " to double", is_in_func)
+                return [dr, CodeGen.NATIVE_FLOAT]
             return None
-        if node.type == "UNARY" and node.value == "-":
+        if node.type == "UNARY" and (node.value == "-" or node.value == "~" or node.value == "+"):
             inner = self._emit_native_expr(node.children[0], var_types, loop_var, is_in_func)
             if inner == None:
                 return None
+            if node.value == "+":
+                return inner
             r = self.new_reg()
+            if node.value == "~":
+                self.emit(r + " = xor i64 " + inner[0] + ", -1", is_in_func)
+                return [r, CodeGen.NATIVE_INT]
             if inner[1] == CodeGen.NATIVE_FLOAT:
                 self.emit(r + " = fneg double " + inner[0], is_in_func)
                 return [r, CodeGen.NATIVE_FLOAT]
             else:
                 self.emit(r + " = sub i64 0, " + inner[0], is_in_func)
                 return [r, CodeGen.NATIVE_INT]
+        if node.type == "SUBSCRIPT":
+            ct = self._infer_type_heuristic(node.children[0], var_types, loop_var)
+            elem_t = self._elem_type_of_list(ct)
+            items_ptr = self._emit_native_list_items_ptr(node.children[0], var_types, loop_var, is_in_func)
+            idx_res = self._emit_native_expr(node.children[1], var_types, loop_var, is_in_func)
+            r_ep = self.new_reg()
+            self.emit(r_ep + " = getelementptr inbounds i64, i64* " + items_ptr + ", i64 " + idx_res[0], is_in_func)
+            r_tv = self.new_reg()
+            self.emit(r_tv + " = load i64, i64* " + r_ep, is_in_func)
+            if elem_t == CodeGen.NATIVE_FLOAT:
+                rd = self.new_reg()
+                self.emit(rd + " = bitcast i64 " + r_tv + " to double", is_in_func)
+                return [rd, CodeGen.NATIVE_FLOAT]
+            else:
+                ri = self.emit_unbox_int(r_tv, is_in_func)
+                return [ri, CodeGen.NATIVE_INT]
         if node.type == "BINOP":
             l_res = self._emit_native_expr(node.children[0], var_types, loop_var, is_in_func)
             if l_res == None:
@@ -3886,12 +4495,24 @@ class CodeGen:
                     i_op = "sdiv"
                 elif op == '%':
                     i_op = "srem"
+                elif op == '&':
+                    i_op = "and"
+                elif op == '|':
+                    i_op = "or"
+                elif op == '^':
+                    i_op = "xor"
+                elif op == '<<':
+                    i_op = "shl"
+                elif op == '>>':
+                    i_op = "ashr"
                 r = self.new_reg()
                 self.emit(r + " = " + i_op + " i64 " + lv + ", " + rv, is_in_func)
                 return [r, CodeGen.NATIVE_INT]
         return None
 
     def _emit_native_stmt(self, stmt, var_types, loop_var, is_in_func):
+        if stmt.type == "PASS":
+            return True
         if stmt.type == "ASSIGN":
             target = stmt.children[0]
             if target.type == "NAME":
@@ -3915,6 +4536,25 @@ class CodeGen:
                         val_r = rc
                     self.emit("store i64 " + val_r + ", i64* %loc__i_" + target.value, is_in_func)
                     return True
+            elif target.type == "SUBSCRIPT":
+                ct = self._infer_type_heuristic(target.children[0], var_types, loop_var)
+                elem_t = self._elem_type_of_list(ct)
+                items_ptr = self._emit_native_list_items_ptr(target.children[0], var_types, loop_var, is_in_func)
+                idx_res = self._emit_native_expr(target.children[1], var_types, loop_var, is_in_func)
+                val_res = self._emit_native_expr(stmt.children[1], var_types, loop_var, is_in_func)
+                if elem_t == CodeGen.NATIVE_FLOAT:
+                    vr = val_res[0]
+                    if val_res[1] == CodeGen.NATIVE_INT:
+                        rc = self.new_reg()
+                        self.emit(rc + " = sitofp i64 " + vr + " to double", is_in_func)
+                        vr = rc
+                    boxed_r = self.emit_box_float(vr, is_in_func)
+                else:
+                    boxed_r = self.emit_box_int(val_res[0], is_in_func)
+                r_ep = self.new_reg()
+                self.emit(r_ep + " = getelementptr inbounds i64, i64* " + items_ptr + ", i64 " + idx_res[0], is_in_func)
+                self.emit("store i64 " + boxed_r + ", i64* " + r_ep, is_in_func)
+                return True
             elif target.type == "TUPLE":
                 val = stmt.children[1]
                 if val.type == "TUPLE":
@@ -3957,7 +4597,7 @@ class CodeGen:
                 val_r = res[0]
                 vt = res[1]
                 t = var_types.get(target.value, None)
-                op = stmt.value[0]
+                op = stmt.value[0:len(stmt.value) - 1]
                 if t == CodeGen.NATIVE_FLOAT:
                     if vt == CodeGen.NATIVE_INT:
                         rc = self.new_reg()
@@ -3984,10 +4624,169 @@ class CodeGen:
                         i_op = "sub"
                     elif op == '*':
                         i_op = "mul"
+                    elif op == '//':
+                        i_op = "sdiv"
+                    elif op == '%':
+                        i_op = "srem"
+                    elif op == '&':
+                        i_op = "and"
+                    elif op == '|':
+                        i_op = "or"
+                    elif op == '^':
+                        i_op = "xor"
+                    elif op == '<<':
+                        i_op = "shl"
+                    elif op == '>>':
+                        i_op = "ashr"
                     new_r = self.new_reg()
                     self.emit(new_r + " = " + i_op + " i64 " + cur_r + ", " + val_r, is_in_func)
                     self.emit("store i64 " + new_r + ", i64* %loc__i_" + target.value, is_in_func)
                     return True
+            elif target.type == "SUBSCRIPT":
+                ct = self._infer_type_heuristic(target.children[0], var_types, loop_var)
+                elem_t = self._elem_type_of_list(ct)
+                items_ptr = self._emit_native_list_items_ptr(target.children[0], var_types, loop_var, is_in_func)
+                idx_res = self._emit_native_expr(target.children[1], var_types, loop_var, is_in_func)
+                val_res = self._emit_native_expr(stmt.children[1], var_types, loop_var, is_in_func)
+                r_ep = self.new_reg()
+                self.emit(r_ep + " = getelementptr inbounds i64, i64* " + items_ptr + ", i64 " + idx_res[0], is_in_func)
+                r_old_tv = self.new_reg()
+                self.emit(r_old_tv + " = load i64, i64* " + r_ep, is_in_func)
+                op = stmt.value[0:len(stmt.value) - 1]
+                if elem_t == CodeGen.NATIVE_FLOAT:
+                    old_d = self.new_reg()
+                    self.emit(old_d + " = bitcast i64 " + r_old_tv + " to double", is_in_func)
+                    vr = val_res[0]
+                    if val_res[1] == CodeGen.NATIVE_INT:
+                        rc = self.new_reg()
+                        self.emit(rc + " = sitofp i64 " + vr + " to double", is_in_func)
+                        vr = rc
+                    f_op = "fadd"
+                    if op == '-':
+                        f_op = "fsub"
+                    elif op == '*':
+                        f_op = "fmul"
+                    elif op == '/':
+                        f_op = "fdiv"
+                    new_d = self.new_reg()
+                    self.emit(new_d + " = " + f_op + " double " + old_d + ", " + vr, is_in_func)
+                    boxed_r = self.emit_box_float(new_d, is_in_func)
+                    self.emit("store i64 " + boxed_r + ", i64* " + r_ep, is_in_func)
+                    return True
+                else:
+                    old_i = self.emit_unbox_int(r_old_tv, is_in_func)
+                    i_op = "add"
+                    if op == '-':
+                        i_op = "sub"
+                    elif op == '*':
+                        i_op = "mul"
+                    elif op == '//':
+                        i_op = "sdiv"
+                    elif op == '%':
+                        i_op = "srem"
+                    elif op == '&':
+                        i_op = "and"
+                    elif op == '|':
+                        i_op = "or"
+                    elif op == '^':
+                        i_op = "xor"
+                    elif op == '<<':
+                        i_op = "shl"
+                    elif op == '>>':
+                        i_op = "ashr"
+                    new_i = self.new_reg()
+                    self.emit(new_i + " = " + i_op + " i64 " + old_i + ", " + val_res[0], is_in_func)
+                    boxed_r = self.emit_box_int(new_i, is_in_func)
+                    self.emit("store i64 " + boxed_r + ", i64* " + r_ep, is_in_func)
+                    return True
+        if stmt.type == "IF":
+            c_i1 = self._emit_native_cond_i1(stmt.children[0], var_types, loop_var, is_in_func)
+            lbl_then = self.new_label("nat_if_then")
+            lbl_else = self.new_label("nat_if_else")
+            lbl_end = self.new_label("nat_if_end")
+            if len(stmt.children) >= 3:
+                self.emit_cond_br(c_i1, lbl_then, lbl_else, is_in_func)
+                self.emit_label(lbl_then, is_in_func)
+                then_b = stmt.children[1]
+                i = 0
+                while i < len(then_b.children):
+                    self._emit_native_stmt(then_b.children[i], var_types, loop_var, is_in_func)
+                    i = i + 1
+                self.emit_br(lbl_end, is_in_func)
+                self.emit_label(lbl_else, is_in_func)
+                else_n = stmt.children[2]
+                if else_n.type == "IF":
+                    self._emit_native_stmt(else_n, var_types, loop_var, is_in_func)
+                else:
+                    i = 0
+                    while i < len(else_n.children):
+                        self._emit_native_stmt(else_n.children[i], var_types, loop_var, is_in_func)
+                        i = i + 1
+                self.emit_br(lbl_end, is_in_func)
+                self.emit_label(lbl_end, is_in_func)
+            else:
+                self.emit_cond_br(c_i1, lbl_then, lbl_end, is_in_func)
+                self.emit_label(lbl_then, is_in_func)
+                then_b = stmt.children[1]
+                i = 0
+                while i < len(then_b.children):
+                    self._emit_native_stmt(then_b.children[i], var_types, loop_var, is_in_func)
+                    i = i + 1
+                self.emit_br(lbl_end, is_in_func)
+                self.emit_label(lbl_end, is_in_func)
+            return True
+        if stmt.type == "WHILE":
+            lbl_cond = self.new_label("nat_w_cond")
+            lbl_body = self.new_label("nat_w_body")
+            lbl_end = self.new_label("nat_w_end")
+            self.emit_label(lbl_cond, is_in_func)
+            c_i1 = self._emit_native_cond_i1(stmt.children[0], var_types, loop_var, is_in_func)
+            self.emit_cond_br(c_i1, lbl_body, lbl_end, is_in_func)
+            self.emit_label(lbl_body, is_in_func)
+            wb = stmt.children[1]
+            i = 0
+            while i < len(wb.children):
+                self._emit_native_stmt(wb.children[i], var_types, loop_var, is_in_func)
+                i = i + 1
+            self.emit_br(lbl_cond, is_in_func)
+            self.emit_label(lbl_end, is_in_func)
+            return True
+        if stmt.type == "FOR":
+            vname = stmt.value
+            rargs = stmt.children[0].children[1].children
+            r_start = "0"
+            if len(rargs) == 1:
+                stop_res = self._emit_native_expr(rargs[0], var_types, loop_var, is_in_func)
+                r_stop = stop_res[0]
+            else:
+                start_res = self._emit_native_expr(rargs[0], var_types, loop_var, is_in_func)
+                stop_res = self._emit_native_expr(rargs[1], var_types, loop_var, is_in_func)
+                r_start = start_res[0]
+                r_stop = stop_res[0]
+            self.emit("store i64 " + r_start + ", i64* %loc__i_" + vname, is_in_func)
+            lbl_cond = self.new_label("nat_nfor_cond")
+            lbl_body = self.new_label("nat_nfor_body")
+            lbl_end = self.new_label("nat_nfor_end")
+            self.emit_label(lbl_cond, is_in_func)
+            r_iv = self.new_reg()
+            self.emit(r_iv + " = load i64, i64* %loc__i_" + vname, is_in_func)
+            r_cmp = self.new_reg()
+            self.emit(r_cmp + " = icmp slt i64 " + r_iv + ", " + r_stop, is_in_func)
+            self.emit_cond_br(r_cmp, lbl_body, lbl_end, is_in_func)
+            self.emit_label(lbl_body, is_in_func)
+            fb = stmt.children[1]
+            i = 0
+            while i < len(fb.children):
+                self._emit_native_stmt(fb.children[i], var_types, loop_var, is_in_func)
+                i = i + 1
+            r_iv2 = self.new_reg()
+            self.emit(r_iv2 + " = load i64, i64* %loc__i_" + vname, is_in_func)
+            r_ivn = self.new_reg()
+            self.emit(r_ivn + " = add i64 " + r_iv2 + ", 1", is_in_func)
+            self.emit("store i64 " + r_ivn + ", i64* %loc__i_" + vname, is_in_func)
+            self.emit_br(lbl_cond, is_in_func)
+            self.emit_label(lbl_end, is_in_func)
+            return True
         return False
 
     def _collect_names(self, node, names):
@@ -4000,17 +4799,70 @@ class CodeGen:
 
     def _infer_type_heuristic(self, node, var_types, loop_var):
         if node.type == "NAME":
-            if node.value == loop_var:
-                return CodeGen.NATIVE_INT
-            if node.value in var_types:
-                return var_types[node.value]
-            return None
+            return self._lookup_var_type(node.value, var_types, loop_var)
         if node.type == "CONST_FLOAT":
             return CodeGen.NATIVE_FLOAT
         if node.type == "CONST_INT":
-            return CodeGen.NATIVE_INT
-        if node.type == "UNARY" and node.value == "-":
-            return self._infer_type_heuristic(node.children[0], var_types, loop_var)
+            if self._is_safe_int_literal(node.value):
+                return CodeGen.NATIVE_INT
+            return None
+        if node.type == "UNARY" and (node.value == "-" or node.value == "~" or node.value == "+"):
+            ut = self._infer_type_heuristic(node.children[0], var_types, loop_var)
+            if node.value == "~" and ut != CodeGen.NATIVE_INT:
+                return None
+            return ut
+        if node.type == "SUBSCRIPT":
+            ct = self._infer_type_heuristic(node.children[0], var_types, loop_var)
+            return self._elem_type_of_list(ct)
+        if node.type == "CALL":
+            fn_n = node.children[0]
+            if fn_n.type == "NAME":
+                fname = fn_n.value
+                if fname == "int" or fname == "len" or fname == "ord":
+                    return CodeGen.NATIVE_INT
+                if fname == "float":
+                    return CodeGen.NATIVE_FLOAT
+                if fname == "sum" and len(node.children[1].children) == 1:
+                    arg0 = node.children[1].children[0]
+                    if arg0.type == "LISTCOMP" or arg0.type == "GENCOMP":
+                        ct = self._infer_type_heuristic(arg0, var_types, loop_var)
+                        return self._elem_type_of_list(ct)
+                    else:
+                        ct = self._infer_type_heuristic(arg0, var_types, loop_var)
+                        return self._elem_type_of_list(ct)
+                if (self.mod_prefix + fname) in self.func_ret_types:
+                    return self.func_ret_types[self.mod_prefix + fname]
+                if fname in self.func_ret_types:
+                    return self.func_ret_types[fname]
+            return None
+        if node.type == "LIST":
+            if len(node.children) > 0:
+                et0 = self._infer_type_heuristic(node.children[0], var_types, loop_var)
+                if et0 != None:
+                    same = True
+                    li = 1
+                    while li < len(node.children):
+                        if self._infer_type_heuristic(node.children[li], var_types, loop_var) != et0:
+                            same = False
+                            break
+                        li = li + 1
+                    if same:
+                        return "list:" + et0
+            return None
+        if node.type == "LISTCOMP" or node.type == "GENCOMP":
+            gen_n = node.children[1]
+            if gen_n.type == "GENERATOR" or gen_n.type == "COMP_FOR":
+                iter_n = gen_n.children[0]
+                t_names = gen_n.value.split(',')
+                vt_copy = {}
+                for k in var_types:
+                    vt_copy[k] = var_types[k]
+                if len(t_names) == 1 and iter_n.type == "CALL" and iter_n.children[0].type == "NAME" and iter_n.children[0].value == "range":
+                    vt_copy[t_names[0]] = CodeGen.NATIVE_INT
+                et = self._infer_type_heuristic(node.children[0], vt_copy, loop_var)
+                if et != None:
+                    return "list:" + et
+            return None
         if node.type == "BINOP":
             lt = self._infer_type_heuristic(node.children[0], var_types, loop_var)
             rt = self._infer_type_heuristic(node.children[1], var_types, loop_var)
@@ -4022,15 +4874,86 @@ class CodeGen:
                     return CodeGen.NATIVE_FLOAT
                 return None
             if lt == CodeGen.NATIVE_INT and rt == CodeGen.NATIVE_INT:
-                if op in ('+', '-', '*', '//', '%'):
+                if op in ('+', '-', '*', '//', '%', '&', '|', '^', '<<', '>>'):
                     return CodeGen.NATIVE_INT
                 return None
-            if lt != None:
+            if lt != None and lt.startswith("list:") and rt == CodeGen.NATIVE_INT and op == '*':
                 return lt
-            if rt != None:
+            if rt != None and rt.startswith("list:") and lt == CodeGen.NATIVE_INT and op == '*':
                 return rt
+            if lt != None and lt.startswith("list:") and rt == lt and op == '+':
+                return lt
             return None
         return None
+
+    def _infer_module_global_types(self, body_node):
+        assign_counts = {}
+        assign_types = {}
+        i = 0
+        while i < len(body_node.children):
+            stmt = body_node.children[i]
+            if stmt.type == "ASSIGN":
+                target = stmt.children[0]
+                if target.type == "NAME":
+                    vname = target.value
+                    c = 0
+                    if vname in assign_counts:
+                        c = assign_counts[vname]
+                    assign_counts[vname] = c + 1
+                    t = self._infer_type_heuristic(stmt.children[1], self.global_var_types, None)
+                    if t == CodeGen.NATIVE_INT or t == CodeGen.NATIVE_FLOAT:
+                        assign_types[vname] = t
+            i = i + 1
+        for k in assign_types:
+            if assign_counts.get(k, 0) == 1:
+                self.global_var_types[k] = assign_types[k]
+
+    def _infer_func_ret_type(self, body_node, var_types):
+        found_t = None
+        i = 0
+        while i < len(body_node.children):
+            stmt = body_node.children[i]
+            if stmt.type == "RETURN":
+                if len(stmt.children) == 0 or stmt.children[0].type == "CONST_NONE":
+                    return None
+                rt = self._infer_type_heuristic(stmt.children[0], var_types, None)
+                if rt == None:
+                    return None
+                if found_t == None:
+                    found_t = rt
+                elif found_t != rt:
+                    return None
+            elif stmt.type == "IF":
+                _i = 0
+                while _i < len(stmt.children):
+                    if _i + 1 < len(stmt.children):
+                        sub_t = self._infer_func_ret_type(stmt.children[_i + 1], var_types)
+                    else:
+                        sub_t = self._infer_func_ret_type(stmt.children[_i], var_types)
+                    if sub_t != None:
+                        if found_t == None:
+                            found_t = sub_t
+                        elif found_t != sub_t:
+                            return None
+                    _i = _i + 2
+            elif stmt.type == "FOR" or stmt.type == "WHILE":
+                sub_t = self._infer_func_ret_type(stmt.children[1], var_types)
+                if sub_t != None:
+                    if found_t == None:
+                        found_t = sub_t
+                    elif found_t != sub_t:
+                        return None
+            i = i + 1
+        return found_t
+
+    def _infer_range_bound_vars(self, node, var_types):
+        if node.type == "NAME":
+            if not (node.value in var_types):
+                var_types[node.value] = CodeGen.NATIVE_INT
+        elif node.type == "BINOP":
+            if node.value in ('+', '-', '*', '//', '%', '&', '|', '^', '<<', '>>'):
+                self._infer_range_bound_vars(node.children[0], var_types)
+                self._infer_range_bound_vars(node.children[1], var_types)
 
     def _infer_func_types(self, body_node, var_types):
         for stmt in body_node.children:
@@ -4057,9 +4980,24 @@ class CodeGen:
                 iter_node = stmt.children[0]
                 if iter_node.type == "CALL" and iter_node.children[0].type == "NAME" and iter_node.children[0].value == "range":
                     var_types[stmt.value] = CodeGen.NATIVE_INT
+                    rargs = iter_node.children[1].children
+                    ri = 0
+                    while ri < len(rargs):
+                        self._infer_range_bound_vars(rargs[ri], var_types)
+                        ri = ri + 1
                 body = stmt.children[1]
                 self._infer_func_types(body, var_types)
             elif stmt.type == "WHILE":
+                cond_n = stmt.children[0]
+                if cond_n.type == "COMP":
+                    c0 = cond_n.children[0]
+                    c1 = cond_n.children[1]
+                    t0 = self._infer_type_heuristic(c0, var_types, None)
+                    t1 = self._infer_type_heuristic(c1, var_types, None)
+                    if c0.type == "NAME" and not (c0.value in var_types) and (t1 == CodeGen.NATIVE_INT or t1 == CodeGen.NATIVE_FLOAT):
+                        var_types[c0.value] = t1
+                    elif c1.type == "NAME" and not (c1.value in var_types) and (t0 == CodeGen.NATIVE_INT or t0 == CodeGen.NATIVE_FLOAT):
+                        var_types[c1.value] = t0
                 body = stmt.children[1]
                 self._infer_func_types(body, var_types)
             elif stmt.type == "IF":
@@ -4069,7 +5007,11 @@ class CodeGen:
                         body = stmt.children[_i + 1]
                         self._infer_func_types(body, var_types)
                     else:
-                        self._infer_func_types(stmt.children[_i], var_types)
+                        else_n = stmt.children[_i]
+                        if else_n.type == "IF":
+                            self._infer_func_types(ASTNode("BLOCK", "", [else_n]), var_types)
+                        else:
+                            self._infer_func_types(else_n, var_types)
                     _i = _i + 2
             elif stmt.type == "TYPEDEF" or stmt.type == "DEF" or stmt.type == "ASYNC_DEF":
                 pass
@@ -4129,10 +5071,7 @@ class CodeGen:
             stmt_idx = stmt_idx + 1
         return ops
 
-    def _scan_body_vars(self, body_node, var_types, loop_var):
-        lhs_map = {}
-        lhs_keys_list = []
-        stmt_types = []
+    def _collect_loop_body_stmts(self, body_node, lhs_map, lhs_keys_list, stmt_types):
         s_idx = 0
         while s_idx < len(body_node.children):
             stmt = body_node.children[s_idx]
@@ -4142,6 +5081,8 @@ class CodeGen:
                 if target.type == "NAME":
                     lhs_map[target.value] = stmt
                     lhs_keys_list.append(target.value)
+                elif target.type == "SUBSCRIPT":
+                    pass
                 elif target.type == "TUPLE":
                     all_names = True
                     for elem in target.children:
@@ -4155,11 +5096,75 @@ class CodeGen:
                         lhs_keys_list.append(elem.value)
                 else:
                     return False
+            elif stmt.type == "IF":
+                if not self._collect_loop_body_stmts(stmt.children[1], lhs_map, lhs_keys_list, stmt_types):
+                    return False
+                if len(stmt.children) >= 3:
+                    else_n = stmt.children[2]
+                    if else_n.type == "IF":
+                        if not self._collect_loop_body_stmts(ASTNode("BLOCK", "", [else_n]), lhs_map, lhs_keys_list, stmt_types):
+                            return False
+                    else:
+                        if not self._collect_loop_body_stmts(else_n, lhs_map, lhs_keys_list, stmt_types):
+                            return False
+            elif stmt.type == "WHILE":
+                if len(stmt.children) > 2:
+                    return False
+                if not self._collect_loop_body_stmts(stmt.children[1], lhs_map, lhs_keys_list, stmt_types):
+                    return False
+            elif stmt.type == "FOR":
+                if len(stmt.children) > 2:
+                    return False
+                iter_n = stmt.children[0]
+                if iter_n.type == "CALL" and iter_n.children[0].type == "NAME" and iter_n.children[0].value == "range":
+                    lhs_keys_list.append(stmt.value)
+                else:
+                    return False
+                if not self._collect_loop_body_stmts(stmt.children[1], lhs_map, lhs_keys_list, stmt_types):
+                    return False
+            elif stmt.type == "PASS":
+                pass
+            else:
+                return False
             s_idx = s_idx + 1
+        return True
+
+    def _collect_read_scalar_vars(self, node, var_types, loop_var, out_list):
+        if node.type == "NAME":
+            v = node.value
+            if v != loop_var and v in var_types:
+                vt = var_types[v]
+                if vt == CodeGen.NATIVE_INT or vt == CodeGen.NATIVE_FLOAT:
+                    found = False
+                    i = 0
+                    while i < len(out_list):
+                        if out_list[i] == v:
+                            found = True
+                        i = i + 1
+                    if not found:
+                        out_list.append(v)
+        if hasattr(node, 'children') and node.children:
+            i = 0
+            while i < len(node.children):
+                c = node.children[i]
+                if isinstance(c, ASTNode):
+                    self._collect_read_scalar_vars(c, var_types, loop_var, out_list)
+                i = i + 1
+
+    def _scan_body_vars(self, body_node, var_types, loop_var):
+        lhs_map = {}
+        lhs_keys_list = []
+        stmt_types = []
+        if not self._collect_loop_body_stmts(body_node, lhs_map, lhs_keys_list, stmt_types):
+            return False
+        has_sub_control = False
         t_idx = 0
         while t_idx < len(stmt_types):
-            if stmt_types[t_idx] != "ASSIGN" and stmt_types[t_idx] != "AUGASSIGN":
+            st = stmt_types[t_idx]
+            if st != "ASSIGN" and st != "AUGASSIGN" and st != "IF" and st != "WHILE" and st != "FOR" and st != "PASS":
                 return False
+            if st == "IF" or st == "WHILE" or st == "FOR":
+                has_sub_control = True
             t_idx = t_idx + 1
         op_usage = self._collect_op_usage(body_node)
         changed = True
@@ -4168,13 +5173,13 @@ class CodeGen:
             k_idx = 0
             while k_idx < len(lhs_keys_list):
                 v = lhs_keys_list[k_idx]
-                if v in var_types:
+                if v in var_types or not (v in lhs_map):
                     k_idx = k_idx + 1
                     continue
                 stmt = lhs_map[v]
                 val = stmt.children[1]
                 typ = self._infer_type_heuristic(val, var_types, loop_var)
-                if typ != None:
+                if typ == CodeGen.NATIVE_INT or typ == CodeGen.NATIVE_FLOAT:
                     var_types[v] = typ
                     changed = True
                 k_idx = k_idx + 1
@@ -4194,7 +5199,7 @@ class CodeGen:
             if has_div:
                 var_types[v] = CodeGen.NATIVE_FLOAT
                 changed = True
-            else:
+            elif not has_sub_control:
                 has_arith = False
                 u_idx = 0
                 while u_idx < len(uses):
@@ -4206,11 +5211,13 @@ class CodeGen:
                     changed = True
                 else:
                     typ = self._type_from_body_use(v, body_node, loop_var)
-                    if typ != None:
+                    if typ == CodeGen.NATIVE_INT or typ == CodeGen.NATIVE_FLOAT:
                         var_types[v] = typ
                         changed = True
                     else:
                         return False
+            else:
+                return False
             k_idx = k_idx + 1
         changed = True
         while changed:
@@ -4218,13 +5225,13 @@ class CodeGen:
             k_idx = 0
             while k_idx < len(lhs_keys_list):
                 v = lhs_keys_list[k_idx]
-                if not (v in var_types):
+                if not (v in var_types) or not (v in lhs_map):
                     k_idx = k_idx + 1
                     continue
                 stmt = lhs_map[v]
                 val = stmt.children[1]
                 t = self._infer_type_heuristic(val, var_types, loop_var)
-                if t != None and t != var_types[v]:
+                if (t == CodeGen.NATIVE_INT or t == CodeGen.NATIVE_FLOAT) and t != var_types[v]:
                     var_types[v] = t
                     changed = True
                 k_idx = k_idx + 1
@@ -4233,7 +5240,10 @@ class CodeGen:
             v = lhs_keys_list[k_idx]
             if not (v in var_types):
                 return False
+            if var_types[v] != CodeGen.NATIVE_INT and var_types[v] != CodeGen.NATIVE_FLOAT:
+                return False
             k_idx = k_idx + 1
+        self._collect_read_scalar_vars(body_node, var_types, loop_var, lhs_keys_list)
         # Verify every statement in body_node can be emitted natively
         s_idx = 0
         while s_idx < len(body_node.children):
@@ -4439,6 +5449,76 @@ class CodeGen:
                 new_reg = self.new_reg()
                 self.emit(new_reg + " = call i64 " + fn + "(i64 " + old_reg + ", i64 " + val_reg + ")", is_in_func)
                 self.emit_store_var(target.value, new_reg, is_in_func)
+            elif target.type == "SUBSCRIPT":
+                obj_reg = self.gen_expr(target.children[0], is_in_func)
+                idx_reg = self.gen_expr(target.children[1], is_in_func)
+                old_reg = self.new_reg()
+                self.emit(old_reg + " = call i64 @turbo_getitem(i64 " + obj_reg + ", i64 " + idx_reg + ")", is_in_func)
+                fn = "@turbo_add"
+                if op == '+=':
+                    fn = "@turbo_add"
+                elif op == '-=':
+                    fn = "@turbo_sub"
+                elif op == '*=':
+                    fn = "@turbo_mul"
+                elif op == '/=':
+                    fn = "@turbo_div"
+                elif op == '%=':
+                    fn = "@turbo_mod"
+                elif op == '**=':
+                    fn = "@turbo_pow"
+                elif op == '//=':
+                    fn = "@turbo_floordiv"
+                elif op == '&=':
+                    fn = "@turbo_bitand"
+                elif op == '|=':
+                    fn = "@turbo_bitor"
+                elif op == '^=':
+                    fn = "@turbo_bitxor"
+                elif op == '>>=':
+                    fn = "@turbo_rshift"
+                elif op == '<<=':
+                    fn = "@turbo_lshift"
+                elif op == '@=':
+                    fn = "@turbo_matmul"
+                new_reg = self.new_reg()
+                self.emit(new_reg + " = call i64 " + fn + "(i64 " + old_reg + ", i64 " + val_reg + ")", is_in_func)
+                self.emit("call void @turbo_setitem(i64 " + obj_reg + ", i64 " + idx_reg + ", i64 " + new_reg + ")", is_in_func)
+            elif target.type == "ATTR":
+                obj_reg = self.gen_expr(target.children[0], is_in_func)
+                sp_a = self.get_str_ptr(target.value, is_in_func)
+                old_reg = self.new_reg()
+                self.emit(old_reg + " = call i64 @turbo_getattr(i64 " + obj_reg + ", i8* " + sp_a + ")", is_in_func)
+                fn = "@turbo_add"
+                if op == '+=':
+                    fn = "@turbo_add"
+                elif op == '-=':
+                    fn = "@turbo_sub"
+                elif op == '*=':
+                    fn = "@turbo_mul"
+                elif op == '/=':
+                    fn = "@turbo_div"
+                elif op == '%=':
+                    fn = "@turbo_mod"
+                elif op == '**=':
+                    fn = "@turbo_pow"
+                elif op == '//=':
+                    fn = "@turbo_floordiv"
+                elif op == '&=':
+                    fn = "@turbo_bitand"
+                elif op == '|=':
+                    fn = "@turbo_bitor"
+                elif op == '^=':
+                    fn = "@turbo_bitxor"
+                elif op == '>>=':
+                    fn = "@turbo_rshift"
+                elif op == '<<=':
+                    fn = "@turbo_lshift"
+                elif op == '@=':
+                    fn = "@turbo_matmul"
+                new_reg = self.new_reg()
+                self.emit(new_reg + " = call i64 " + fn + "(i64 " + old_reg + ", i64 " + val_reg + ")", is_in_func)
+                self.emit("call void @turbo_setattr(i64 " + obj_reg + ", i8* " + sp_a + ", i64 " + new_reg + ")", is_in_func)
         elif node.type == "RETURN":
             self._flush_pending_native(is_in_func)
             if self.is_generator and node.children[0].type != "CONST_NONE":
@@ -4453,6 +5533,44 @@ class CodeGen:
         elif node.type == "WHILE":
             self._flush_pending_native(is_in_func)
             do_else = len(node.children) > 2
+            if not do_else and is_in_func:
+                w_var_types = {}
+                _idx = 0
+                while _idx < len(self.local_vars):
+                    _k = self.local_vars[_idx]
+                    if _k in self._var_types:
+                        w_var_types[_k] = self._var_types[_k]
+                    _idx = _idx + 1
+                if self._can_emit_native_cond(node.children[0], w_var_types, ""):
+                    w_body = node.children[1]
+                    w_keys = self._scan_body_vars(w_body, w_var_types, "")
+                    if w_keys != False:
+                        self._collect_read_scalar_vars(node.children[0], w_var_types, "", w_keys)
+                        w_float_vars = []
+                        w_int_vars = []
+                        wk_i = 0
+                        while wk_i < len(w_keys):
+                            wk = w_keys[wk_i]
+                            wv = w_var_types[wk]
+                            if wv == CodeGen.NATIVE_FLOAT:
+                                w_float_vars.append(wk)
+                            elif wv == CodeGen.NATIVE_INT:
+                                w_int_vars.append(wk)
+                            wk_i = wk_i + 1
+                        for v in w_float_vars:
+                            self.ensure_typed_alloca("_d_" + v, "double", is_in_func)
+                            tv_r = self.emit_load_var(v, is_in_func)
+                            dbl_r = self.new_reg()
+                            self.emit(dbl_r + " = call double @to_double(i64 " + tv_r + ")", is_in_func)
+                            self.emit("store double " + dbl_r + ", double* %loc__d_" + v, is_in_func)
+                        for v in w_int_vars:
+                            self.ensure_typed_alloca("_i_" + v, "i64", is_in_func)
+                            tv_r = self.emit_load_var(v, is_in_func)
+                            i_r = self.emit_unbox_int(tv_r, is_in_func)
+                            self.emit("store i64 " + i_r + ", i64* %loc__i_" + v, is_in_func)
+                        self._emit_native_stmt(node, w_var_types, "", is_in_func)
+                        self.pending_native_vars = [w_float_vars, w_int_vars, w_var_types, ""]
+                        return
             lbl_cond = self.new_label("while_cond")
             lbl_body = self.new_label("while_body")
             lbl_after = self.new_label("while_after")
@@ -4514,6 +5632,8 @@ class CodeGen:
                         range_stop = self._gen_range_bound(rargs[1], is_in_func)
             if is_range_loop:
                 body_node = node.children[1]
+                if self._try_emit_interchanged_sum_loop(var_name, range_start, range_stop, body_node, is_in_func):
+                    return
                 var_types = {}
                 var_types[var_name] = CodeGen.NATIVE_INT
                 _idx = 0
@@ -4989,6 +6109,7 @@ class CodeGen:
         out.append("declare i64 @make_str(i8*)")
         out.append("declare i64 @make_bool(i32)")
         out.append("declare i64 @make_list()")
+        out.append("declare i64 @make_list_len(i64)")
         out.append("declare i64 @make_tuple()")
         out.append("declare i64 @make_set()")
         out.append("declare i64 @make_dict()")
@@ -5173,6 +6294,7 @@ def main():
             cg.add_global(g_name)
         g_idx = g_idx + 1
 
+    cg._infer_module_global_types(module_ast)
     cg.gen_block_stmts(module_ast, False)
     llvm_source = cg.build_llvm_ir()
 

@@ -552,6 +552,17 @@ TurboVal make_list(void) {
     return tv_make_ptr(obj);
 }
 
+TurboVal make_list_len(int64_t len) {
+    int32_t n = len > 0 ? (int32_t)len : 0;
+    int32_t cap = n > 8 ? n : 8;
+    TurboList* obj = (TurboList*)malloc(sizeof(TurboList));
+    obj->tag = HEAP_LIST;
+    obj->length = n;
+    obj->capacity = cap;
+    obj->items = (TurboVal*)malloc(sizeof(TurboVal) * cap);
+    return tv_make_ptr(obj);
+}
+
 TurboVal make_tuple(void) {
     TurboList* obj = (TurboList*)malloc(sizeof(TurboList));
     obj->tag = HEAP_TUPLE;
