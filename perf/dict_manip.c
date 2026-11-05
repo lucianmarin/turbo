@@ -11,6 +11,7 @@ typedef struct {
     int32_t length;
     int32_t capacity;
     int32_t ht_cap;
+    int32_t ht_tombstones;
 } IntDict;
 
 static inline uint64_t hash_i64(int64_t v) {
@@ -25,6 +26,7 @@ static IntDict* dict_new(int32_t init_cap) {
     d->length = 0;
     d->capacity = init_cap > 8 ? init_cap : 8;
     d->ht_cap = 16;
+    d->ht_tombstones = 0;
     while (d->ht_cap < d->capacity * 2) d->ht_cap *= 2;
     d->keys = (int64_t*)malloc(sizeof(int64_t) * d->capacity);
     d->values = (int64_t*)malloc(sizeof(int64_t) * d->capacity);
@@ -41,16 +43,21 @@ static void dict_free(IntDict* d) {
 }
 
 static void dict_rebuild(IntDict* d, int32_t new_cap) {
-    free(d->buckets);
-    d->ht_cap = new_cap;
-    d->buckets = (int32_t*)malloc(sizeof(int32_t) * new_cap);
-    for (int32_t i = 0; i < new_cap; i++) d->buckets[i] = -1;
+    if (d->buckets && d->ht_cap == new_cap) {
+        for (int32_t i = 0; i < new_cap; i++) d->buckets[i] = -1;
+    } else {
+        free(d->buckets);
+        d->ht_cap = new_cap;
+        d->buckets = (int32_t*)malloc(sizeof(int32_t) * new_cap);
+        for (int32_t i = 0; i < new_cap; i++) d->buckets[i] = -1;
+    }
     uint32_t mask = (uint32_t)(new_cap - 1);
     for (int32_t i = 0; i < d->length; i++) {
         uint32_t b = (uint32_t)hash_i64(d->keys[i]) & mask;
         while (d->buckets[b] >= 0) b = (b + 1) & mask;
         d->buckets[b] = i;
     }
+    d->ht_tombstones = 0;
 }
 
 static int32_t dict_find(const IntDict* d, int64_t key, int32_t* out_slot) {
@@ -74,8 +81,9 @@ static int32_t dict_find(const IntDict* d, int64_t key, int32_t* out_slot) {
 }
 
 static void dict_set(IntDict* d, int64_t key, int64_t val) {
-    if ((d->length + 1) * 2 >= d->ht_cap) {
-        dict_rebuild(d, d->ht_cap * 2);
+    if ((d->length + d->ht_tombstones + 1) * 2 > d->ht_cap) {
+        int32_t next_cap = ((d->length + 1) * 2 > d->ht_cap) ? d->ht_cap * 2 : d->ht_cap;
+        dict_rebuild(d, next_cap);
     }
     int32_t slot = -1;
     int32_t idx = dict_find(d, key, &slot);
@@ -91,6 +99,7 @@ static void dict_set(IntDict* d, int64_t key, int64_t val) {
     int32_t new_idx = d->length++;
     d->keys[new_idx] = key;
     d->values[new_idx] = val;
+    if (d->buckets[slot] == -2) d->ht_tombstones--;
     d->buckets[slot] = new_idx;
 }
 
@@ -107,14 +116,28 @@ static int64_t dict_setdefault(IntDict* d, int64_t key, int64_t def_val) {
 }
 
 static int64_t dict_pop(IntDict* d, int64_t key) {
-    int32_t idx = dict_find(d, key, NULL);
+    int32_t slot = -1;
+    int32_t idx = dict_find(d, key, &slot);
     int64_t v = d->values[idx];
-    for (int32_t j = idx; j < d->length - 1; j++) {
-        d->keys[j] = d->keys[j + 1];
-        d->values[j] = d->values[j + 1];
+    int32_t last_idx = d->length - 1;
+    d->buckets[slot] = -2;
+    d->ht_tombstones++;
+    if (idx != last_idx) {
+        int64_t moved_k = d->keys[last_idx];
+        int64_t moved_v = d->values[last_idx];
+        d->keys[idx] = moved_k;
+        d->values[idx] = moved_v;
+        uint32_t mask = (uint32_t)(d->ht_cap - 1);
+        uint32_t b = (uint32_t)hash_i64(moved_k) & mask;
+        while (true) {
+            if (d->buckets[b] == last_idx) {
+                d->buckets[b] = idx;
+                break;
+            }
+            b = (b + 1) & mask;
+        }
     }
     d->length--;
-    dict_rebuild(d, d->ht_cap);
     return v;
 }
 
@@ -123,6 +146,7 @@ static IntDict* dict_copy(const IntDict* d) {
     c->length = d->length;
     c->capacity = d->capacity;
     c->ht_cap = d->ht_cap;
+    c->ht_tombstones = d->ht_tombstones;
     c->keys = (int64_t*)malloc(sizeof(int64_t) * c->capacity);
     c->values = (int64_t*)malloc(sizeof(int64_t) * c->capacity);
     c->buckets = (int32_t*)malloc(sizeof(int32_t) * c->ht_cap);

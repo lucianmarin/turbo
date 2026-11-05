@@ -2035,6 +2035,15 @@ class CodeGen:
                 r = self.new_reg()
                 self.emit(r + " = call i64 @make_bool(i32 " + r_in + ")", is_in_func)
                 return r
+            if (op == '==' or op == '!=') and (node.children[0].type == "CONST_NONE" or node.children[1].type == "CONST_NONE" or node.children[0].type == "CONST_BOOL" or node.children[1].type == "CONST_BOOL"):
+                r_cmp = self.new_reg()
+                if op == '==':
+                    self.emit(r_cmp + " = icmp eq i64 " + left + ", " + right, is_in_func)
+                else:
+                    self.emit(r_cmp + " = icmp ne i64 " + left + ", " + right, is_in_func)
+                r = self.new_reg()
+                self.emit(r + " = select i1 " + r_cmp + ", i64 -1688849860263933, i64 -1688849860263934", is_in_func)
+                return r
             fn = "@turbo_eq"
             if op == '==':
                 fn = "@turbo_eq"
@@ -2102,6 +2111,11 @@ class CodeGen:
                 arg0 = args_list[0]
                 if arg0.type == "LISTCOMP" or arg0.type == "GENCOMP":
                     return self._emit_fused_sum_comp(arg0, is_in_func)
+            if func_node.type == "NAME" and func_node.value == "len" and argc == 1 and not self.is_local("len", is_in_func):
+                arg_reg = self.gen_expr(args_list[0], is_in_func)
+                r = self.new_reg()
+                self.emit(r + " = call i64 @turbo_len(i64 " + arg_reg + ")", is_in_func)
+                return r
             if func_node.type == "NAME" and func_node.value == "super" and argc == 0:
                 if self.cur_class_name != "" and self.is_local("self", is_in_func):
                     r_cls = self.new_reg()

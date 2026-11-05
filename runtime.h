@@ -102,6 +102,8 @@ typedef struct {
     TurboVal* keys;
     TurboVal* values;
     int32_t* ht_buckets;
+    int32_t used;
+    int32_t ht_tombstones;
 } TurboDict;
 
 /* %Bytes = type { i32, i32, i8* } */
@@ -155,6 +157,8 @@ typedef struct {
     int32_t base_count;
     int32_t base_capacity;
     int32_t abstract_count;
+    int32_t has_property;
+    int32_t mro_len;
     char* name;
     char** method_names;
     TurboCFunction* method_funcs;
@@ -162,6 +166,7 @@ typedef struct {
     TurboVal* attr_values;
     TurboVal* bases;
     char** abstract_names;
+    TurboVal mro_cache[32];
 } TurboClass;
 
 /* %Instance = type { i32, i32, i32, i32, i64, i8**, i64* } */
@@ -173,6 +178,8 @@ typedef struct {
     TurboVal class_obj;
     char** keys;
     TurboVal* values;
+    char* inline_keys[8];
+    TurboVal inline_values[8];
 } TurboInstance;
 
 /* %File = type { i32, i32, i8* } */
