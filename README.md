@@ -65,13 +65,17 @@ Benchmark suite (`perf/`) comparing Python 3, Turbo (LLVM IR), and hand-written 
 
 | Benchmark | Python 3 (ms) | Turbo LLVM IR (ms) | C `clang -O2` (ms) | Turbo vs Python & C |
 |---|---:|---:|---:|---:|
-| `fib_iterative` | 5,559.25 | **5.25** | 4.19 | **1,058.9x** (0.80x C) |
-| `fib_recursive` | 5,184.40 | **166.78** | 166.82 | **31.1x** (1.00x C) |
-| `ackermann` | 1,509.81 | **3.46** | 4.39 | **436.4x** (1.27x C) |
-| `pi_wallis` | 278.52 | **3.54** | 3.28 | **78.7x** (0.93x C) |
-| `leibniz` | 41,411.30 | **569.28** | 537.28 | **72.7x** (0.94x C) |
-| `matmult` | 5,569.44 | **22.67** | 5.72* / 109.99 | **245.7x** (4.85x C) |
-| `sieve` | 148.00 | **10.60** | 11.82 | **14.0x** (1.12x C) |
-| `collatz` | 5,141.71 | **105.25** | 105.77 | **48.9x** (1.00x C) |
+| `fib_iterative` | 10,769.59 | **5.74** | 4.97 | **1,876.4x** (0.87x C) |
+| `fib_recursive` | 9,974.44 | **326.98** | 323.33 | **30.5x** (0.99x C) |
+| `ackermann` | 2,849.88 | **6.69** | 5.69 | **425.9x** (0.85x C) |
+| `pi_wallis` | 510.96 | **5.99** | 5.03 | **85.3x** (0.84x C) |
+| `leibniz` | 84,013.21 | **1,136.95** | 1,106.99 | **73.9x** (0.97x C) |
+| `matmult` | 10,586.24 | **41.32** | 5.02* / 215.84 | **256.2x** (5.22x C) |
+| `sieve` | 270.92 | **14.35** | 16.12 | **18.9x** (1.12x C) |
+| `collatz` | 10,065.62 | **204.12** | 203.25 | **49.3x** (1.00x C) |
+| `set_ops` | 130.40 | **80.31** | 52.91 | **1.6x** (0.66x C) |
+| `dict_manip` | 95.94 | **247.97** | 122.87 | **0.4x** (0.50x C) |
+| `tree_structures` | 277.06 | **351.64** | 15.99 | **0.8x** (0.05x C) |
+| `class_hierarchy` | 100.43 | **49.38** | 6.09 | **2.0x** (0.12x C) |
 
-*\*Note: `matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (5.72 ms); with a volatile sink, C 512×512 matmult takes 109.99 ms vs Turbo's 22.67 ms (4.85x faster due to loop-interchanged reduction).*
+*\*Note: `matmult.c` frees `C` without reading it, so `clang -O2` dead-code eliminates the multiplication loop (5.02 ms); with a volatile sink, C 512×512 matmult takes 215.84 ms vs Turbo's 41.32 ms (5.22x faster due to loop-interchanged reduction).*

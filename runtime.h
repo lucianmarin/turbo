@@ -74,7 +74,7 @@ typedef struct {
     char* chars;
 } TurboStr;
 
-/* %List = type { i32, i32, i32, i32, i64* } (also used for Tuple and Set) */
+/* %List = type { i32, i32, i32, i32, i64* } (also used for Tuple) */
 typedef struct {
     int32_t tag;
     int32_t length;
@@ -83,14 +83,25 @@ typedef struct {
     TurboVal* items;
 } TurboList;
 
-/* %Dict = type { i32, i32, i32, i32, i64*, i64* } */
+/* %Set (prefix matches %List for iteration/length compatibility, plus open-addressing hash table) */
 typedef struct {
     int32_t tag;
     int32_t length;
     int32_t capacity;
-    int32_t _pad;
+    int32_t ht_cap;
+    TurboVal* items;
+    int32_t* ht_buckets;
+} TurboSet;
+
+/* %Dict = type { i32, i32, i32, i32, i64*, i64* } (plus open-addressing hash table) */
+typedef struct {
+    int32_t tag;
+    int32_t length;
+    int32_t capacity;
+    int32_t ht_cap;
     TurboVal* keys;
     TurboVal* values;
+    int32_t* ht_buckets;
 } TurboDict;
 
 /* %Bytes = type { i32, i32, i8* } */
@@ -141,12 +152,16 @@ typedef struct {
     int32_t method_capacity;
     int32_t attr_count;
     int32_t attr_capacity;
-    int32_t _pad;
+    int32_t base_count;
+    int32_t base_capacity;
+    int32_t abstract_count;
     char* name;
     char** method_names;
     TurboCFunction* method_funcs;
     char** attr_names;
     TurboVal* attr_values;
+    TurboVal* bases;
+    char** abstract_names;
 } TurboClass;
 
 /* %Instance = type { i32, i32, i32, i32, i64, i8**, i64* } */
@@ -174,10 +189,11 @@ typedef struct {
     TurboVal dict;
 } TurboModule;
 
-/* %Super = type { i32, i32, i64 } */
+/* %Super = type { i32, i32, i64, i64 } */
 typedef struct {
     int32_t tag;
     int32_t _pad;
+    TurboVal cls;
     TurboVal obj;
 } TurboSuper;
 
@@ -228,6 +244,9 @@ extern TurboVal t_enumerate;
 extern TurboVal t_zip;
 extern TurboVal t_map;
 extern TurboVal t_filter;
+extern TurboVal t_ABC;
+extern TurboVal t_abstractmethod;
+extern TurboVal t_dataclass;
 
 /* Exception handling */
 extern jmp_buf* turbo_exception_jmp;
@@ -338,6 +357,21 @@ void turbo_tuple_append(TurboVal tuple_obj, TurboVal item);
 void turbo_set_add(TurboVal set_obj, TurboVal item);
 int32_t turbo_set_contains(TurboVal set_obj, TurboVal item);
 void turbo_set_remove(TurboVal set_obj, TurboVal item);
+void turbo_set_discard(TurboVal set_obj, TurboVal item);
+TurboVal turbo_set_pop(TurboVal set_obj);
+void turbo_set_clear(TurboVal set_obj);
+TurboVal turbo_set_copy(TurboVal set_obj);
+TurboVal turbo_set_union(TurboVal a, TurboVal b);
+TurboVal turbo_set_intersection(TurboVal a, TurboVal b);
+TurboVal turbo_set_difference(TurboVal a, TurboVal b);
+TurboVal turbo_set_symmetric_difference(TurboVal a, TurboVal b);
+void turbo_set_update(TurboVal a, TurboVal b);
+void turbo_set_intersection_update(TurboVal a, TurboVal b);
+void turbo_set_difference_update(TurboVal a, TurboVal b);
+void turbo_set_symmetric_difference_update(TurboVal a, TurboVal b);
+TurboVal turbo_set_issubset(TurboVal a, TurboVal b);
+TurboVal turbo_set_issuperset(TurboVal a, TurboVal b);
+TurboVal turbo_set_isdisjoint(TurboVal a, TurboVal b);
 
 /* String Methods */
 TurboVal turbo_str_split(int32_t argc, TurboVal* args);
@@ -368,8 +402,11 @@ TurboVal turbo_dict_setdefault(TurboVal self, TurboVal key, TurboVal default_val
 
 /* Class & Method Dispatch */
 void turbo_class_add_method(TurboVal class_obj, const char* name, TurboCFunction func);
+void turbo_class_add_base(TurboVal class_obj, TurboVal base_obj);
+void turbo_class_add_abstract(TurboVal class_obj, const char* name);
 void turbo_class_set_attr(TurboVal class_obj, const char* name, TurboVal val);
 TurboVal turbo_class_get_attr(TurboVal class_obj, const char* name);
+TurboVal make_super(TurboVal cls, TurboVal obj);
 
 TurboVal turbo_call(TurboVal callable, int32_t argc, TurboVal* args);
 TurboVal turbo_call_method(TurboVal obj, const char* method_name, int32_t argc, TurboVal* args);

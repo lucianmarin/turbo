@@ -114,6 +114,9 @@ TurboVal t_enumerate = TV_NONE;
 TurboVal t_zip = TV_NONE;
 TurboVal t_map = TV_NONE;
 TurboVal t_filter = TV_NONE;
+TurboVal t_ABC = TV_NONE;
+TurboVal t_abstractmethod = TV_NONE;
+TurboVal t_dataclass = TV_NONE;
 
 /* Exception stack for LLVM IR / C interop */
 #define TURBO_MAX_TRY_DEPTH 64
@@ -586,11 +589,14 @@ TurboVal make_tuple_from_list(TurboVal list) {
 }
 
 TurboVal make_set(void) {
-    TurboList* obj = (TurboList*)malloc(sizeof(TurboList));
+    TurboSet* obj = (TurboSet*)malloc(sizeof(TurboSet));
     obj->tag = HEAP_SET;
     obj->length = 0;
     obj->capacity = 8;
+    obj->ht_cap = 16;
     obj->items = (TurboVal*)malloc(sizeof(TurboVal) * obj->capacity);
+    obj->ht_buckets = (int32_t*)malloc(sizeof(int32_t) * obj->ht_cap);
+    for (int i = 0; i < obj->ht_cap; i++) obj->ht_buckets[i] = -1;
     return tv_make_ptr(obj);
 }
 
@@ -599,8 +605,11 @@ TurboVal make_dict(void) {
     obj->tag = HEAP_DICT;
     obj->length = 0;
     obj->capacity = 8;
+    obj->ht_cap = 16;
     obj->keys = (TurboVal*)malloc(sizeof(TurboVal) * obj->capacity);
     obj->values = (TurboVal*)malloc(sizeof(TurboVal) * obj->capacity);
+    obj->ht_buckets = (int32_t*)malloc(sizeof(int32_t) * obj->ht_cap);
+    for (int i = 0; i < obj->ht_cap; i++) obj->ht_buckets[i] = -1;
     return tv_make_ptr(obj);
 }
 
@@ -649,7 +658,20 @@ TurboVal make_class(const char* name) {
     obj->attr_capacity = 8;
     obj->attr_names = (char**)malloc(sizeof(char*) * obj->attr_capacity);
     obj->attr_values = (TurboVal*)malloc(sizeof(TurboVal) * obj->attr_capacity);
+    obj->base_count = 0;
+    obj->base_capacity = 4;
+    obj->bases = (TurboVal*)malloc(sizeof(TurboVal) * obj->base_capacity);
+    obj->abstract_count = 0;
+    obj->abstract_names = (char**)malloc(sizeof(char*) * 8);
     return tv_make_ptr(obj);
+}
+
+TurboVal make_super(TurboVal cls, TurboVal obj_val) {
+    TurboSuper* s = (TurboSuper*)malloc(sizeof(TurboSuper));
+    s->tag = HEAP_SUPER;
+    s->cls = cls;
+    s->obj = obj_val;
+    return tv_make_ptr(s);
 }
 
 TurboVal make_instance(TurboVal class_obj) {
@@ -702,6 +724,139 @@ long long int_to_ll(TurboVal obj) {
 
 /* --- Equality & Comparisons --- */
 
+static uint64_t tv_hash(TurboVal v) {
+    if (tv_is_int48(v)) {
+        uint64_t x = (uint64_t)tv_get_int48(v);
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    }
+    if (v == TV_TRUE) return tv_hash(tv_make_int48(1));
+    if (v == TV_FALSE) return tv_hash(tv_make_int48(0));
+    if (v == TV_NONE) return 0x9e3779b97f4a7c15ULL;
+    if (tv_is_float(v)) {
+        double d = tv_get_float(v);
+        if (d == (double)(int64_t)d && d >= (double)TV_MIN_INT48 && d <= (double)TV_MAX_INT48) {
+            return tv_hash(tv_make_int48((int64_t)d));
+        }
+        uint64_t x = (uint64_t)v;
+        return x ^ (x >> 32);
+    }
+    int32_t tag = tv_heap_tag(v);
+    if (tag == HEAP_STR) {
+        TurboStr* s = (TurboStr*)tv_get_ptr(v);
+        uint64_t h = 14695981039346656037ULL;
+        for (int i = 0; i < s->length; i++) {
+            h ^= (uint8_t)s->chars[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+    if (tag == HEAP_BYTES) {
+        TurboBytes* b = (TurboBytes*)tv_get_ptr(v);
+        uint64_t h = 14695981039346656037ULL;
+        for (int i = 0; i < b->length; i++) {
+            h ^= b->data[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+    if (tag == HEAP_TUPLE) {
+        TurboList* t = (TurboList*)tv_get_ptr(v);
+        uint64_t h = 0x345678ULL;
+        for (int i = 0; i < t->length; i++) {
+            h = (h ^ tv_hash(t->items[i])) * 1000003ULL + 82520ULL;
+        }
+        return h;
+    }
+    if (tag == HEAP_BIGINT) {
+        return tv_hash(tv_make_int48(int_to_ll(v)));
+    }
+    return (uint64_t)v;
+}
+
+static bool is_equal(TurboVal a, TurboVal b);
+static TurboCFunction class_find_method(TurboVal class_obj, const char* name);
+static TurboCFunction class_find_super_method(TurboVal inst_cls, TurboVal cur_cls, const char* name);
+static bool class_is_subclass(TurboVal sub_cls, TurboVal target_cls);
+
+static void set_ht_rebuild(TurboSet* st, int32_t new_cap) {
+    if (new_cap < 16) new_cap = 16;
+    if (st->ht_buckets) free(st->ht_buckets);
+    st->ht_cap = new_cap;
+    st->ht_buckets = (int32_t*)malloc(sizeof(int32_t) * new_cap);
+    for (int i = 0; i < new_cap; i++) st->ht_buckets[i] = -1;
+    uint32_t mask = (uint32_t)(new_cap - 1);
+    for (int i = 0; i < st->length; i++) {
+        uint32_t b = (uint32_t)tv_hash(st->items[i]) & mask;
+        while (st->ht_buckets[b] >= 0) {
+            b = (b + 1) & mask;
+        }
+        st->ht_buckets[b] = i;
+    }
+}
+
+static int32_t set_ht_find(TurboSet* st, TurboVal item, int32_t* out_slot) {
+    if (st->ht_cap == 0) set_ht_rebuild(st, 16);
+    uint32_t mask = (uint32_t)(st->ht_cap - 1);
+    uint32_t b = (uint32_t)tv_hash(item) & mask;
+    int32_t first_tomb = -1;
+    while (true) {
+        int32_t idx = st->ht_buckets[b];
+        if (idx == -1) {
+            if (out_slot) *out_slot = (first_tomb >= 0) ? first_tomb : (int32_t)b;
+            return -1;
+        }
+        if (idx == -2) {
+            if (first_tomb < 0) first_tomb = (int32_t)b;
+        } else if (is_equal(st->items[idx], item)) {
+            if (out_slot) *out_slot = (int32_t)b;
+            return idx;
+        }
+        b = (b + 1) & mask;
+    }
+}
+
+static void dict_ht_rebuild(TurboDict* d, int32_t new_cap) {
+    if (new_cap < 16) new_cap = 16;
+    if (d->ht_buckets) free(d->ht_buckets);
+    d->ht_cap = new_cap;
+    d->ht_buckets = (int32_t*)malloc(sizeof(int32_t) * new_cap);
+    for (int i = 0; i < new_cap; i++) d->ht_buckets[i] = -1;
+    uint32_t mask = (uint32_t)(new_cap - 1);
+    for (int i = 0; i < d->length; i++) {
+        uint32_t b = (uint32_t)tv_hash(d->keys[i]) & mask;
+        while (d->ht_buckets[b] >= 0) {
+            b = (b + 1) & mask;
+        }
+        d->ht_buckets[b] = i;
+    }
+}
+
+static int32_t dict_ht_find(TurboDict* d, TurboVal key, int32_t* out_slot) {
+    if (d->ht_cap == 0) dict_ht_rebuild(d, 16);
+    uint32_t mask = (uint32_t)(d->ht_cap - 1);
+    uint32_t b = (uint32_t)tv_hash(key) & mask;
+    int32_t first_tomb = -1;
+    while (true) {
+        int32_t idx = d->ht_buckets[b];
+        if (idx == -1) {
+            if (out_slot) *out_slot = (first_tomb >= 0) ? first_tomb : (int32_t)b;
+            return -1;
+        }
+        if (idx == -2) {
+            if (first_tomb < 0) first_tomb = (int32_t)b;
+        } else if (is_equal(d->keys[idx], key)) {
+            if (out_slot) *out_slot = (int32_t)b;
+            return idx;
+        }
+        b = (b + 1) & mask;
+    }
+}
+
+/* Forward declaration for class method lookup across MRO */
+static TurboCFunction class_find_method(TurboVal class_obj, const char* name);
+
 static bool is_equal(TurboVal a, TurboVal b) {
     if (a == b) return true;
     if (tv_is_float(a) && tv_is_int(b)) return tv_get_float(a) == to_double(b);
@@ -746,18 +901,11 @@ static bool is_equal(TurboVal a, TurboVal b) {
             return true;
         }
         case HEAP_SET: {
-            TurboList* sa = (TurboList*)tv_get_ptr(a);
-            TurboList* sb = (TurboList*)tv_get_ptr(b);
+            TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+            TurboSet* sb = (TurboSet*)tv_get_ptr(b);
             if (sa->length != sb->length) return false;
             for (int i = 0; i < sa->length; i++) {
-                bool found = false;
-                for (int j = 0; j < sb->length; j++) {
-                    if (is_equal(sa->items[i], sb->items[j])) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return false;
+                if (set_ht_find(sb, sa->items[i], NULL) < 0) return false;
             }
             return true;
         }
@@ -766,16 +914,19 @@ static bool is_equal(TurboVal a, TurboVal b) {
             TurboDict* db = (TurboDict*)tv_get_ptr(b);
             if (da->length != db->length) return false;
             for (int i = 0; i < da->length; i++) {
-                bool found = false;
-                for (int j = 0; j < db->length; j++) {
-                    if (is_equal(da->keys[i], db->keys[j]) && is_equal(da->values[i], db->values[j])) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return false;
+                int32_t j = dict_ht_find(db, da->keys[i], NULL);
+                if (j < 0 || !is_equal(da->values[i], db->values[j])) return false;
             }
             return true;
+        }
+        case HEAP_INSTANCE: {
+            TurboInstance* ia = (TurboInstance*)tv_get_ptr(a);
+            TurboCFunction eq_fn = class_find_method(ia->class_obj, "__eq__");
+            if (eq_fn != NULL) {
+                TurboVal eq_args[2] = { a, b };
+                return turbo_is_truthy(eq_fn(2, eq_args));
+            }
+            return false;
         }
         default:
             return false;
@@ -801,13 +952,11 @@ static int int_cmp(TurboVal a, TurboVal b) {
 static bool try_op_overload(TurboVal a, TurboVal b, const char* method, TurboVal* out) {
     if (tv_heap_tag(a) == HEAP_INSTANCE) {
         TurboInstance* inst = (TurboInstance*)tv_get_ptr(a);
-        TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], method) == 0) {
-                TurboVal args[2] = { a, b };
-                *out = cls->method_funcs[i](2, args);
-                return true;
-            }
+        TurboCFunction m_fn = class_find_method(inst->class_obj, method);
+        if (m_fn != NULL) {
+            TurboVal args[2] = { a, b };
+            *out = m_fn(2, args);
+            return true;
         }
         TurboVal cls_attr = turbo_class_get_attr(inst->class_obj, method);
         if (cls_attr != TV_NONE && tv_heap_tag(cls_attr) == HEAP_STATICMETHOD) {
@@ -952,6 +1101,9 @@ TurboVal turbo_sub(TurboVal a, TurboVal b) {
     if ((tv_is_int(a) || tv_is_float(a)) && tb == HEAP_COMPLEX) {
         TurboComplex* cb = (TurboComplex*)tv_get_ptr(b);
         return make_complex(to_double(a) - cb->real, -cb->imag);
+    }
+    if (ta == HEAP_SET && tb == HEAP_SET) {
+        return turbo_set_difference(a, b);
     }
     TurboVal ov;
     if (try_op_overload(a, b, "__sub__", &ov)) return ov;
@@ -1145,6 +1297,9 @@ TurboVal turbo_bitand(TurboVal a, TurboVal b) {
     if (tv_is_int(a) && tv_is_int(b)) {
         return make_int_from_ll(int_to_ll(a) & int_to_ll(b));
     }
+    if (tv_heap_tag(a) == HEAP_SET && tv_heap_tag(b) == HEAP_SET) {
+        return turbo_set_intersection(a, b);
+    }
     TurboVal ov;
     if (try_op_overload(a, b, "__and__", &ov)) return ov;
     fprintf(stderr, "TypeError: unsupported operand type(s) for &\n");
@@ -1155,6 +1310,16 @@ TurboVal turbo_bitor(TurboVal a, TurboVal b) {
     if (tv_is_int(a) && tv_is_int(b)) {
         return make_int_from_ll(int_to_ll(a) | int_to_ll(b));
     }
+    int32_t ta = tv_heap_tag(a);
+    int32_t tb = tv_heap_tag(b);
+    if (ta == HEAP_SET && tb == HEAP_SET) {
+        return turbo_set_union(a, b);
+    }
+    if (ta == HEAP_DICT && tb == HEAP_DICT) {
+        TurboVal res = turbo_dict_copy(a);
+        turbo_dict_update(res, b);
+        return res;
+    }
     TurboVal ov;
     if (try_op_overload(a, b, "__or__", &ov)) return ov;
     fprintf(stderr, "TypeError: unsupported operand type(s) for |\n");
@@ -1164,6 +1329,9 @@ TurboVal turbo_bitor(TurboVal a, TurboVal b) {
 TurboVal turbo_bitxor(TurboVal a, TurboVal b) {
     if (tv_is_int(a) && tv_is_int(b)) {
         return make_int_from_ll(int_to_ll(a) ^ int_to_ll(b));
+    }
+    if (tv_heap_tag(a) == HEAP_SET && tv_heap_tag(b) == HEAP_SET) {
+        return turbo_set_symmetric_difference(a, b);
     }
     TurboVal ov;
     if (try_op_overload(a, b, "__xor__", &ov)) return ov;
@@ -1317,6 +1485,11 @@ TurboVal turbo_lt(TurboVal a, TurboVal b) {
     if (tv_heap_tag(a) == HEAP_STR && tv_heap_tag(b) == HEAP_STR) {
         return make_bool(strcmp(((TurboStr*)tv_get_ptr(a))->chars, ((TurboStr*)tv_get_ptr(b))->chars) < 0);
     }
+    if (tv_heap_tag(a) == HEAP_SET && tv_heap_tag(b) == HEAP_SET) {
+        TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+        TurboSet* sb = (TurboSet*)tv_get_ptr(b);
+        return make_bool(sa->length < sb->length && turbo_set_issubset(a, b) == TV_TRUE);
+    }
     fprintf(stderr, "TypeError: '<' not supported between types\n");
     exit(1);
 }
@@ -1329,6 +1502,11 @@ TurboVal turbo_gt(TurboVal a, TurboVal b) {
     if ((tv_is_float(a) || tv_is_int(a)) && (tv_is_float(b) || tv_is_int(b))) return make_bool(to_double(a) > to_double(b));
     if (tv_heap_tag(a) == HEAP_STR && tv_heap_tag(b) == HEAP_STR) {
         return make_bool(strcmp(((TurboStr*)tv_get_ptr(a))->chars, ((TurboStr*)tv_get_ptr(b))->chars) > 0);
+    }
+    if (tv_heap_tag(a) == HEAP_SET && tv_heap_tag(b) == HEAP_SET) {
+        TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+        TurboSet* sb = (TurboSet*)tv_get_ptr(b);
+        return make_bool(sa->length > sb->length && turbo_set_issuperset(a, b) == TV_TRUE);
     }
     fprintf(stderr, "TypeError: '>' not supported between types\n");
     exit(1);
@@ -1343,6 +1521,9 @@ TurboVal turbo_lte(TurboVal a, TurboVal b) {
     if (tv_heap_tag(a) == HEAP_STR && tv_heap_tag(b) == HEAP_STR) {
         return make_bool(strcmp(((TurboStr*)tv_get_ptr(a))->chars, ((TurboStr*)tv_get_ptr(b))->chars) <= 0);
     }
+    if (tv_heap_tag(a) == HEAP_SET && tv_heap_tag(b) == HEAP_SET) {
+        return turbo_set_issubset(a, b);
+    }
     fprintf(stderr, "TypeError: '<=' not supported between types\n");
     exit(1);
 }
@@ -1355,6 +1536,9 @@ TurboVal turbo_gte(TurboVal a, TurboVal b) {
     if ((tv_is_float(a) || tv_is_int(a)) && (tv_is_float(b) || tv_is_int(b))) return make_bool(to_double(a) >= to_double(b));
     if (tv_heap_tag(a) == HEAP_STR && tv_heap_tag(b) == HEAP_STR) {
         return make_bool(strcmp(((TurboStr*)tv_get_ptr(a))->chars, ((TurboStr*)tv_get_ptr(b))->chars) >= 0);
+    }
+    if (tv_heap_tag(a) == HEAP_SET && tv_heap_tag(b) == HEAP_SET) {
+        return turbo_set_issuperset(a, b);
     }
     fprintf(stderr, "TypeError: '>=' not supported between types\n");
     exit(1);
@@ -1466,11 +1650,8 @@ TurboVal turbo_getitem(TurboVal obj, TurboVal key) {
     }
     if (tag == HEAP_DICT) {
         TurboDict* d = (TurboDict*)tv_get_ptr(obj);
-        for (int i = 0; i < d->length; i++) {
-            if (is_equal(d->keys[i], key)) {
-                return d->values[i];
-            }
-        }
+        int32_t idx = dict_ht_find(d, key, NULL);
+        if (idx >= 0) return d->values[idx];
         fprintf(stderr, "KeyError: key not found in dict\n");
         exit(1);
     }
@@ -1497,20 +1678,25 @@ void turbo_setitem(TurboVal obj, TurboVal key, TurboVal val) {
     }
     if (tag == HEAP_DICT) {
         TurboDict* d = (TurboDict*)tv_get_ptr(obj);
-        for (int i = 0; i < d->length; i++) {
-            if (is_equal(d->keys[i], key)) {
-                d->values[i] = val;
-                return;
-            }
+        if ((d->length + 1) * 2 > d->ht_cap) {
+            dict_ht_rebuild(d, d->ht_cap * 2);
+        }
+        int32_t slot = -1;
+        int32_t idx = dict_ht_find(d, key, &slot);
+        if (idx >= 0) {
+            d->values[idx] = val;
+            return;
         }
         if (d->length >= d->capacity) {
             d->capacity *= 2;
             d->keys = (TurboVal*)realloc(d->keys, sizeof(TurboVal) * d->capacity);
             d->values = (TurboVal*)realloc(d->values, sizeof(TurboVal) * d->capacity);
         }
-        d->keys[d->length] = key;
-        d->values[d->length] = val;
+        int32_t new_idx = d->length;
+        d->keys[new_idx] = key;
+        d->values[new_idx] = val;
         d->length++;
+        d->ht_buckets[slot] = new_idx;
         return;
     }
     fprintf(stderr, "TypeError: object does not support item assignment\n");
@@ -1539,15 +1725,15 @@ void turbo_delitem(TurboVal obj, TurboVal key) {
     }
     if (tag == HEAP_DICT) {
         TurboDict* d = (TurboDict*)tv_get_ptr(obj);
-        for (int i = 0; i < d->length; i++) {
-            if (is_equal(d->keys[i], key)) {
-                for (int j = i; j < d->length - 1; j++) {
-                    d->keys[j] = d->keys[j + 1];
-                    d->values[j] = d->values[j + 1];
-                }
-                d->length--;
-                return;
+        int32_t idx = dict_ht_find(d, key, NULL);
+        if (idx >= 0) {
+            for (int j = idx; j < d->length - 1; j++) {
+                d->keys[j] = d->keys[j + 1];
+                d->values[j] = d->values[j + 1];
             }
+            d->length--;
+            dict_ht_rebuild(d, d->ht_cap);
+            return;
         }
         fprintf(stderr, "KeyError: key not found in dict\n");
         exit(1);
@@ -1613,12 +1799,6 @@ TurboVal turbo_getattr(TurboVal obj, const char* name) {
                 return inst->values[i];
             }
         }
-        TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], name) == 0) {
-                return make_func(cls->method_funcs[i], name);
-            }
-        }
         TurboVal cls_attr = turbo_class_get_attr(inst->class_obj, name);
         if (cls_attr != TV_NONE) {
             int32_t atag = tv_heap_tag(cls_attr);
@@ -1633,15 +1813,19 @@ TurboVal turbo_getattr(TurboVal obj, const char* name) {
             }
             return cls_attr;
         }
+        TurboCFunction m_fn = class_find_method(inst->class_obj, name);
+        if (m_fn != NULL) {
+            return make_func(m_fn, name);
+        }
+        TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
         fprintf(stderr, "AttributeError: '%s' object has no attribute '%s'\n", cls->name, name);
         exit(1);
     }
     if (tag == HEAP_CLASS) {
         TurboClass* cls = (TurboClass*)tv_get_ptr(obj);
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], name) == 0) {
-                return make_func(cls->method_funcs[i], name);
-            }
+        TurboCFunction m_fn = class_find_method(obj, name);
+        if (m_fn != NULL) {
+            return make_func(m_fn, name);
         }
         TurboVal cls_attr = turbo_class_get_attr(obj, name);
         if (cls_attr != TV_NONE) {
@@ -1666,11 +1850,10 @@ TurboVal turbo_getattr(TurboVal obj, const char* name) {
         TurboSuper* sup = (TurboSuper*)tv_get_ptr(obj);
         if (tv_heap_tag(sup->obj) == HEAP_INSTANCE) {
             TurboInstance* inst = (TurboInstance*)tv_get_ptr(sup->obj);
-            TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
-            for (int i = 0; i < cls->method_count; i++) {
-                if (strcmp(cls->method_names[i], name) == 0) {
-                    return make_func(cls->method_funcs[i], name);
-                }
+            TurboCFunction m_fn = class_find_super_method(inst->class_obj, sup->cls, name);
+            if (m_fn == NULL) m_fn = class_find_method(inst->class_obj, name);
+            if (m_fn != NULL) {
+                return make_func(m_fn, name);
             }
         }
         fprintf(stderr, "AttributeError: 'super' object has no attribute '%s'\n", name);
@@ -1723,7 +1906,11 @@ void turbo_setattr(TurboVal obj, const char* name, TurboVal val) {
 
 int32_t turbo_in(TurboVal item, TurboVal container) {
     int32_t tag = tv_heap_tag(container);
-    if (tag == HEAP_LIST || tag == HEAP_TUPLE || tag == HEAP_SET) {
+    if (tag == HEAP_SET) {
+        TurboSet* st = (TurboSet*)tv_get_ptr(container);
+        return set_ht_find(st, item, NULL) >= 0 ? 1 : 0;
+    }
+    if (tag == HEAP_LIST || tag == HEAP_TUPLE) {
         TurboList* lst = (TurboList*)tv_get_ptr(container);
         for (int i = 0; i < lst->length; i++) {
             if (is_equal(item, lst->items[i])) return 1;
@@ -1732,10 +1919,7 @@ int32_t turbo_in(TurboVal item, TurboVal container) {
     }
     if (tag == HEAP_DICT) {
         TurboDict* d = (TurboDict*)tv_get_ptr(container);
-        for (int i = 0; i < d->length; i++) {
-            if (is_equal(item, d->keys[i])) return 1;
-        }
-        return 0;
+        return dict_ht_find(d, item, NULL) >= 0 ? 1 : 0;
     }
     if (tag == HEAP_STR) {
         if (tv_heap_tag(item) != HEAP_STR) {
@@ -1951,13 +2135,11 @@ TurboVal turbo_str(TurboVal val) {
                 TurboVal res = fn->func_ptr(1, args);
                 if (tv_heap_tag(res) == HEAP_STR) return res;
             }
-            for (int i = 0; i < cls->method_count; i++) {
-                if (strcmp(cls->method_names[i], "__str__") == 0) {
-                    TurboVal m_args[1] = { val };
-                    TurboVal res = cls->method_funcs[i](1, m_args);
-                    if (tv_heap_tag(res) == HEAP_STR) return res;
-                    break;
-                }
+            TurboCFunction str_fn = class_find_method(inst->class_obj, "__str__");
+            if (str_fn != NULL) {
+                TurboVal m_args[1] = { val };
+                TurboVal res = str_fn(1, m_args);
+                if (tv_heap_tag(res) == HEAP_STR) return res;
             }
             char* s = (char*)malloc(strlen(cls->name) + 16);
             sprintf(s, "<%s object>", cls->name);
@@ -1986,7 +2168,6 @@ TurboVal turbo_repr(TurboVal val) {
     }
     if (tag == HEAP_INSTANCE) {
         TurboInstance* inst = (TurboInstance*)tv_get_ptr(val);
-        TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
         TurboVal cls_attr = turbo_class_get_attr(inst->class_obj, "__repr__");
         if (cls_attr != TV_NONE && tv_heap_tag(cls_attr) == HEAP_STATICMETHOD) {
             TurboFunc* fn = (TurboFunc*)tv_get_ptr(cls_attr);
@@ -1994,13 +2175,11 @@ TurboVal turbo_repr(TurboVal val) {
             TurboVal res = fn->func_ptr(1, args);
             if (tv_heap_tag(res) == HEAP_STR) return res;
         }
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], "__repr__") == 0) {
-                TurboVal m_args[1] = { val };
-                TurboVal res = cls->method_funcs[i](1, m_args);
-                if (tv_heap_tag(res) == HEAP_STR) return res;
-                break;
-            }
+        TurboCFunction repr_fn = class_find_method(inst->class_obj, "__repr__");
+        if (repr_fn != NULL) {
+            TurboVal m_args[1] = { val };
+            TurboVal res = repr_fn(1, m_args);
+            if (tv_heap_tag(res) == HEAP_STR) return res;
         }
     }
     return turbo_str(val);
@@ -2184,15 +2363,20 @@ void turbo_set_add(TurboVal set_obj, TurboVal item) {
         fprintf(stderr, "TypeError: expected set object\n");
         exit(1);
     }
-    TurboList* st = (TurboList*)tv_get_ptr(set_obj);
-    for (int i = 0; i < st->length; i++) {
-        if (is_equal(st->items[i], item)) return;
+    TurboSet* st = (TurboSet*)tv_get_ptr(set_obj);
+    if ((st->length + 1) * 2 > st->ht_cap) {
+        set_ht_rebuild(st, st->ht_cap * 2);
     }
+    int32_t slot = -1;
+    int32_t idx = set_ht_find(st, item, &slot);
+    if (idx >= 0) return;
     if (st->length >= st->capacity) {
         st->capacity *= 2;
         st->items = (TurboVal*)realloc(st->items, sizeof(TurboVal) * st->capacity);
     }
-    st->items[st->length++] = item;
+    int32_t new_idx = st->length++;
+    st->items[new_idx] = item;
+    st->ht_buckets[slot] = new_idx;
 }
 
 int32_t turbo_set_contains(TurboVal set_obj, TurboVal item) {
@@ -2200,11 +2384,8 @@ int32_t turbo_set_contains(TurboVal set_obj, TurboVal item) {
         fprintf(stderr, "TypeError: expected set object\n");
         exit(1);
     }
-    TurboList* st = (TurboList*)tv_get_ptr(set_obj);
-    for (int i = 0; i < st->length; i++) {
-        if (is_equal(st->items[i], item)) return 1;
-    }
-    return 0;
+    TurboSet* st = (TurboSet*)tv_get_ptr(set_obj);
+    return set_ht_find(st, item, NULL) >= 0 ? 1 : 0;
 }
 
 void turbo_set_remove(TurboVal set_obj, TurboVal item) {
@@ -2212,16 +2393,207 @@ void turbo_set_remove(TurboVal set_obj, TurboVal item) {
         fprintf(stderr, "TypeError: expected set object\n");
         exit(1);
     }
-    TurboList* st = (TurboList*)tv_get_ptr(set_obj);
-    for (int i = 0; i < st->length; i++) {
-        if (is_equal(st->items[i], item)) {
-            st->items[i] = st->items[st->length - 1];
-            st->length--;
-            return;
+    TurboSet* st = (TurboSet*)tv_get_ptr(set_obj);
+    int32_t slot = -1;
+    int32_t idx = set_ht_find(st, item, &slot);
+    if (idx >= 0) {
+        int32_t last_idx = st->length - 1;
+        st->ht_buckets[slot] = -2;
+        if (idx != last_idx) {
+            TurboVal moved = st->items[last_idx];
+            st->items[idx] = moved;
+            int32_t moved_slot = -1;
+            set_ht_find(st, moved, &moved_slot);
+            if (moved_slot >= 0) st->ht_buckets[moved_slot] = idx;
         }
+        st->length--;
+        return;
     }
     fprintf(stderr, "KeyError: element not found in set\n");
     exit(1);
+}
+
+void turbo_set_discard(TurboVal set_obj, TurboVal item) {
+    if (tv_heap_tag(set_obj) != HEAP_SET) {
+        fprintf(stderr, "TypeError: expected set object\n");
+        exit(1);
+    }
+    TurboSet* st = (TurboSet*)tv_get_ptr(set_obj);
+    int32_t slot = -1;
+    int32_t idx = set_ht_find(st, item, &slot);
+    if (idx >= 0) {
+        int32_t last_idx = st->length - 1;
+        st->ht_buckets[slot] = -2;
+        if (idx != last_idx) {
+            TurboVal moved = st->items[last_idx];
+            st->items[idx] = moved;
+            int32_t moved_slot = -1;
+            set_ht_find(st, moved, &moved_slot);
+            if (moved_slot >= 0) st->ht_buckets[moved_slot] = idx;
+        }
+        st->length--;
+    }
+}
+
+TurboVal turbo_set_pop(TurboVal set_obj) {
+    TurboSet* st = (TurboSet*)tv_get_ptr(set_obj);
+    if (st->length == 0) {
+        fprintf(stderr, "KeyError: pop from an empty set\n");
+        exit(1);
+    }
+    TurboVal item = st->items[st->length - 1];
+    turbo_set_discard(set_obj, item);
+    return item;
+}
+
+void turbo_set_clear(TurboVal set_obj) {
+    TurboSet* st = (TurboSet*)tv_get_ptr(set_obj);
+    st->length = 0;
+    for (int i = 0; i < st->ht_cap; i++) st->ht_buckets[i] = -1;
+}
+
+TurboVal turbo_set_copy(TurboVal set_obj) {
+    TurboSet* st = (TurboSet*)tv_get_ptr(set_obj);
+    TurboSet* obj = (TurboSet*)malloc(sizeof(TurboSet));
+    obj->tag = HEAP_SET;
+    obj->length = st->length;
+    obj->capacity = st->capacity;
+    obj->ht_cap = st->ht_cap;
+    obj->items = (TurboVal*)malloc(sizeof(TurboVal) * obj->capacity);
+    memcpy(obj->items, st->items, sizeof(TurboVal) * st->length);
+    obj->ht_buckets = (int32_t*)malloc(sizeof(int32_t) * obj->ht_cap);
+    memcpy(obj->ht_buckets, st->ht_buckets, sizeof(int32_t) * st->ht_cap);
+    return tv_make_ptr(obj);
+}
+
+TurboVal turbo_set_union(TurboVal a, TurboVal b) {
+    TurboVal res = turbo_set_copy(a);
+    turbo_set_update(res, b);
+    return res;
+}
+
+TurboVal turbo_set_intersection(TurboVal a, TurboVal b) {
+    TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+    TurboSet* sb = (TurboSet*)tv_get_ptr(b);
+    TurboVal res = make_set();
+    if (sa->length <= sb->length) {
+        for (int i = 0; i < sa->length; i++) {
+            if (set_ht_find(sb, sa->items[i], NULL) >= 0) {
+                turbo_set_add(res, sa->items[i]);
+            }
+        }
+    } else {
+        for (int i = 0; i < sb->length; i++) {
+            if (set_ht_find(sa, sb->items[i], NULL) >= 0) {
+                turbo_set_add(res, sb->items[i]);
+            }
+        }
+    }
+    return res;
+}
+
+TurboVal turbo_set_difference(TurboVal a, TurboVal b) {
+    TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+    TurboSet* sb = (TurboSet*)tv_get_ptr(b);
+    TurboVal res = make_set();
+    for (int i = 0; i < sa->length; i++) {
+        if (set_ht_find(sb, sa->items[i], NULL) < 0) {
+            turbo_set_add(res, sa->items[i]);
+        }
+    }
+    return res;
+}
+
+TurboVal turbo_set_symmetric_difference(TurboVal a, TurboVal b) {
+    TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+    TurboSet* sb = (TurboSet*)tv_get_ptr(b);
+    TurboVal res = make_set();
+    for (int i = 0; i < sa->length; i++) {
+        if (set_ht_find(sb, sa->items[i], NULL) < 0) {
+            turbo_set_add(res, sa->items[i]);
+        }
+    }
+    for (int i = 0; i < sb->length; i++) {
+        if (set_ht_find(sa, sb->items[i], NULL) < 0) {
+            turbo_set_add(res, sb->items[i]);
+        }
+    }
+    return res;
+}
+
+void turbo_set_update(TurboVal a, TurboVal b) {
+    int32_t tb = tv_heap_tag(b);
+    if (tb == HEAP_SET || tb == HEAP_LIST || tb == HEAP_TUPLE) {
+        TurboList* lb = (TurboList*)tv_get_ptr(b);
+        for (int i = 0; i < lb->length; i++) {
+            turbo_set_add(a, lb->items[i]);
+        }
+    }
+}
+
+void turbo_set_intersection_update(TurboVal a, TurboVal b) {
+    TurboVal inter = turbo_set_intersection(a, b);
+    TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+    TurboSet* si = (TurboSet*)tv_get_ptr(inter);
+    free(sa->items);
+    free(sa->ht_buckets);
+    sa->length = si->length;
+    sa->capacity = si->capacity;
+    sa->ht_cap = si->ht_cap;
+    sa->items = si->items;
+    sa->ht_buckets = si->ht_buckets;
+}
+
+void turbo_set_difference_update(TurboVal a, TurboVal b) {
+    int32_t tb = tv_heap_tag(b);
+    if (tb == HEAP_SET || tb == HEAP_LIST || tb == HEAP_TUPLE) {
+        TurboList* lb = (TurboList*)tv_get_ptr(b);
+        for (int i = 0; i < lb->length; i++) {
+            turbo_set_discard(a, lb->items[i]);
+        }
+    }
+}
+
+void turbo_set_symmetric_difference_update(TurboVal a, TurboVal b) {
+    TurboVal sym = turbo_set_symmetric_difference(a, b);
+    TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+    TurboSet* ss = (TurboSet*)tv_get_ptr(sym);
+    free(sa->items);
+    free(sa->ht_buckets);
+    sa->length = ss->length;
+    sa->capacity = ss->capacity;
+    sa->ht_cap = ss->ht_cap;
+    sa->items = ss->items;
+    sa->ht_buckets = ss->ht_buckets;
+}
+
+TurboVal turbo_set_issubset(TurboVal a, TurboVal b) {
+    TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+    TurboSet* sb = (TurboSet*)tv_get_ptr(b);
+    if (sa->length > sb->length) return TV_FALSE;
+    for (int i = 0; i < sa->length; i++) {
+        if (set_ht_find(sb, sa->items[i], NULL) < 0) return TV_FALSE;
+    }
+    return TV_TRUE;
+}
+
+TurboVal turbo_set_issuperset(TurboVal a, TurboVal b) {
+    return turbo_set_issubset(b, a);
+}
+
+TurboVal turbo_set_isdisjoint(TurboVal a, TurboVal b) {
+    TurboSet* sa = (TurboSet*)tv_get_ptr(a);
+    TurboSet* sb = (TurboSet*)tv_get_ptr(b);
+    if (sa->length <= sb->length) {
+        for (int i = 0; i < sa->length; i++) {
+            if (set_ht_find(sb, sa->items[i], NULL) >= 0) return TV_FALSE;
+        }
+    } else {
+        for (int i = 0; i < sb->length; i++) {
+            if (set_ht_find(sa, sb->items[i], NULL) >= 0) return TV_FALSE;
+        }
+    }
+    return TV_TRUE;
 }
 
 /* --- String Methods --- */
@@ -2712,24 +3084,23 @@ TurboVal turbo_dict_items(TurboVal self) {
 
 TurboVal turbo_dict_get(TurboVal self, TurboVal key, TurboVal default_val) {
     TurboDict* d = (TurboDict*)tv_get_ptr(self);
-    for (int i = 0; i < d->length; i++) {
-        if (is_equal(d->keys[i], key)) return d->values[i];
-    }
+    int32_t idx = dict_ht_find(d, key, NULL);
+    if (idx >= 0) return d->values[idx];
     return default_val;
 }
 
 TurboVal turbo_dict_pop(TurboVal self, TurboVal key) {
     TurboDict* d = (TurboDict*)tv_get_ptr(self);
-    for (int i = 0; i < d->length; i++) {
-        if (is_equal(d->keys[i], key)) {
-            TurboVal value = d->values[i];
-            for (int j = i; j < d->length - 1; j++) {
-                d->keys[j] = d->keys[j+1];
-                d->values[j] = d->values[j+1];
-            }
-            d->length--;
-            return value;
+    int32_t idx = dict_ht_find(d, key, NULL);
+    if (idx >= 0) {
+        TurboVal value = d->values[idx];
+        for (int j = idx; j < d->length - 1; j++) {
+            d->keys[j] = d->keys[j+1];
+            d->values[j] = d->values[j+1];
         }
+        d->length--;
+        dict_ht_rebuild(d, d->ht_cap);
+        return value;
     }
     fprintf(stderr, "KeyError: pop(): key not found in dict\n");
     exit(1);
@@ -2744,6 +3115,10 @@ TurboVal turbo_dict_popitem(TurboVal self) {
     int last = d->length - 1;
     TurboVal key = d->keys[last];
     TurboVal value = d->values[last];
+    int32_t slot = -1;
+    if (dict_ht_find(d, key, &slot) >= 0 && slot >= 0) {
+        d->ht_buckets[slot] = -2;
+    }
     d->length--;
     TurboVal pair = make_tuple();
     turbo_tuple_append(pair, key);
@@ -2765,22 +3140,29 @@ void turbo_dict_update(TurboVal self, TurboVal other) {
 void turbo_dict_clear(TurboVal self) {
     TurboDict* d = (TurboDict*)tv_get_ptr(self);
     d->length = 0;
+    for (int i = 0; i < d->ht_cap; i++) d->ht_buckets[i] = -1;
 }
 
 TurboVal turbo_dict_copy(TurboVal self) {
     TurboDict* d = (TurboDict*)tv_get_ptr(self);
-    TurboVal new_dict = make_dict();
-    for (int i = 0; i < d->length; i++) {
-        turbo_setitem(new_dict, d->keys[i], d->values[i]);
-    }
-    return new_dict;
+    TurboDict* obj = (TurboDict*)malloc(sizeof(TurboDict));
+    obj->tag = HEAP_DICT;
+    obj->length = d->length;
+    obj->capacity = d->capacity;
+    obj->ht_cap = d->ht_cap;
+    obj->keys = (TurboVal*)malloc(sizeof(TurboVal) * obj->capacity);
+    obj->values = (TurboVal*)malloc(sizeof(TurboVal) * obj->capacity);
+    memcpy(obj->keys, d->keys, sizeof(TurboVal) * d->length);
+    memcpy(obj->values, d->values, sizeof(TurboVal) * d->length);
+    obj->ht_buckets = (int32_t*)malloc(sizeof(int32_t) * obj->ht_cap);
+    memcpy(obj->ht_buckets, d->ht_buckets, sizeof(int32_t) * d->ht_cap);
+    return tv_make_ptr(obj);
 }
 
 TurboVal turbo_dict_setdefault(TurboVal self, TurboVal key, TurboVal default_val) {
     TurboDict* d = (TurboDict*)tv_get_ptr(self);
-    for (int i = 0; i < d->length; i++) {
-        if (is_equal(d->keys[i], key)) return d->values[i];
-    }
+    int32_t idx = dict_ht_find(d, key, NULL);
+    if (idx >= 0) return d->values[idx];
     turbo_setitem(self, key, default_val);
     return default_val;
 }
@@ -2789,6 +3171,12 @@ TurboVal turbo_dict_setdefault(TurboVal self, TurboVal key, TurboVal default_val
 
 void turbo_class_add_method(TurboVal class_obj, const char* name, TurboCFunction func) {
     TurboClass* cls = (TurboClass*)tv_get_ptr(class_obj);
+    for (int i = 0; i < cls->method_count; i++) {
+        if (strcmp(cls->method_names[i], name) == 0) {
+            cls->method_funcs[i] = func;
+            return;
+        }
+    }
     if (cls->method_count >= cls->method_capacity) {
         cls->method_capacity *= 2;
         cls->method_names = (char**)realloc(cls->method_names, sizeof(char*) * cls->method_capacity);
@@ -2797,6 +3185,142 @@ void turbo_class_add_method(TurboVal class_obj, const char* name, TurboCFunction
     cls->method_names[cls->method_count] = strdup(name);
     cls->method_funcs[cls->method_count] = func;
     cls->method_count++;
+}
+
+void turbo_class_add_base(TurboVal class_obj, TurboVal base_obj) {
+    if (tv_heap_tag(class_obj) != HEAP_CLASS || tv_heap_tag(base_obj) != HEAP_CLASS) return;
+    TurboClass* cls = (TurboClass*)tv_get_ptr(class_obj);
+    if (cls->base_count >= cls->base_capacity) {
+        cls->base_capacity *= 2;
+        cls->bases = (TurboVal*)realloc(cls->bases, sizeof(TurboVal) * cls->base_capacity);
+    }
+    cls->bases[cls->base_count++] = base_obj;
+}
+
+void turbo_class_add_abstract(TurboVal class_obj, const char* name) {
+    if (tv_heap_tag(class_obj) != HEAP_CLASS) return;
+    TurboClass* cls = (TurboClass*)tv_get_ptr(class_obj);
+    cls->abstract_names = (char**)realloc(cls->abstract_names, sizeof(char*) * (cls->abstract_count + 1));
+    cls->abstract_names[cls->abstract_count++] = strdup(name);
+}
+
+static void build_mro_post(TurboVal cls_val, TurboVal* post, int* post_len, TurboVal* visited, int* vis_len) {
+    if (tv_heap_tag(cls_val) != HEAP_CLASS) return;
+    for (int i = 0; i < *vis_len; i++) {
+        if (visited[i] == cls_val) return;
+    }
+    if (*vis_len < 64) visited[(*vis_len)++] = cls_val;
+    TurboClass* cls = (TurboClass*)tv_get_ptr(cls_val);
+    for (int i = cls->base_count - 1; i >= 0; i--) {
+        build_mro_post(cls->bases[i], post, post_len, visited, vis_len);
+    }
+    if (*post_len < 64) post[(*post_len)++] = cls_val;
+}
+
+static void build_mro_dfs(TurboVal cls_val, TurboVal* mro, int* count) {
+    TurboVal post[64];
+    TurboVal visited[64];
+    int post_len = 0;
+    int vis_len = 0;
+    build_mro_post(cls_val, post, &post_len, visited, &vis_len);
+    *count = 0;
+    for (int i = post_len - 1; i >= 0; i--) {
+        mro[(*count)++] = post[i];
+    }
+}
+
+static bool class_is_subclass(TurboVal sub_cls, TurboVal target_cls) {
+    if (sub_cls == target_cls) return true;
+    TurboVal mro[64];
+    int mro_len = 0;
+    build_mro_dfs(sub_cls, mro, &mro_len);
+    for (int i = 0; i < mro_len; i++) {
+        if (mro[i] == target_cls) return true;
+    }
+    return false;
+}
+
+static TurboCFunction class_find_method(TurboVal class_obj, const char* name) {
+    TurboVal mro[64];
+    int mro_len = 0;
+    build_mro_dfs(class_obj, mro, &mro_len);
+    for (int m = 0; m < mro_len; m++) {
+        TurboClass* c = (TurboClass*)tv_get_ptr(mro[m]);
+        for (int i = 0; i < c->method_count; i++) {
+            if (strcmp(c->method_names[i], name) == 0) {
+                return c->method_funcs[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+static TurboCFunction class_find_super_method(TurboVal inst_cls, TurboVal cur_cls, const char* name) {
+    TurboVal mro[64];
+    int mro_len = 0;
+    build_mro_dfs(inst_cls, mro, &mro_len);
+    int start = 1;
+    if (cur_cls != TV_NONE) {
+        for (int m = 0; m < mro_len; m++) {
+            if (mro[m] == cur_cls) {
+                start = m + 1;
+                break;
+            }
+        }
+    }
+    for (int m = start; m < mro_len; m++) {
+        TurboClass* c = (TurboClass*)tv_get_ptr(mro[m]);
+        for (int i = 0; i < c->method_count; i++) {
+            if (strcmp(c->method_names[i], name) == 0) {
+                return c->method_funcs[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+static bool class_has_unimplemented_abstract(TurboVal class_obj, const char** out_name) {
+    TurboVal mro[64];
+    int mro_len = 0;
+    build_mro_dfs(class_obj, mro, &mro_len);
+    for (int m = 0; m < mro_len; m++) {
+        TurboClass* base_c = (TurboClass*)tv_get_ptr(mro[m]);
+        for (int a = 0; a < base_c->abstract_count; a++) {
+            const char* aname = base_c->abstract_names[a];
+            bool implemented = false;
+            for (int k = 0; k < m; k++) {
+                TurboClass* sub_c = (TurboClass*)tv_get_ptr(mro[k]);
+                bool sub_is_abs = false;
+                for (int sa = 0; sa < sub_c->abstract_count; sa++) {
+                    if (strcmp(sub_c->abstract_names[sa], aname) == 0) {
+                        sub_is_abs = true;
+                        break;
+                    }
+                }
+                if (sub_is_abs) continue;
+                for (int mi = 0; mi < sub_c->method_count; mi++) {
+                    if (strcmp(sub_c->method_names[mi], aname) == 0) {
+                        implemented = true;
+                        break;
+                    }
+                }
+                if (!implemented) {
+                    for (int ai = 0; ai < sub_c->attr_count; ai++) {
+                        if (strcmp(sub_c->attr_names[ai], aname) == 0) {
+                            implemented = true;
+                            break;
+                        }
+                    }
+                }
+                if (implemented) break;
+            }
+            if (!implemented) {
+                if (out_name) *out_name = aname;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void turbo_class_set_attr(TurboVal class_obj, const char* name, TurboVal val) {
@@ -2822,10 +3346,15 @@ void turbo_class_set_attr(TurboVal class_obj, const char* name, TurboVal val) {
 }
 
 TurboVal turbo_class_get_attr(TurboVal class_obj, const char* name) {
-    TurboClass* cls = (TurboClass*)tv_get_ptr(class_obj);
-    for (int i = 0; i < cls->attr_count; i++) {
-        if (strcmp(cls->attr_names[i], name) == 0) {
-            return cls->attr_values[i];
+    TurboVal mro[64];
+    int mro_len = 0;
+    build_mro_dfs(class_obj, mro, &mro_len);
+    for (int m = 0; m < mro_len; m++) {
+        TurboClass* cls = (TurboClass*)tv_get_ptr(mro[m]);
+        for (int i = 0; i < cls->attr_count; i++) {
+            if (strcmp(cls->attr_names[i], name) == 0) {
+                return cls->attr_values[i];
+            }
         }
     }
     return TV_NONE;
@@ -2839,17 +3368,22 @@ TurboVal turbo_call(TurboVal callable, int32_t argc, TurboVal* args) {
     }
     if (tag == HEAP_CLASS) {
         TurboClass* cls = (TurboClass*)tv_get_ptr(callable);
+        const char* abs_name = NULL;
+        if (class_has_unimplemented_abstract(callable, &abs_name)) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "TypeError: Can't instantiate abstract class %s with abstract method %s", cls->name, abs_name ? abs_name : "");
+            turbo_raise(make_str(msg));
+        }
         TurboVal inst = make_instance(callable);
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], "__init__") == 0) {
-                int32_t init_argc = argc + 1;
-                TurboVal* init_args = (TurboVal*)malloc(sizeof(TurboVal) * init_argc);
-                init_args[0] = inst;
-                for (int j = 0; j < argc; j++) init_args[j + 1] = args[j];
-                cls->method_funcs[i](init_argc, init_args);
-                free(init_args);
-                break;
-            }
+        TurboCFunction init_fn = class_find_method(callable, "__init__");
+        if (init_fn != NULL) {
+            int32_t init_argc = argc + 1;
+            TurboVal stack_args[16];
+            TurboVal* init_args = (init_argc <= 16) ? stack_args : (TurboVal*)malloc(sizeof(TurboVal) * init_argc);
+            init_args[0] = inst;
+            for (int j = 0; j < argc; j++) init_args[j + 1] = args[j];
+            init_fn(init_argc, init_args);
+            if (init_argc > 16) free(init_args);
         }
         return inst;
     }
@@ -2862,16 +3396,16 @@ TurboVal turbo_call_method(TurboVal obj, const char* method_name, int32_t argc, 
     if (tag == HEAP_INSTANCE) {
         TurboInstance* inst = (TurboInstance*)tv_get_ptr(obj);
         TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], method_name) == 0) {
-                int32_t call_argc = argc + 1;
-                TurboVal* call_args = (TurboVal*)malloc(sizeof(TurboVal) * call_argc);
-                call_args[0] = obj;
-                for (int j = 0; j < argc; j++) call_args[j + 1] = args[j];
-                TurboVal res = cls->method_funcs[i](call_argc, call_args);
-                free(call_args);
-                return res;
-            }
+        TurboCFunction m_fn = class_find_method(inst->class_obj, method_name);
+        if (m_fn != NULL) {
+            int32_t call_argc = argc + 1;
+            TurboVal stack_args[16];
+            TurboVal* call_args = (call_argc <= 16) ? stack_args : (TurboVal*)malloc(sizeof(TurboVal) * call_argc);
+            call_args[0] = obj;
+            for (int j = 0; j < argc; j++) call_args[j + 1] = args[j];
+            TurboVal res = m_fn(call_argc, call_args);
+            if (call_argc > 16) free(call_args);
+            return res;
         }
         TurboVal cls_attr = turbo_class_get_attr(inst->class_obj, method_name);
         if (cls_attr != TV_NONE) {
@@ -2881,11 +3415,12 @@ TurboVal turbo_call_method(TurboVal obj, const char* method_name, int32_t argc, 
             }
             if (atag == HEAP_CLASSMETHOD) {
                 int32_t call_argc = argc + 1;
-                TurboVal* call_args = (TurboVal*)malloc(sizeof(TurboVal) * call_argc);
+                TurboVal stack_args[16];
+                TurboVal* call_args = (call_argc <= 16) ? stack_args : (TurboVal*)malloc(sizeof(TurboVal) * call_argc);
                 call_args[0] = inst->class_obj;
                 for (int j = 0; j < argc; j++) call_args[j + 1] = args[j];
                 TurboVal res = ((TurboFunc*)tv_get_ptr(cls_attr))->func_ptr(call_argc, call_args);
-                free(call_args);
+                if (call_argc > 16) free(call_args);
                 return res;
             }
             if (atag == HEAP_PROPERTY) {
@@ -2900,17 +3435,19 @@ TurboVal turbo_call_method(TurboVal obj, const char* method_name, int32_t argc, 
         TurboSuper* sup = (TurboSuper*)tv_get_ptr(obj);
         if (tv_heap_tag(sup->obj) == HEAP_INSTANCE) {
             TurboInstance* inst = (TurboInstance*)tv_get_ptr(sup->obj);
-            TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
-            for (int i = 0; i < cls->method_count; i++) {
-                if (strcmp(cls->method_names[i], method_name) == 0) {
-                    int32_t call_argc = argc + 1;
-                    TurboVal* call_args = (TurboVal*)malloc(sizeof(TurboVal) * call_argc);
-                    call_args[0] = sup->obj;
-                    for (int j = 0; j < argc; j++) call_args[j + 1] = args[j];
-                    TurboVal res = cls->method_funcs[i](call_argc, call_args);
-                    free(call_args);
-                    return res;
-                }
+            TurboCFunction m_fn = class_find_super_method(inst->class_obj, sup->cls, method_name);
+            if (m_fn == NULL) {
+                m_fn = class_find_method(inst->class_obj, method_name);
+            }
+            if (m_fn != NULL) {
+                int32_t call_argc = argc + 1;
+                TurboVal stack_args[16];
+                TurboVal* call_args = (call_argc <= 16) ? stack_args : (TurboVal*)malloc(sizeof(TurboVal) * call_argc);
+                call_args[0] = sup->obj;
+                for (int j = 0; j < argc; j++) call_args[j + 1] = args[j];
+                TurboVal res = m_fn(call_argc, call_args);
+                if (call_argc > 16) free(call_args);
+                return res;
             }
         }
         fprintf(stderr, "AttributeError: 'super' object has no method '%s'\n", method_name);
@@ -3020,6 +3557,63 @@ TurboVal turbo_call_method(TurboVal obj, const char* method_name, int32_t argc, 
             turbo_set_remove(obj, args[0]);
             return TV_NONE;
         }
+        if (strcmp(method_name, "discard") == 0) {
+            turbo_set_discard(obj, args[0]);
+            return TV_NONE;
+        }
+        if (strcmp(method_name, "pop") == 0) {
+            return turbo_set_pop(obj);
+        }
+        if (strcmp(method_name, "clear") == 0) {
+            turbo_set_clear(obj);
+            return TV_NONE;
+        }
+        if (strcmp(method_name, "copy") == 0) {
+            return turbo_set_copy(obj);
+        }
+        if (strcmp(method_name, "union") == 0) {
+            TurboVal res = turbo_set_copy(obj);
+            for (int i = 0; i < argc; i++) turbo_set_update(res, args[i]);
+            return res;
+        }
+        if (strcmp(method_name, "intersection") == 0) {
+            TurboVal res = turbo_set_copy(obj);
+            for (int i = 0; i < argc; i++) res = turbo_set_intersection(res, args[i]);
+            return res;
+        }
+        if (strcmp(method_name, "difference") == 0) {
+            TurboVal res = turbo_set_copy(obj);
+            for (int i = 0; i < argc; i++) res = turbo_set_difference(res, args[i]);
+            return res;
+        }
+        if (strcmp(method_name, "symmetric_difference") == 0) {
+            return turbo_set_symmetric_difference(obj, args[0]);
+        }
+        if (strcmp(method_name, "update") == 0) {
+            for (int i = 0; i < argc; i++) turbo_set_update(obj, args[i]);
+            return TV_NONE;
+        }
+        if (strcmp(method_name, "intersection_update") == 0) {
+            for (int i = 0; i < argc; i++) turbo_set_intersection_update(obj, args[i]);
+            return TV_NONE;
+        }
+        if (strcmp(method_name, "difference_update") == 0) {
+            for (int i = 0; i < argc; i++) turbo_set_difference_update(obj, args[i]);
+            return TV_NONE;
+        }
+        if (strcmp(method_name, "symmetric_difference_update") == 0) {
+            turbo_set_symmetric_difference_update(obj, args[0]);
+            return TV_NONE;
+        }
+        if (strcmp(method_name, "issubset") == 0) {
+            return turbo_set_issubset(obj, args[0]);
+        }
+        if (strcmp(method_name, "issuperset") == 0) {
+            return turbo_set_issuperset(obj, args[0]);
+        }
+        if (strcmp(method_name, "isdisjoint") == 0) {
+            return turbo_set_isdisjoint(obj, args[0]);
+        }
     }
     if (tag == HEAP_FILE) {
         if (strcmp(method_name, "read") == 0) return turbo_file_read(obj);
@@ -3039,10 +3633,9 @@ TurboVal turbo_call_method(TurboVal obj, const char* method_name, int32_t argc, 
     }
     if (tag == HEAP_CLASS) {
         TurboClass* cls = (TurboClass*)tv_get_ptr(obj);
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], method_name) == 0) {
-                return cls->method_funcs[i](argc, args);
-            }
+        TurboCFunction m_fn = class_find_method(obj, method_name);
+        if (m_fn != NULL) {
+            return m_fn(argc, args);
         }
         TurboVal cls_attr = turbo_class_get_attr(obj, method_name);
         if (cls_attr != TV_NONE) {
@@ -3052,11 +3645,12 @@ TurboVal turbo_call_method(TurboVal obj, const char* method_name, int32_t argc, 
             }
             if (atag == HEAP_CLASSMETHOD) {
                 int32_t call_argc = argc + 1;
-                TurboVal* call_args = (TurboVal*)malloc(sizeof(TurboVal) * call_argc);
+                TurboVal stack_args[16];
+                TurboVal* call_args = (call_argc <= 16) ? stack_args : (TurboVal*)malloc(sizeof(TurboVal) * call_argc);
                 call_args[0] = obj;
                 for (int j = 0; j < argc; j++) call_args[j + 1] = args[j];
                 TurboVal res = ((TurboFunc*)tv_get_ptr(cls_attr))->func_ptr(call_argc, call_args);
-                free(call_args);
+                if (call_argc > 16) free(call_args);
                 return res;
             }
             if (atag == HEAP_PROPERTY) {
@@ -3156,7 +3750,15 @@ static TurboVal builtin_isinstance(int32_t argc, TurboVal* args) {
     if (tv_heap_tag(args[1]) == HEAP_CLASS) {
         if (tv_heap_tag(args[0]) == HEAP_INSTANCE) {
             TurboInstance* inst = (TurboInstance*)tv_get_ptr(args[0]);
-            if (inst->class_obj == args[1]) return TV_TRUE;
+            if (class_is_subclass(inst->class_obj, args[1])) return TV_TRUE;
+        }
+        return TV_FALSE;
+    }
+    if (tv_heap_tag(args[1]) == HEAP_TUPLE) {
+        TurboList* tup = (TurboList*)tv_get_ptr(args[1]);
+        for (int i = 0; i < tup->length; i++) {
+            TurboVal sub_args[2] = { args[0], tup->items[i] };
+            if (builtin_isinstance(2, sub_args) == TV_TRUE) return TV_TRUE;
         }
         return TV_FALSE;
     }
@@ -3181,10 +3783,8 @@ static TurboVal builtin_hasattr(int32_t argc, TurboVal* args) {
         for (int i = 0; i < inst->length; i++) {
             if (strcmp(inst->keys[i], name) == 0) return TV_TRUE;
         }
-        TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], name) == 0) return TV_TRUE;
-        }
+        if (class_find_method(inst->class_obj, name) != NULL) return TV_TRUE;
+        if (turbo_class_get_attr(inst->class_obj, name) != TV_NONE) return TV_TRUE;
     }
     return TV_FALSE;
 }
@@ -3197,11 +3797,18 @@ static TurboVal builtin_getattr(int32_t argc, TurboVal* args) {
         for (int i = 0; i < inst->length; i++) {
             if (strcmp(inst->keys[i], name) == 0) return inst->values[i];
         }
-        TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
-        for (int i = 0; i < cls->method_count; i++) {
-            if (strcmp(cls->method_names[i], name) == 0) {
-                return make_func(cls->method_funcs[i], name);
+        TurboVal cls_attr = turbo_class_get_attr(inst->class_obj, name);
+        if (cls_attr != TV_NONE) {
+            if (tv_heap_tag(cls_attr) == HEAP_PROPERTY) {
+                TurboProperty* prop = (TurboProperty*)tv_get_ptr(cls_attr);
+                TurboVal prop_args[1] = { args[0] };
+                return prop->getter(1, prop_args);
             }
+            return cls_attr;
+        }
+        TurboCFunction m_fn = class_find_method(inst->class_obj, name);
+        if (m_fn != NULL) {
+            return make_func(m_fn, name);
         }
     }
     return def;
@@ -3363,12 +3970,12 @@ static TurboVal builtin_list(int32_t argc, TurboVal* args) {
 }
 
 static TurboVal builtin_dict(int32_t argc, TurboVal* args) {
-    (void)argc;
+    if (argc == 0) return make_dict();
     return turbo_dict_copy(args[0]);
 }
 
 static TurboVal builtin_tuple(int32_t argc, TurboVal* args) {
-    (void)argc;
+    if (argc == 0) return make_tuple();
     TurboVal obj = args[0];
     int32_t tag = tv_heap_tag(obj);
     if (tag == HEAP_LIST) return make_tuple_from_list(obj);
@@ -3392,13 +3999,19 @@ static TurboVal builtin_tuple(int32_t argc, TurboVal* args) {
 }
 
 static TurboVal builtin_set(int32_t argc, TurboVal* args) {
-    (void)argc;
+    if (argc == 0) return make_set();
     TurboVal obj = args[0];
     int32_t tag = tv_heap_tag(obj);
     if (tag == HEAP_SET || tag == HEAP_LIST || tag == HEAP_TUPLE) {
         TurboList* lst = (TurboList*)tv_get_ptr(obj);
         TurboVal res = make_set();
         for (int i = 0; i < lst->length; i++) turbo_set_add(res, lst->items[i]);
+        return res;
+    }
+    if (tag == HEAP_DICT) {
+        TurboDict* d = (TurboDict*)tv_get_ptr(obj);
+        TurboVal res = make_set();
+        for (int i = 0; i < d->length; i++) turbo_set_add(res, d->keys[i]);
         return res;
     }
     if (tag == HEAP_STR) {
@@ -3415,8 +4028,12 @@ static TurboVal builtin_set(int32_t argc, TurboVal* args) {
 }
 
 static TurboVal builtin_super(int32_t argc, TurboVal* args) {
-    (void)argc; (void)args;
+    if (argc >= 2) return make_super(args[0], args[1]);
     return TV_NONE;
+}
+
+static TurboVal builtin_identity(int32_t argc, TurboVal* args) {
+    return (argc > 0) ? args[0] : TV_NONE;
 }
 
 static TurboVal builtin_iter(int32_t argc, TurboVal* args) {
@@ -3581,18 +4198,19 @@ void turbo_raise(TurboVal exc) {
 int32_t turbo_exception_matches(TurboVal exc, TurboVal exc_type) {
     if (exc_type == TV_NONE) return 1;
     if (tv_heap_tag(exc) != HEAP_INSTANCE) return 0;
-    const char* type_name;
+    TurboInstance* inst = (TurboInstance*)tv_get_ptr(exc);
     int32_t etag = tv_heap_tag(exc_type);
     if (etag == HEAP_CLASS) {
-        type_name = ((TurboClass*)tv_get_ptr(exc_type))->name;
+        if (class_is_subclass(inst->class_obj, exc_type)) return 1;
+        const char* type_name = ((TurboClass*)tv_get_ptr(exc_type))->name;
+        TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
+        return strcmp(cls->name, type_name) == 0 ? 1 : 0;
     } else if (etag == HEAP_STR) {
-        type_name = ((TurboStr*)tv_get_ptr(exc_type))->chars;
-    } else {
-        return 0;
+        const char* type_name = ((TurboStr*)tv_get_ptr(exc_type))->chars;
+        TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
+        return strcmp(cls->name, type_name) == 0 ? 1 : 0;
     }
-    TurboInstance* inst = (TurboInstance*)tv_get_ptr(exc);
-    TurboClass* cls = (TurboClass*)tv_get_ptr(inst->class_obj);
-    return strcmp(cls->name, type_name) == 0 ? 1 : 0;
+    return 0;
 }
 
 void turbo_init(void) {
@@ -3644,6 +4262,9 @@ void turbo_init(void) {
     t_zip = make_func(builtin_zip, "zip");
     t_map = make_func(builtin_map, "map");
     t_filter = make_func(builtin_filter, "filter");
+    t_ABC = make_class("ABC");
+    t_abstractmethod = make_func(builtin_identity, "abstractmethod");
+    t_dataclass = make_func(builtin_identity, "dataclass");
 }
 
 void turbo_init_args(int32_t argc, char** argv) {

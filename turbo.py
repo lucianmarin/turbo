@@ -575,6 +575,18 @@ class Parser:
             self.pos = self.pos + 1
             right = self.parse_bitor()
             node = ASTNode("COMP", t.type, [node, right])
+        elif t.type == "not" and self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1].type == "in":
+            self.pos = self.pos + 2
+            right = self.parse_bitor()
+            node = ASTNode("NOT", "", [ASTNode("COMP", "in", [node, right])])
+        elif t.type == "NAME" and t.value == "is":
+            self.pos = self.pos + 1
+            if self.try_match("not"):
+                right = self.parse_bitor()
+                node = ASTNode("COMP", "!=", [node, right])
+            else:
+                right = self.parse_bitor()
+                node = ASTNode("COMP", "==", [node, right])
         return node
 
     def parse_bitor(self):
@@ -947,12 +959,17 @@ class Parser:
         elif t.type == "class":
             self.pos = self.pos + 1
             name = self.consume("NAME").value
-            # Optional inheritance
+            bases_node = ASTNode("BASES", "", [])
             if self.try_match('('):
-                base_name = self.consume("NAME").value
+                if self.peek().type != ')':
+                    bases_node.children.append(self.parse_expr())
+                    while self.try_match(','):
+                        if self.peek().type == ')':
+                            break
+                        bases_node.children.append(self.parse_expr())
                 self.consume(')')
             body = self.parse_suite()
-            return ASTNode("CLASS", name, [body])
+            return ASTNode("CLASS", name, [body, bases_node])
 
         elif t.type == "if":
             self.pos = self.pos + 1
@@ -1510,7 +1527,7 @@ def escape_c_string(s):
         i = i + 1
     return res
 
-stdlib_list = ["sys", "os", "math", "json", "re", "time", "datetime", "random", "collections", "itertools", "functools", "pathlib", "subprocess", "typing"]
+stdlib_list = ["sys", "os", "math", "json", "re", "time", "datetime", "random", "collections", "itertools", "functools", "pathlib", "subprocess", "typing", "abc", "dataclasses"]
 
 def is_stdlib_module(name):
     s_idx = 0
@@ -1658,7 +1675,10 @@ class CodeGen:
         self.raw_int_funcs = {}
         self.range_loop_vars = {}
         self.input_dir = "."
-        self.builtins_list = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "tuple", "set", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter"]
+        self.builtins_list = ["print", "len", "str", "int", "ord", "chr", "range", "open", "sys_argv", "input", "type", "isinstance", "hasattr", "getattr", "setattr", "repr", "abs", "round", "pow", "hex", "bin", "oct", "float", "bool", "list", "dict", "tuple", "set", "super", "iter", "next", "all", "any", "sum", "min", "max", "sorted", "reversed", "enumerate", "zip", "map", "filter", "ABC", "abstractmethod", "dataclass"]
+        self.cur_class_name = ""
+        self.dataclass_fields_map = {}
+        self.class_bases_map = {}
         self.pending_native_vars = None
         self._var_types = {}
         self.func_ret_types = {}
@@ -2082,6 +2102,15 @@ class CodeGen:
                 arg0 = args_list[0]
                 if arg0.type == "LISTCOMP" or arg0.type == "GENCOMP":
                     return self._emit_fused_sum_comp(arg0, is_in_func)
+            if func_node.type == "NAME" and func_node.value == "super" and argc == 0:
+                if self.cur_class_name != "" and self.is_local("self", is_in_func):
+                    r_cls = self.new_reg()
+                    self.emit(r_cls + " = load i64, i64* @t_" + self.cur_class_name, is_in_func)
+                    r_self = self.new_reg()
+                    self.emit(r_self + " = load i64, i64* %loc_self", is_in_func)
+                    r_sup = self.new_reg()
+                    self.emit(r_sup + " = call i64 @make_super(i64 " + r_cls + ", i64 " + r_self + ")", is_in_func)
+                    return r_sup
             arg_regs = []
             a_idx = 0
             while a_idx < argc:
@@ -3600,6 +3629,31 @@ class CodeGen:
                         self.emit("store i64 " + new_fn + ", i64* @t_" + func_name, False)
                     d_idx = d_idx + 1
 
+    def _collect_dc_fields(self, cls_name, out_fields):
+        if cls_name in self.class_bases_map:
+            bases = self.class_bases_map[cls_name]
+            b_i = 0
+            while b_i < len(bases):
+                self._collect_dc_fields(bases[b_i], out_fields)
+                b_i = b_i + 1
+        if cls_name in self.dataclass_fields_map:
+            own = self.dataclass_fields_map[cls_name]
+            f_i = 0
+            while f_i < len(own):
+                fname = own[f_i][0]
+                fdef = own[f_i][1]
+                replaced = False
+                e_i = 0
+                while e_i < len(out_fields):
+                    if out_fields[e_i][0] == fname:
+                        out_fields[e_i][1] = fdef
+                        replaced = True
+                        break
+                    e_i = e_i + 1
+                if not replaced:
+                    out_fields.append([fname, fdef])
+                f_i = f_i + 1
+
     def gen_class_def(self, node, mod_prefix):
         class_name = node.value
         full_name = mod_prefix + class_name
@@ -3611,6 +3665,24 @@ class CodeGen:
             self.emit("store i64 " + r_cls + ", i64* @t_" + class_name, False)
 
         suite = node.children[0]
+        base_names = []
+        b_node_idx = 1
+        while b_node_idx < len(node.children):
+            if node.children[b_node_idx].type == "BASES":
+                bases_list = node.children[b_node_idx].children
+                bi = 0
+                while bi < len(bases_list):
+                    b_expr = bases_list[bi]
+                    if b_expr.type == "NAME":
+                        base_names.append(b_expr.value)
+                    if mod_prefix == "":
+                        b_reg = self.gen_expr(b_expr, False)
+                        r_c_b = self.new_reg()
+                        self.emit(r_c_b + " = load i64, i64* @t_" + class_name, False)
+                        self.emit("call void @turbo_class_add_base(i64 " + r_c_b + ", i64 " + b_reg + ")", False)
+                    bi = bi + 1
+            b_node_idx = b_node_idx + 1
+        self.class_bases_map[full_name] = base_names
 
         is_dataclass = False
         dc_idx = 1
@@ -3619,24 +3691,34 @@ class CodeGen:
                 dcc = node.children[dc_idx].children[0]
                 if dcc.type == "NAME" and dcc.value == "dataclass":
                     is_dataclass = True
+                elif dcc.type == "CALL" and dcc.children[0].type == "NAME" and dcc.children[0].value == "dataclass":
+                    is_dataclass = True
             dc_idx = dc_idx + 1
 
         if is_dataclass:
-            init_fields = []
+            own_fields = []
             dc_m_idx = 0
             while dc_m_idx < len(suite.children):
                 s = suite.children[dc_m_idx]
                 if s.type == "ANN_ASSIGN":
                     fname = s.value
-                    fdefault = s.children[0] if s.children[1].type == "CONST_NONE" else s.children[1]
-                    init_fields.append([fname, fdefault])
+                    fdefault = s.children[1]
+                    if fdefault.type == "CONST_NONE":
+                        ann_node = s.children[0]
+                        if ann_node.type == "CONST_INT" or ann_node.type == "CONST_FLOAT" or ann_node.type == "CONST_STR" or ann_node.type == "CONST_BOOL":
+                            fdefault = ann_node
+                    own_fields.append([fname, fdefault])
                 elif s.type == "ASSIGN":
                     target = s.children[0]
                     if target.type == "NAME":
                         fname = target.value
                         fdefault = s.children[1]
-                        init_fields.append([fname, fdefault])
+                        own_fields.append([fname, fdefault])
                 dc_m_idx = dc_m_idx + 1
+            self.dataclass_fields_map[full_name] = own_fields
+            init_fields = []
+            self._collect_dc_fields(full_name, init_fields)
+
             init_impl = "t_impl_" + full_name + "__init__"
             saved_cur_lines = self.cur_lines
             saved_locals = self.local_vars
@@ -3713,6 +3795,51 @@ class CodeGen:
             fn_lines.append("}")
             self.funcs_list.append("\n".join(fn_lines))
 
+            eq_impl = "t_impl_" + full_name + "__eq__"
+            self.cur_lines = []
+            self.local_vars = ["self", "other"]
+            self.local_allocas = []
+            self.sized_allocas = []
+            self.typed_allocas = []
+            self.block_terminated = False
+
+            p_s0 = self.new_reg()
+            self.emit(p_s0 + " = getelementptr inbounds i64, i64* %args, i64 0", True)
+            v_s0 = self.new_reg()
+            self.emit(v_s0 + " = load i64, i64* " + p_s0, True)
+            p_s1 = self.new_reg()
+            self.emit(p_s1 + " = getelementptr inbounds i64, i64* %args, i64 1", True)
+            v_s1 = self.new_reg()
+            self.emit(v_s1 + " = load i64, i64* " + p_s1, True)
+
+            eq_i = 0
+            while eq_i < len(init_fields):
+                fname = init_fields[eq_i][0]
+                sp_ef = self.get_str_ptr(fname, True)
+                va0 = self.new_reg()
+                self.emit(va0 + " = call i64 @turbo_getattr(i64 " + v_s0 + ", i8* " + sp_ef + ")", True)
+                va1 = self.new_reg()
+                self.emit(va1 + " = call i64 @turbo_getattr(i64 " + v_s1 + ", i8* " + sp_ef + ")", True)
+                veq = self.new_reg()
+                self.emit(veq + " = call i64 @turbo_eq(i64 " + va0 + ", i64 " + va1 + ")", True)
+                c_eq = self.emit_truthy_i1(veq, True)
+                lbl_nxt = self.new_label("dc_eq_nxt")
+                lbl_fls = self.new_label("dc_eq_fls")
+                self.emit_cond_br(c_eq, lbl_nxt, lbl_fls, True)
+                self.emit_label(lbl_fls, True)
+                self.emit_ret("-1688849860263934", True)
+                self.emit_label(lbl_nxt, True)
+                eq_i = eq_i + 1
+            self.emit_ret("-1688849860263933", True)
+
+            eq_lines = ["define i64 @" + eq_impl + "(i32 %argc, i64* %args) {", "entry:"]
+            c_i = 0
+            while c_i < len(self.cur_lines):
+                eq_lines.append(self.cur_lines[c_i])
+                c_i = c_i + 1
+            eq_lines.append("}")
+            self.funcs_list.append("\n".join(eq_lines))
+
             self.cur_lines = saved_cur_lines
             self.local_vars = saved_locals
             self.local_allocas = saved_allocas
@@ -3725,7 +3852,11 @@ class CodeGen:
                 self.emit(r_c + " = load i64, i64* @t_" + class_name, False)
                 sp_init = self.get_str_ptr("__init__", False)
                 self.emit("call void @turbo_class_add_method(i64 " + r_c + ", i8* " + sp_init + ", i64 (i32, i64*)* @" + init_impl + ")", False)
+                sp_eq = self.get_str_ptr("__eq__", False)
+                self.emit("call void @turbo_class_add_method(i64 " + r_c + ", i8* " + sp_eq + ", i64 (i32, i64*)* @" + eq_impl + ")", False)
 
+        saved_cls_name = self.cur_class_name
+        self.cur_class_name = full_name
         m_idx = 0
         while m_idx < len(suite.children):
             m_node = suite.children[m_idx]
@@ -3734,6 +3865,7 @@ class CodeGen:
                 is_static = False
                 is_class = False
                 is_property = False
+                is_abstract = False
                 md_idx = 2
                 while md_idx < len(m_node.children):
                     if m_node.children[md_idx].type == "DECORATOR":
@@ -3745,6 +3877,8 @@ class CodeGen:
                                 is_class = True
                             elif dec_c.value == "property":
                                 is_property = True
+                            elif dec_c.value == "abstractmethod":
+                                is_abstract = True
                     md_idx = md_idx + 1
                 self.gen_func_def(m_node, full_name, "", False)
                 if mod_prefix == "":
@@ -3752,6 +3886,8 @@ class CodeGen:
                     self.emit(r_c + " = load i64, i64* @t_" + class_name, False)
                     sp_m = self.get_str_ptr(method_name, False)
                     m_impl = "@t_impl_" + class_name + "_" + method_name
+                    if is_abstract:
+                        self.emit("call void @turbo_class_add_abstract(i64 " + r_c + ", i8* " + sp_m + ")", False)
                     if is_static:
                         sp_m2 = self.get_str_ptr(method_name, False)
                         r_sm = self.new_reg()
@@ -3789,6 +3925,7 @@ class CodeGen:
                         sp_a = self.get_str_ptr(attr_name, False)
                         self.emit("call void @turbo_class_set_attr(i64 " + r_c + ", i8* " + sp_a + ", i64 " + val_reg + ")", False)
             m_idx = m_idx + 1
+        self.cur_class_name = saved_cls_name
 
         d_idx = 1
         while d_idx < len(node.children):
@@ -3796,6 +3933,8 @@ class CodeGen:
                 dec_c = node.children[d_idx].children[0]
                 is_special = False
                 if dec_c.type == "NAME" and dec_c.value == "dataclass":
+                    is_special = True
+                elif dec_c.type == "CALL" and dec_c.children[0].type == "NAME" and dec_c.children[0].value == "dataclass":
                     is_special = True
                 if not is_special and mod_prefix == "":
                     dec_reg = self.gen_expr(dec_c, False)
@@ -6118,10 +6257,13 @@ class CodeGen:
         out.append("declare i64 @make_classmethod(i64 (i32, i64*)*, i8*)")
         out.append("declare i64 @make_property(i64 (i32, i64*)*, i64 (i32, i64*)*, i8*)")
         out.append("declare i64 @make_class(i8*)")
+        out.append("declare i64 @make_super(i64, i64)")
         out.append("declare i64 @make_module()")
         out.append("declare void @turbo_module_set(i64, i8*, i64)")
         out.append("declare i64 @turbo_module_get(i64, i8*)")
         out.append("declare void @turbo_class_add_method(i64, i8*, i64 (i32, i64*)*)")
+        out.append("declare void @turbo_class_add_base(i64, i64)")
+        out.append("declare void @turbo_class_add_abstract(i64, i8*)")
         out.append("declare void @turbo_class_set_attr(i64, i8*, i64)")
         out.append("declare void @turbo_list_append(i64, i64)")
         out.append("declare void @turbo_tuple_append(i64, i64)")
